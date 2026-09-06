@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "jam.grace-window",
+  "name": "Grace Window",
+  "version": "1.0.0",
+  "author": "CoolJam",
+  "description": "Hide the focused window to workspace 10 with a one-minute reopen grace period. SUPER+SHIFT+W reopens it; if the grace period is never renewed, the window is closed for real.",
+  "kinds": ["service"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}
