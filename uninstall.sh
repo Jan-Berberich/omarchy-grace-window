@@ -4,8 +4,8 @@ set -euo pipefail
 # Grace Window — Omarchy shell plugin uninstaller.
 #
 # Disables and removes the plugin, then removes ONLY the marked block of
-# keybindings that install.sh wrote (BLOCK_START..BLOCK_END). Every
-# pre-existing binding is left untouched.
+# keybindings that the service wired into ~/.config/hypr/bindings.lua
+# (BLOCK_START..BLOCK_END). Every pre-existing binding is left untouched.
 #
 # If the marked block is missing or malformed, the script fails closed with
 # manual instructions instead of guessing at the file's contents.
@@ -25,7 +25,7 @@ fail() {
 }
 
 # 1. Disable the plugin in the running shell, then remove its folder.
-omarchy-shell -q shell disablePlugin "$PLUGIN_ID" || true
+omarchy-shell -q shell setPluginEnabled "$PLUGIN_ID" false || true
 rm -rf "$DEST"
 
 # 2. Remove only the plugin-owned marked block from the bindings file.

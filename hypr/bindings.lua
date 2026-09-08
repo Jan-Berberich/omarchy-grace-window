@@ -4,10 +4,10 @@
 -- SUPER+SHIFT+CTRL+W also closes the window for real, immediately.
 -- Requires the plugin to be installed and enabled (see README.md).
 --
--- This file documents the bindings for hand-rolled setups. Merge the block
--- below into your existing bindings.lua; it is exactly the managed block
--- install.sh appends. uninstall.sh removes only this block and never
--- touches any other binding, so add only the lines you want to keep.
+-- On service start the plugin copies the block below into your
+-- ~/.config/hypr/bindings.lua, exactly once. This file is the source of the
+-- managed block; uninstall.sh removes only that block and never touches any
+-- other binding.
 
 -- BEGIN Grace Window (jam.grace-window) managed block - do not edit
 hl.unbind("SUPER + W")

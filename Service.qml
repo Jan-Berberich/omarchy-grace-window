@@ -12,6 +12,11 @@
 //
 // Window death on an expired grace period uses Hyprland's Lua dispatcher
 // syntax (Hyprland >= 0.55): hyprctl dispatch 'hl.dsp.window.close(...)'.
+//
+// No install.sh: on service start the managed keybinding block from this
+// plugin's own hypr/bindings.lua is appended to ~/.config/hypr/bindings.lua
+// (when not already present) and Hyprland is reloaded, so enabling the plugin
+// is all that is needed. uninstall.sh still removes that block cleanly.
 
 import QtQuick
 import Quickshell
@@ -22,6 +27,11 @@ Item {
 
   // Grace period in milliseconds before a hidden window is closed for real.
   readonly property int graceMs: 60000
+
+  // The shell wires the enabled plugin's manifest (including its __sourceDir)
+  // onto services that declare this property, so the service can find its own
+  // hypr/bindings.lua without any install script.
+  property var manifest: null
 
   // Pending hidden windows, newest last. Each entry keeps the absolute
   // deadline so the sweep can expire many windows independently.
@@ -47,6 +57,53 @@ Item {
 
     function cancel(): string {
       return root.cancel()
+    }
+  }
+
+  // --------------------------------------------------- keybinding wiring
+  //
+  // install.sh used to append the plugin's keybindings to
+  // ~/.config/hypr/bindings.lua. The service now owns that step: on start it
+  // appends the managed block from its own hypr/bindings.lua when it is not
+  // already present, then reloads Hyprland. Re-running is a safe no-op, so
+  // shell restarts and plugin hot-reloads never duplicate the block.
+  readonly property string bindingsBlockStart:
+    "-- BEGIN Grace Window (jam.grace-window) managed block - do not edit"
+  readonly property string bindingsBlockEnd:
+    "-- END Grace Window (jam.grace-window) managed block"
+
+  function wireBindings() {
+    const manifestDir = root.manifest && root.manifest.__sourceDir
+      ? String(root.manifest.__sourceDir) : ""
+    // Fall back to the well-known install location in case a shell version
+    // ever stops wiring the manifest property.
+    const sourceDir = manifestDir
+      || Quickshell.env("HOME") + "/.config/omarchy/plugins/jam.grace-window"
+    const script =
+      'src="$1"; target="$2"; start="$3"; end="$4"\n' +
+      'if [[ ! -f $src ]]; then echo "grace-window: source bindings missing: $src"; exit 0; fi\n' +
+      'if [[ ! -f $target ]]; then echo "grace-window: hyprland bindings file not found: $target"; exit 0; fi\n' +
+      'if grep -qF -- "$start" "$target"; then echo "grace-window: keybindings already wired; nothing to do"; exit 0; fi\n' +
+      'l0=$(grep -nF -- "$start" "$src" | head -n1 | cut -d: -f1)\n' +
+      'l1=$(grep -nF -- "$end" "$src" | head -n1 | cut -d: -f1)\n' +
+      'if [[ -z $l0 || -z $l1 ]]; then echo "grace-window: managed block not found in $src"; exit 0; fi\n' +
+      '{ echo ""; sed -n "${l0},${l1}p" "$src"; } >> "$target" || echo "grace-window: append failed"\n' +
+      'if ! grep -qF -- "$start" "$target"; then echo "grace-window: failed to wire keybindings into $target"; exit 0; fi\n' +
+      'hyprctl reload >/dev/null 2>&1 || true\n' +
+      'echo "grace-window: keybindings wired into $target and hyprland reloaded"'
+    wireProc.command = ["bash", "-c", script, "--",
+      sourceDir + "/hypr/bindings.lua",
+      Quickshell.env("HOME") + "/.config/hypr/bindings.lua",
+      root.bindingsBlockStart,
+      root.bindingsBlockEnd]
+    wireProc.running = true
+  }
+
+  Process {
+    id: wireProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: console.log(text)
     }
   }
 
@@ -192,5 +249,12 @@ Item {
   function cancel() {
     root.pending = []
     return "ok"
+  }
+
+  // ---------------------------------------------------------------- startup
+  Component.onCompleted: {
+    // The shell assigns root.manifest right after creating this service, so
+    // defer the wiring until that property is populated.
+    Qt.callLater(root.wireBindings)
   }
 }
