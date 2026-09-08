@@ -24,9 +24,9 @@ background script.
 |------|---------|
 | `manifest.json` | Omarchy plugin manifest (schema v1, kind `service`) |
 | `Service.qml` | The service: IPC handlers, hyprctl dispatch queue, grace sweep |
-| `hypr/bindings.lua` | Changes and adds the bindings for this plugin |
+| `hypr/bindings.lua` | Reference bindings for the plugin, wrapped in the managed block |
 | `install.sh` | Installs + enables the plugin and wires the bindings |
-| `uninstall.sh` | Reverts everything |
+| `uninstall.sh` | Reverts everything, preserving pre-existing bindings |
 
 ## Install
 
@@ -39,9 +39,13 @@ What it does:
 1. Copies the plugin to `~/.config/omarchy/plugins/jam.grace-window/`.
 2. `omarchy-shell shell rescanPlugins` then enables it via
    `omarchy plugin enable` (writes `~/.config/omarchy/shell.json`).
-3. Appends the binding block to `~/.config/hypr/bindings.lua` and reloads Hyprland.
+3. Appends a marked binding block to `~/.config/hypr/bindings.lua` and
+   reloads Hyprland. Every line the installer adds lives inside a
+   `-- BEGIN Grace Window ... managed block` / `-- END Grace Window ...
+   managed block` pair; nothing outside that block is ever modified.
 
-Safe to re-run; it skips the binding block when already present.
+Safe to re-run; the binding step is skipped when the managed block is
+already present.
 
 ## Uninstall
 
@@ -49,8 +53,11 @@ Safe to re-run; it skips the binding block when already present.
 ./uninstall.sh
 ```
 
-Restores SUPER+W → *Close window* and SUPER+SHIFT+W → *Omawrite*, and removes
-the plugin.
+Removes the plugin, then strips exactly the plugin's managed binding block
+from `~/.config/hypr/bindings.lua`. Every binding that was already present
+before the plugin was installed is preserved unchanged. If the managed
+block cannot be located intact, the uninstaller fails closed and prints
+manual instructions instead of rewriting assumed defaults.
 
 ## Usage without the keybindings
 
