@@ -2,7 +2,7 @@
 
 ![](preview.png)
 
-An Omarchy shell plugin that hides the focused window to **workspace 10**
+An Omarchy shell plugin to reopen "closed" windoes with **SUPER + SHIFT + W**. It remaps **SUPER + W** to hide the focused window to **workspace 10**
 with a one-minute reopen grace period:
 
 - **SUPER + W** — silently move the selected window to workspace 10 and start
@@ -31,10 +31,14 @@ background script.
 ## Install
 
 ```bash
-./install.sh
+omarchy plugin add https://github.com/Jan-Berberich/omarchy-grace-window.git
+~/.config/omarchy/plugins/jam.grace-window/install.sh
 ```
 
-What it does:
+**Important:** The Omarchy plugin system does not run `install.sh`
+automatically. You must run it manually after adding the plugin.
+
+`install.sh` does the following:
 
 1. Copies the plugin to `~/.config/omarchy/plugins/jam.grace-window/`.
 2. `omarchy-shell shell rescanPlugins` then enables it via
@@ -49,15 +53,20 @@ already present.
 
 ## Uninstall
 
+**Important:** You must run `uninstall.sh` before removing the plugin,
+otherwise the managed keybinding block will be left behind in
+`~/.config/hypr/bindings.lua`.
+
 ```bash
-./uninstall.sh
+~/.config/omarchy/plugins/jam.grace-window/uninstall.sh
+omarchy plugin remove jam.grace-window
 ```
 
-Removes the plugin, then strips exactly the plugin's managed binding block
-from `~/.config/hypr/bindings.lua`. Every binding that was already present
-before the plugin was installed is preserved unchanged. If the managed
-block cannot be located intact, the uninstaller fails closed and prints
-manual instructions instead of rewriting assumed defaults.
+`uninstall.sh` removes the plugin, then strips exactly the plugin's managed
+binding block from `~/.config/hypr/bindings.lua`. Every binding that was
+already present before the plugin was installed is preserved unchanged. If
+the managed block cannot be located intact, the uninstaller fails closed and
+prints manual instructions instead of rewriting assumed defaults.
 
 ## Usage without the keybindings
 
