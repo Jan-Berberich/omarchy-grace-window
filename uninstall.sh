@@ -19,6 +19,11 @@ HYPR_BINDINGS="$HOME/.config/hypr/bindings.lua"
 BLOCK_START='-- BEGIN Grace Window (jam.grace-window) managed block - do not edit'
 BLOCK_END='-- END Grace Window (jam.grace-window) managed block'
 
+fail() {
+  echo "uninstall: $*" >&2
+  exit 1
+}
+
 # 1. Disable the plugin in the running shell, then remove its folder.
 omarchy-shell -q shell disablePlugin "$PLUGIN_ID" || true
 rm -rf "$DEST"
@@ -42,13 +47,17 @@ if (( starts == 0 )) || (( ends == 0 )) || (( starts != ends )); then
 fi
 
 cp "$HYPR_BINDINGS" "$HYPR_BINDINGS.bak.$(date +%s)"
-tmpfile="${TMPDIR:-/tmp}/grace-window-bindings.$$"
+tmpfile=$(mktemp "${HYPR_BINDINGS}.tmp.XXXXXX") || fail "could not create temporary file"
+trap 'rm -f "$tmpfile"' EXIT
+original_mode=$(stat -c '%a' "$HYPR_BINDINGS")
 awk -v s="$BLOCK_START" -v e="$BLOCK_END" '
   $0 == s { skip++ }
   !skip { print }
   $0 == e { if (skip > 0) skip-- }
 ' "$HYPR_BINDINGS" >"$tmpfile"
+chmod "$original_mode" "$tmpfile"
 mv "$tmpfile" "$HYPR_BINDINGS"
+trap - EXIT
 
 hyprctl reload >/dev/null 2>&1 || true
 
