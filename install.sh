@@ -58,9 +58,6 @@ result=$(omarchy-shell shell enablePlugin "$PLUGIN_ID" '{}') || true
 # 3. Wire the keybindings (idempotent: block present means already wired).
 if ! grep -qF -e "$BLOCK_START" "$HYPR_BINDINGS"; then
   cp "$HYPR_BINDINGS" "$HYPR_BINDINGS.bak.$(date +%s)"
-  # Drop any leftover lines from the pre-plugin standalone-script approach;
-  # only lines this plugin historically wrote are removed, nothing else.
-  sed -i '/omarchy-grace-window hide/d;/omarchy-grace-window reopen/d' "$HYPR_BINDINGS"
   {
     echo ""
     echo "$BLOCK_START"
