@@ -4,7 +4,7 @@
   "name": "Grace Window",
   "version": "1.0.0",
   "author": "CoolJam",
-  "description": "Hide the focused window to workspace 10 with a one-minute reopen grace period. SUPER+SHIFT+W reopens it; if the grace period is never renewed, the window is closed for real.",
+  "description": "Reopen \"closed\" windows with SUPER + SHIFT + W. It remaps SUPER + W to hide the focused window to workspace 10 with a one-minute reopen grace period. Important note: run `~/.config/omarchy/plugins/jam.grace-window/install.sh` after adding this plugin for the custom keybindings and run `~/.config/omarchy/plugins/jam.grace-window/uninstall.sh` before removing it.",
   "kinds": ["service"],
   "keepLoaded": true,
   "entryPoints": {
