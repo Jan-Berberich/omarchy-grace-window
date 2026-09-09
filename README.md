@@ -2,16 +2,14 @@
 
 ![](preview.png)
 
-An Omarchy shell plugin to reopen "closed" windows with **SUPER + SHIFT + W**. It remaps **SUPER + W** to hide the focused window to **workspace 10**
+An Omarchy shell plugin to reopen "closed" windows with <kbd>SUPER</kbd>+<kbd>SHIFT</kbd>+<kbd>W</kbd>. It rebinds <kbd>SUPER</kbd>+<kbd>W</kbd> to move the focused window silently to **workspace 10**
 with a one-minute reopen grace period:
 
-- **SUPER + W** — silently move the selected window to workspace 10 and start
+- <kbd>SUPER</kbd>+<kbd>W</kbd>: close window gracefully: silently move the selected window to workspace 10 and start
   the 60s grace timer. Focus stays where it was.
-- **SUPER + SHIFT + W** — "reopen" the most recently hidden window: bring it
-  back to the current workspace, focus it, and cancel its auto-close.
-- **Grace expiry** — if a hidden window is never reopened, it is closed for
-  real when the timer runs out.
-- **SUPER + SHIFT + CTRL + W** — also closes the window for real, immediately.
+- <kbd>SUPER</kbd>+<kbd>SHIFT</kbd>+<kbd>W</kbd>: reopen the most recently "closed" window: bring it back to the current workspace, focus it, and cancel its auto-close.
+- <kbd>SUPER</kbd>+<kbd>SHIFT</kbd>+<kbd>CTRL</kbd>+<kbd>W</kbd>: closes the window for real, immediately.
+- **Grace expiry**: if a hidden window is never reopened, it is closed for real when the timer runs out.
 
 The feature is a *service* plugin: the state lives in the long-lived
 `omarchy-shell` process, and the keybindings drive it over Quickshell IPC
@@ -53,8 +51,9 @@ already present before the plugin was installed is preserved unchanged. If
 the managed block cannot be located intact, the uninstaller fails closed and
 prints manual instructions.
 
-**Important:** Don't use `omarchy plugin remove` for this,
-otherwise you need to remove its managed block from `~/.config/hypr/bindings.lua` manually.
+**Important:** Do not use `omarchy plugin remove` for uninstall,
+otherwise you need to remove the plugins managed block from
+`~/.config/hypr/bindings.lua` manually.
 
 ## Usage without the keybindings
 
