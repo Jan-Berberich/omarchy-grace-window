@@ -18,8 +18,8 @@ closed for real:
   reopens the most recent gracefully closed window.
 - <kbd>SUPER</kbd>+<kbd>SHIFT</kbd>+<kbd>CTRL</kbd>+<kbd>W</kbd>: close window,
   for real, immediately. It can not be reopened again.
-- **Grace expiry**: if a gracefully closed window is never reopened, it is
-  closed for real when the grace period runs out.
+- **Grace period**: time to reopen gracefully closed window before it gets
+  closed for real. Pauses if gracefully closed window is focused.
 - **Grace look**: A gracefully closed window gets a distinctive look so you
   can tell it will close soon: a 10% lower opacity and cut corners.
 

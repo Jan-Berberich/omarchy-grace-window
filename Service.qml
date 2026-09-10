@@ -4,6 +4,7 @@
 //   hide()     Move the focused window silently to workspace 10 and give it a
 //              one-minute grace period. Returns "requested" when the address
 //              query started, "busy" when a previous query is still in flight.
+//              The grace timer pauses while the hidden window keeps focus.
 //   reopen()   Bring a hidden window back to the current workspace and focus
 //              it, cancelling its pending auto-close. When the focused window
 //              is itself hidden it is preferred; otherwise the most recently
@@ -43,11 +44,16 @@ Item {
   // hypr/bindings.lua without any install script.
   property var manifest: null
 
-  // Pending hidden windows, newest last. Each entry keeps the absolute
-  // deadline so the sweep can expire many windows independently.
+  // Pending hidden windows, newest last. Each entry keeps its remaining
+  // grace time; the sweep pauses it while that window keeps focus.
   property var pending: []
 
   property bool queryBusy: false
+
+  // Timestamp of the last sweep tick and address of the currently focused
+  // window, used to pause a window's grace timer while it is focused.
+  property double lastTick: 0
+  property string focusedAddress: ""
 
   // ---------------------------------------------------------------- IPC
   IpcHandler {
@@ -244,7 +250,7 @@ Item {
     const graceOpacityInactive = String(Number(opacityInactive) * root.graceOpacityFactor)
     root.pending.push({
       address: addr,
-      deadline: Date.now() + root.graceMs,
+      remaining: root.graceMs,
       opacity: opacity,
       opacityInactive: opacityInactive,
       rounding: rounding,
@@ -354,15 +360,28 @@ Item {
   }
 
   function sweep() {
-    if (root.pending.length === 0) return
     const now = Date.now()
+    if (root.pending.length === 0) {
+      // Keep the tick anchor fresh so the first countdown after a new hide
+      // starts from a full grace period.
+      root.lastTick = now
+      return
+    }
+    const delta = now - root.lastTick
+    root.lastTick = now
     const dead = []
     const alive = []
     for (let i = 0; i < root.pending.length; i++) {
-      if (root.pending[i].deadline <= now) dead.push(root.pending[i])
-      else alive.push(root.pending[i])
+      const entry = root.pending[i]
+      // While the window itself keeps focus its grace timer is paused.
+      if (entry.address === root.focusedAddress) {
+        alive.push(entry)
+        continue
+      }
+      entry.remaining -= delta
+      if (entry.remaining <= 0) dead.push(entry)
+      else alive.push(entry)
     }
-    if (dead.length === 0) return
     root.pending = alive
     for (let i = 0; i < dead.length; i++) {
       root.dispatch([
@@ -370,13 +389,36 @@ Item {
         'hl.dsp.window.close({ window = "address:' + dead[i].address + '" })',
       ])
     }
+    // Refresh the focused-window probe that decides the next tick's pauses.
+    if (!focusProc.running) focusProc.running = true
+  }
+
+  Process {
+    id: focusProc
+    command: ["hyprctl", "-j", "activewindow"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.onFocusRead(text)
+    }
+  }
+
+  function onFocusRead(raw) {
+    let win
+    try {
+      win = JSON.parse(raw || "{}")
+    } catch (e) {
+      root.focusedAddress = ""
+      return
+    }
+    const addr = String(win && win.address || "")
+    root.focusedAddress = addr === "0x0" ? "" : addr
   }
 
   // ---------------------------------------------------------------- misc
   function status() {
     if (root.pending.length === 0) return "idle"
     const last = root.pending[root.pending.length - 1]
-    const remaining = Math.ceil((last.deadline - Date.now()) / 1000)
+    const remaining = Math.ceil(last.remaining / 1000)
     return "pending " + (remaining > 0 ? remaining : 0) + "s"
   }
 
@@ -389,6 +431,7 @@ Item {
   Component.onCompleted: {
     // The shell assigns root.manifest right after creating this service, so
     // defer the wiring until that property is populated.
+    root.lastTick = Date.now()
     Qt.callLater(root.wireBindings)
   }
 }
