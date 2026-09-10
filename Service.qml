@@ -166,6 +166,16 @@ Item {
     }
     const addr = String(win.address || "")
     if (!addr || addr === "0x0") return
+    // Already in grace: only relocate the window to the grace workspace.
+    // Keep its captured look and grace timer untouched.
+    for (let i = 0; i < root.pending.length; i++) {
+      if (root.pending[i].address !== addr) continue
+      root.dispatch([
+        "hyprctl", "dispatch",
+        'hl.dsp.window.move({ window = "address:' + addr + '", workspace = "' + root.graceWorkspace + '", follow = false })',
+      ])
+      return
+    }
     // Capture the window's current corners and opacity so they can be
     // restored exactly when it is reopened.
     if (propProc.running) return
