@@ -11,9 +11,9 @@
 
 -- BEGIN Grace Window (jam.grace-window) managed block - do not edit
 hl.unbind("SUPER + W")
-o.bind("SUPER + W", "Close window gracefully", "omarchy-shell grace-window hide")
+o.bind("SUPER + W", "Close window gracefully (jam.grace-window)", "omarchy-shell grace-window hide")
 hl.unbind("SUPER + SHIFT + W")
-o.bind("SUPER + SHIFT + W", "Reopen closed window", "omarchy-shell grace-window reopen")
+o.bind("SUPER + SHIFT + W", "Reopen closed window (jam.grace-window)", "omarchy-shell grace-window reopen")
 hl.unbind("SUPER + SHIFT + CTRL + W")
-o.bind("SUPER + SHIFT + CTRL + W", "Close window", hl.dsp.window.close())
+o.bind("SUPER + SHIFT + CTRL + W", "Close window (jam.grace-window)", hl.dsp.window.close())
 -- END Grace Window (jam.grace-window) managed block
