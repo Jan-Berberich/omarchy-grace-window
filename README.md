@@ -2,7 +2,7 @@
 
 ![](preview.png)
 
-An Omarchy shell plugin to reopen a recently "closed" window,
+An Omarchy shell plugin to reopen a recently closed window,
 including its content with
 <kbd>SUPER</kbd>+<kbd>SHIFT</kbd>+<kbd>W</kbd>. The plugin rebinds
 <kbd>SUPER</kbd>+<kbd>W</kbd> to move the focused window silently to
@@ -10,20 +10,18 @@ including its content with
 closed for real:
 
 - <kbd>SUPER</kbd>+<kbd>W</kbd>: close window gracefully: silently move the
-selected window to workspace 10 and start the 60s grace timer. Focus stays
-where it was.
-- <kbd>SUPER</kbd>+<kbd>SHIFT</kbd>+<kbd>W</kbd>: reopen the most recently
-"closed" window: bring it back to the current workspace, focus it, and cancel
-its auto-close.
-- <kbd>SUPER</kbd>+<kbd>SHIFT</kbd>+<kbd>CTRL</kbd>+<kbd>W</kbd>: closes the
-window for real, immediately.
-- **Grace expiry**: if a hidden window is never reopened, it is closed for
-  real when the timer runs out.
-- **Grace look**: A hidden window gets a distinctive look so you can tell it
-  will close soon: a 10% lower opacity (also when inactive) and cut corners
-  (`rounding` 30 / `rounding_power` 1). Once that timer expires, the window is
-  closed for real, so reopen it with
-  <kbd>SUPER</kbd>+<kbd>SHIFT</kbd>+<kbd>W</kbd> if you want it back.
+  focused window to workspace 10 and start the one-minute reopen grace period.
+  Active workspace stays where it was.
+- <kbd>SUPER</kbd>+<kbd>SHIFT</kbd>+<kbd>W</kbd>: reopen closed window:
+  bring it back, focus it, and cancel its auto-close. If the focused window is
+  itself a gracefully closed window, that one is reopened instead. Otherwise
+  reopens the most recent gracefully closed window.
+- <kbd>SUPER</kbd>+<kbd>SHIFT</kbd>+<kbd>CTRL</kbd>+<kbd>W</kbd>: close window,
+  for real, immediately. It can not be reopened again.
+- **Grace expiry**: if a gracefully closed window is never reopened, it is
+  closed for real when the grace period runs out.
+- **Grace look**: A gracefully closed window gets a distinctive look so you
+  can tell it will close soon: a 10% lower opacity and cut corners.
 
 The feature is a *service* plugin: the state lives in the long-lived
 `omarchy-shell` process, and the keybindings drive it over Quickshell IPC
@@ -91,8 +89,9 @@ omarchy-shell grace-window cancel     # forget pendings without closing
 
 ## Notes
 
-- Multiple windows can be hidden in sequence; each one keeps its own grace
-  timer, and `reopen` restores the most recent.
+- Multiple windows can be closed gracefully in sequence. Each one keeps its
+  own grace period, and `reopen` restores the most recent one if not focused
+  on a gracefully cloced window.
 - Auto-close uses Hyprland's Lua dispatcher syntax
   (`hl.dsp.window.close({ window = "address:..." })`), which needs Hyprland
   >= 0.55 (Omarchy 4.x ships 0.56).

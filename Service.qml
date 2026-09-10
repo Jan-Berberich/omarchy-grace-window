@@ -4,9 +4,11 @@
 //   hide()     Move the focused window silently to workspace 10 and give it a
 //              one-minute grace period. Returns "requested" when the address
 //              query started, "busy" when a previous query is still in flight.
-//   reopen()   Bring the most recently hidden window back to the current
-//              workspace and focus it, cancelling its pending auto-close.
-//              Returns "none" when there is nothing pending.
+//   reopen()   Bring a hidden window back to the current workspace and focus
+//              it, cancelling its pending auto-close. When the focused window
+//              is itself hidden it is preferred; otherwise the most recently
+//              hidden window is reopened. Returns "none" when there is nothing
+//              pending.
 //   status()   "idle", or "pending Ns" for the most recent hidden window.
 //   cancel()   Forget every pending window (does not close them).
 //
@@ -28,7 +30,7 @@ Item {
   // Grace period in milliseconds before a hidden window is closed for real.
   readonly property int graceMs: 60000
 
-  // Window to hide into and the grace-period look.
+  // Workspace to hide the window into
   readonly property string graceWorkspace: "10"
   // Cut corners mark the window as being in its grace period.
   readonly property double graceRounding: 30
@@ -141,11 +143,14 @@ Item {
 
   // ----------------------------------------------------------- hide path
   function hide() {
-    if (root.queryBusy) return "busy"
+    if (root.queryBusy || activeProc.running) return "busy"
     root.queryBusy = true
+    root._queryMode = "hide"
     activeProc.running = true
     return "requested"
   }
+
+  property string _queryMode: "hide"
 
   Process {
     id: activeProc
@@ -157,17 +162,43 @@ Item {
   }
 
   function onActiveRead(raw) {
+    const resumingReopen = root._queryMode === "reopen"
     root.queryBusy = false
     let win
     try {
       win = JSON.parse(raw || "{}")
     } catch (e) {
+      win = null
+    }
+    const addr = String(win && win.address || "")
+    if (addr === "0x0") return
+    if (resumingReopen) {
+      // Prefer the focused window when it is the one in grace period; otherwise
+      // reopen the most recently hidden one.
+      let index = -1
+      if (addr) {
+        for (let i = 0; i < root.pending.length; i++) {
+          if (root.pending[i].address !== addr) continue
+          index = i
+          break
+        }
+      }
+      let entry
+      if (index !== -1) entry = root.pending.splice(index, 1)[0]
+      else entry = root.pending.pop()
+      root._queryMode = "hide"
+      if (!entry) return
+      root._reopenAddress = entry.address
+      root._reopenOpacity = String(entry.opacity)
+      root._reopenOpacityInactive = String(entry.opacityInactive)
+      root._reopenRounding = String(entry.rounding)
+      root._reopenRoundingPower = String(entry.roundingPower)
+      workspaceProc.running = true
       return
     }
-    const addr = String(win.address || "")
-    if (!addr || addr === "0x0") return
-    // Already in grace: only relocate the window to the grace workspace.
-    // Keep its captured look and grace timer untouched.
+    if (!addr) return
+    // Already hidden: only relocate the window to the grace workspace.
+    // Keep its captured look and grace period untouched.
     for (let i = 0; i < root.pending.length; i++) {
       if (root.pending[i].address !== addr) continue
       root.dispatch([
@@ -245,15 +276,12 @@ Item {
   // --------------------------------------------------------- reopen path
   function reopen() {
     if (root.pending.length === 0) return "none"
-    if (root.queryBusy || workspaceProc.running) return "busy"
-    const entry = root.pending[root.pending.length - 1]
-    root.pending = root.pending.slice(0, -1)
-    root._reopenAddress = entry.address
-    root._reopenOpacity = String(entry.opacity)
-    root._reopenOpacityInactive = String(entry.opacityInactive)
-    root._reopenRounding = String(entry.rounding)
-    root._reopenRoundingPower = String(entry.roundingPower)
-    workspaceProc.running = true
+    if (root.queryBusy || workspaceProc.running || activeProc.running) return "busy"
+    // Resolve the target (focused hidden window, else most recent) via the
+    // active window query; the restore path continues in onActiveRead.
+    root.queryBusy = true
+    root._queryMode = "reopen"
+    activeProc.running = true
     return "requested"
   }
 
