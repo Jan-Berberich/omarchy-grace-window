@@ -18,7 +18,12 @@ its auto-close.
 - <kbd>SUPER</kbd>+<kbd>SHIFT</kbd>+<kbd>CTRL</kbd>+<kbd>W</kbd>: closes the
 window for real, immediately.
 - **Grace expiry**: if a hidden window is never reopened, it is closed for
-real when the timer runs out.
+  real when the timer runs out.
+- **Grace look**: A hidden window gets a distinctive look so you can tell it
+  will close soon: a 10% lower opacity (also when inactive) and cut corners
+  (`rounding` 30 / `rounding_power` 1). Once that timer expires, the window is
+  closed for real, so reopen it with
+  <kbd>SUPER</kbd>+<kbd>SHIFT</kbd>+<kbd>W</kbd> if you want it back.
 
 The feature is a *service* plugin: the state lives in the long-lived
 `omarchy-shell` process, and the keybindings drive it over Quickshell IPC
@@ -78,6 +83,9 @@ omarchy-shell grace-window cancel     # forget pendings without closing
 ## Configuration
 
 - Grace period can be edited in `Service.qml` (`graceMs`).
+- The grace look (workspace, cut corners, opacity reduction) can be tuned in
+  `Service.qml` too: `graceWorkspace`, `graceRounding`,
+  `graceRoundingPower`, `graceOpacityFactor`.
 - Keybindings can be edited in `hypr/bindings.lua` before install, or in
   `~/.config/hypr/bindings.lua` after install.
 

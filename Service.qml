@@ -28,6 +28,14 @@ Item {
   // Grace period in milliseconds before a hidden window is closed for real.
   readonly property int graceMs: 60000
 
+  // Window to hide into and the grace-period look.
+  readonly property string graceWorkspace: "10"
+  // Cut corners mark the window as being in its grace period.
+  readonly property double graceRounding: 30
+  readonly property double graceRoundingPower: 1
+  // Windows in grace period also fade to 90% of their normal opacity.
+  readonly property double graceOpacityFactor: 0.9
+
   // The shell wires the enabled plugin's manifest (including its __sourceDir)
   // onto services that declare this property, so the service can find its own
   // hypr/bindings.lua without any install script.
@@ -158,10 +166,69 @@ Item {
     }
     const addr = String(win.address || "")
     if (!addr || addr === "0x0") return
-    root.pending.push({ address: addr, deadline: Date.now() + root.graceMs })
+    // Capture the window's current corners and opacity so they can be
+    // restored exactly when it is reopened.
+    if (propProc.running) return
+    propProc.command = [
+      "bash", "-c",
+      "hyprctl getprop address:" + addr + " opacity; hyprctl getprop address:" + addr + " opacity_inactive; hyprctl getprop address:" + addr + " rounding; hyprctl getprop address:" + addr + " rounding_power",
+    ]
+    root._hideAddress = addr
+    propProc.running = true
+  }
+
+  property string _hideAddress: ""
+
+  Process {
+    id: propProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.onPropsRead(text)
+    }
+  }
+
+  function onPropsRead(raw) {
+    const addr = root._hideAddress
+    root._hideAddress = ""
+    if (!addr) return
+    const values = String(raw || "").split("\n").map(function (line) {
+      return line.trim()
+    })
+    const opacity = values[0] || ""
+    const opacityInactive = values[1] || ""
+    const rounding = values[2] || ""
+    const roundingPower = values[3] || ""
+    if (opacity === "" || opacityInactive === "" || rounding === "") return
+    const graceOpacity = String(Number(opacity) * root.graceOpacityFactor)
+    const graceOpacityInactive = String(Number(opacityInactive) * root.graceOpacityFactor)
+    root.pending.push({
+      address: addr,
+      deadline: Date.now() + root.graceMs,
+      opacity: opacity,
+      opacityInactive: opacityInactive,
+      rounding: rounding,
+      roundingPower: roundingPower,
+    })
     root.dispatch([
       "hyprctl", "dispatch",
-      'hl.dsp.window.move({ window = "address:' + addr + '", workspace = "10", follow = false })',
+      'hl.dsp.window.move({ window = "address:' + addr + '", workspace = "' + root.graceWorkspace + '", follow = false })',
+    ])
+    // Cut corners and a slight fade mark the window as being in its grace period.
+    root.dispatch([
+      "hyprctl", "dispatch",
+      'hl.dsp.window.set_prop({ window = "address:' + addr + '", prop = "opacity", value = "' + graceOpacity + '" })',
+    ])
+    root.dispatch([
+      "hyprctl", "dispatch",
+      'hl.dsp.window.set_prop({ window = "address:' + addr + '", prop = "opacity_inactive", value = "' + graceOpacityInactive + '" })',
+    ])
+    root.dispatch([
+      "hyprctl", "dispatch",
+      'hl.dsp.window.set_prop({ window = "address:' + addr + '", prop = "rounding", value = "' + root.graceRounding + '" })',
+    ])
+    root.dispatch([
+      "hyprctl", "dispatch",
+      'hl.dsp.window.set_prop({ window = "address:' + addr + '", prop = "rounding_power", value = "' + root.graceRoundingPower + '" })',
     ])
   }
 
@@ -172,11 +239,19 @@ Item {
     const entry = root.pending[root.pending.length - 1]
     root.pending = root.pending.slice(0, -1)
     root._reopenAddress = entry.address
+    root._reopenOpacity = String(entry.opacity)
+    root._reopenOpacityInactive = String(entry.opacityInactive)
+    root._reopenRounding = String(entry.rounding)
+    root._reopenRoundingPower = String(entry.roundingPower)
     workspaceProc.running = true
     return "requested"
   }
 
   property string _reopenAddress: ""
+  property string _reopenOpacity: ""
+  property string _reopenOpacityInactive: ""
+  property string _reopenRounding: ""
+  property string _reopenRoundingPower: ""
 
   Process {
     id: workspaceProc
@@ -201,6 +276,27 @@ Item {
     let id = ""
     if (ws && ws.id !== undefined && ws.id !== null) id = String(ws.id)
     if (id === "" || id === "null") return
+    // Restore the values the window had before it was hidden.
+    root.dispatch([
+      "hyprctl", "dispatch",
+      'hl.dsp.window.set_prop({ window = "address:' + addr + '", prop = "opacity", value = "' + root._reopenOpacity + '" })',
+    ])
+    root.dispatch([
+      "hyprctl", "dispatch",
+      'hl.dsp.window.set_prop({ window = "address:' + addr + '", prop = "opacity_inactive", value = "' + root._reopenOpacityInactive + '" })',
+    ])
+    root._reopenOpacity = ""
+    root._reopenOpacityInactive = ""
+    root.dispatch([
+      "hyprctl", "dispatch",
+      'hl.dsp.window.set_prop({ window = "address:' + addr + '", prop = "rounding", value = "' + root._reopenRounding + '" })',
+    ])
+    root.dispatch([
+      "hyprctl", "dispatch",
+      'hl.dsp.window.set_prop({ window = "address:' + addr + '", prop = "rounding_power", value = "' + root._reopenRoundingPower + '" })',
+    ])
+    root._reopenRounding = ""
+    root._reopenRoundingPower = ""
     root.dispatch([
       "hyprctl", "dispatch",
       'hl.dsp.window.move({ window = "address:' + addr + '", workspace = "' + id + '" })',
