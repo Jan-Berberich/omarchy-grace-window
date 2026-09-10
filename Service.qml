@@ -175,6 +175,8 @@ Item {
       win = JSON.parse(raw || "{}")
     } catch (e) {
       win = null
+      root.queryBusy = false
+      return
     }
     const addr = String(win && win.address || "")
     if (addr === "0x0") return
