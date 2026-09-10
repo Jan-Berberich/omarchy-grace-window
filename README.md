@@ -91,7 +91,7 @@ omarchy-shell grace-window cancel     # forget pendings without closing
 
 - Multiple windows can be closed gracefully in sequence. Each one keeps its
   own grace period, and `reopen` restores the most recent one if not focused
-  on a gracefully cloced window.
+  on a gracefully closed window.
 - Auto-close uses Hyprland's Lua dispatcher syntax
   (`hl.dsp.window.close({ window = "address:..." })`), which needs Hyprland
   >= 0.55 (Omarchy 4.x ships 0.56).
