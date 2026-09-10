@@ -2,14 +2,23 @@
 
 ![](preview.png)
 
-An Omarchy shell plugin to reopen "closed" windows with <kbd>SUPER</kbd>+<kbd>SHIFT</kbd>+<kbd>W</kbd>. It rebinds <kbd>SUPER</kbd>+<kbd>W</kbd> to move the focused window silently to **workspace 10**
-with a one-minute reopen grace period:
+An Omarchy shell plugin to reopen a recently "closed" window,
+including its content with
+<kbd>SUPER</kbd>+<kbd>SHIFT</kbd>+<kbd>W</kbd>. The plugin rebinds
+<kbd>SUPER</kbd>+<kbd>W</kbd> to move the focused window silently to
+**workspace 10** with a one-minute reopen grace period until it gets
+closed for real:
 
-- <kbd>SUPER</kbd>+<kbd>W</kbd>: close window gracefully: silently move the selected window to workspace 10 and start
-  the 60s grace timer. Focus stays where it was.
-- <kbd>SUPER</kbd>+<kbd>SHIFT</kbd>+<kbd>W</kbd>: reopen the most recently "closed" window: bring it back to the current workspace, focus it, and cancel its auto-close.
-- <kbd>SUPER</kbd>+<kbd>SHIFT</kbd>+<kbd>CTRL</kbd>+<kbd>W</kbd>: closes the window for real, immediately.
-- **Grace expiry**: if a hidden window is never reopened, it is closed for real when the timer runs out.
+- <kbd>SUPER</kbd>+<kbd>W</kbd>: close window gracefully: silently move the
+selected window to workspace 10 and start the 60s grace timer. Focus stays
+where it was.
+- <kbd>SUPER</kbd>+<kbd>SHIFT</kbd>+<kbd>W</kbd>: reopen the most recently
+"closed" window: bring it back to the current workspace, focus it, and cancel
+its auto-close.
+- <kbd>SUPER</kbd>+<kbd>SHIFT</kbd>+<kbd>CTRL</kbd>+<kbd>W</kbd>: closes the
+window for real, immediately.
+- **Grace expiry**: if a hidden window is never reopened, it is closed for
+real when the timer runs out.
 
 The feature is a *service* plugin: the state lives in the long-lived
 `omarchy-shell` process, and the keybindings drive it over Quickshell IPC
@@ -51,8 +60,8 @@ already present before the plugin was installed is preserved unchanged. If
 the managed block cannot be located intact, the uninstaller fails closed and
 prints manual instructions.
 
-**Important:** Do not use `omarchy plugin remove` for uninstall,
-otherwise you need to remove the plugins managed block from
+**Important:** Do not use omarchy's plugin system for uninstall,
+otherwise you need to remove the plugin's managed block from
 `~/.config/hypr/bindings.lua` manually.
 
 ## Usage without the keybindings
@@ -68,8 +77,9 @@ omarchy-shell grace-window cancel     # forget pendings without closing
 
 ## Configuration
 
-The grace period is hard-coded to 60 seconds in `Service.qml` (`graceMs`).
-Edit it there, or change the keybindings in `hypr/bindings.lua`.
+- Grace period can be edited in `Service.qml` (`graceMs`).
+- Keybindings can be edited in `hypr/bindings.lua` before install, or in
+  `~/.config/hypr/bindings.lua` after install.
 
 ## Notes
 
