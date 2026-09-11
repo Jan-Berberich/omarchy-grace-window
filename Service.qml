@@ -95,18 +95,59 @@ Item {
     // ever stops wiring the manifest property.
     const sourceDir = manifestDir
       || Quickshell.env("HOME") + "/.config/omarchy/plugins/jam.grace-window"
+    // The block is installed with an owner-checked, symlink-resistant atomic
+    // replace instead of an in-place append (">>"), which follows symlinks and
+    // could strand a partially written block on failure. Every path component
+    // of the target must be owned by the current user (or root), must not be a
+    // symlink, and directories must not be group/other writable. The new
+    // content is staged in a temp file in the same directory (so the rename is
+    // atomic) and never touches anything outside the managed block.
     const script =
+      'set -u\n' +
       'src="$1"; target="$2"; start="$3"; end="$4"\n' +
-      'if [[ ! -f $src ]]; then echo "grace-window: source bindings missing: $src"; exit 0; fi\n' +
-      'if [[ ! -f $target ]]; then echo "grace-window: hyprland bindings file not found: $target"; exit 0; fi\n' +
-      'if grep -qF -- "$start" "$target"; then echo "grace-window: keybindings already wired; nothing to do"; exit 0; fi\n' +
-      'l0=$(grep -nF -- "$start" "$src" | head -n1 | cut -d: -f1)\n' +
-      'l1=$(grep -nF -- "$end" "$src" | head -n1 | cut -d: -f1)\n' +
-      'if [[ -z $l0 || -z $l1 ]]; then echo "grace-window: managed block not found in $src"; exit 0; fi\n' +
-      '{ echo ""; sed -n "${l0},${l1}p" "$src"; } >> "$target" || echo "grace-window: append failed"\n' +
-      'if ! grep -qF -- "$start" "$target"; then echo "grace-window: failed to wire keybindings into $target"; exit 0; fi\n' +
+      'tmpfile=""\n' +
+      'say() { echo "grace-window: $*"; }\n' +
+      'fail() {\n' +
+      '  if [[ -n "$tmpfile" ]]; then rm -f "$tmpfile"; fi\n' +
+      '  say "ERROR: $*"\n' +
+      '  exit 1\n' +
+      '}\n' +
+      'uid=$(id -u)\n' +
+      '[[ "$target" == /* ]] || fail "target is not absolute: $target"\n' +
+      'if [[ ! -f "$src" ]]; then say "source bindings missing: $src"; exit 0; fi\n' +
+      'if [[ ! -f "$target" ]]; then say "hyprland bindings file not found: $target"; exit 0; fi\n' +
+      'if grep -qFs -- "$start" "$target"; then say "keybindings already wired; nothing to do"; exit 0; fi\n' +
+      'l0=$(grep -nFs -- "$start" "$src" | head -n1 | cut -d: -f1)\n' +
+      'l1=$(grep -nFs -- "$end" "$src" | head -n1 | cut -d: -f1)\n' +
+      'if [[ -z "$l0" || -z "$l1" ]]; then fail "managed block not found in $src"; fi\n' +
+      'if (( l0 > l1 )); then fail "managed block markers out of order in $src"; fi\n' +
+      'cur="/"\n' +
+      'IFS=/ read -r -a comps <<< "${target#/}"\n' +
+      'for comp in "${comps[@]}"; do\n' +
+      '  [[ -n "$comp" ]] || continue\n' +
+      '  cur="${cur%/}/$comp"\n' +
+      '  [[ -L "$cur" ]] && fail "refusing to write: $cur is a symlink"\n' +
+      '  owner=$(stat -c "%u" "$cur" 2>/dev/null) || fail "cannot stat $cur"\n' +
+      '  if [[ "$owner" != "$uid" && "$owner" != 0 ]]; then fail "refusing to write: $cur is owned by uid $owner, not you"; fi\n' +
+      '  if [[ -d "$cur" ]]; then\n' +
+      '    mode=$(stat -c "%a" "$cur")\n' +
+      '    if (( (8#$mode & 0022) != 0 )); then fail "refusing to write: $cur is group/other writable (mode $mode)"; fi\n' +
+      '  fi\n' +
+      'done\n' +
+      'dir=$(dirname "$target")\n' +
+      'tmpfile=$(mktemp "$dir/bindings.lua.tmp.XXXXXX") || fail "could not create temporary file"\n' +
+      'orig_mode=$(stat -c "%a" "$target")\n' +
+      '{\n' +
+      '  cat "$target"\n' +
+      '  echo ""\n' +
+      '  sed -n "${l0},${l1}p" "$src"\n' +
+      '} > "$tmpfile" || fail "could not write temporary file"\n' +
+      'chmod "$orig_mode" "$tmpfile" || fail "could not set permissions on temporary file"\n' +
+      'mv -f "$tmpfile" "$target" || fail "could not atomically replace $target"\n' +
+      'tmpfile=""\n' +
+      'if ! grep -qFs -- "$start" "$target"; then fail "failed to wire keybindings into $target"; fi\n' +
       'hyprctl reload >/dev/null 2>&1 || true\n' +
-      'echo "grace-window: keybindings wired into $target and hyprland reloaded"'
+      'say "keybindings wired into $target and hyprland reloaded"'
     wireProc.command = ["bash", "-c", script, "--",
       sourceDir + "/hypr/bindings.lua",
       Quickshell.env("HOME") + "/.config/hypr/bindings.lua",
