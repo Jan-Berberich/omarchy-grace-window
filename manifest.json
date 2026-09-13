@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "jam.grace-window",
   "name": "Grace Window",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "author": "CoolJam",
   "description": "Reopen recently closed window, including its content with SUPER+SHIFT+W. The plugin rebinds SUPER+W to move the focused window silently to workspace 10 with a one-minute reopen grace period until it gets closed for real. Uninstalling the plugin via omarchy's plugin system removes its managed block from \"~/.config/hypr/bindings.lua\" automatically to restore your previous keybindings.",
   "kinds": ["service"],
