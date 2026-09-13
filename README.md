@@ -33,9 +33,8 @@ background script.
 | File | Purpose |
 |------|---------|
 | `manifest.json` | Omarchy plugin manifest (schema v1, kind `service`) |
-| `Service.qml` | The service: IPC handlers, hyprctl dispatch queue, grace sweep, auto-wires the keybindings on start |
+| `Service.qml` | The service: IPC handlers, hyprctl dispatch queue, grace sweep, auto-wires the keybindings on start and unwires them on teardown |
 | `hypr/bindings.lua` | The keybindings, wrapped in the managed block the service copies on start |
-| `uninstall.sh` | Reverts the plugin and its managed bindings, preserving pre-existing bindings |
 
 ## Install
 
@@ -54,18 +53,15 @@ ever modified.
 ## Uninstall
 
 ```bash
-~/.config/omarchy/plugins/jam.grace-window/uninstall.sh
+omarchy plugin remove jam.grace-window
 ```
 
-`uninstall.sh` removes the plugin, then strips exactly the plugin's managed
-binding block from `~/.config/hypr/bindings.lua`. Every binding that was
+Removing the plugin shuts down its service, and the service first strips
+exactly the plugin's managed binding block from
+`~/.config/hypr/bindings.lua` and reloads Hyprland. Every binding that was
 already present before the plugin was installed is preserved unchanged. If
-the managed block cannot be located intact, the uninstaller fails closed and
-prints manual instructions.
-
-**Important:** Do not use omarchy's plugin system for uninstall,
-otherwise you need to remove the plugin's managed block from
-`~/.config/hypr/bindings.lua` manually.
+the managed block cannot be located intact, the service fails closed and
+leaves the file untouched. No uninstaller script is needed.
 
 ## Usage without the keybindings
 

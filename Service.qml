@@ -19,7 +19,18 @@
 // No install.sh: on service start the managed keybinding block from this
 // plugin's own hypr/bindings.lua is appended to ~/.config/hypr/bindings.lua
 // (when not already present) and Hyprland is reloaded, so enabling the plugin
-// is all that is needed. uninstall.sh still removes that block cleanly.
+// is all that is needed. The managed block is also removed when the service is
+// torn down (plugin remove/disable, shell shutdown), so removing the plugin
+// through omarchy's plugin system cleans up cleanly without an uninstaller
+// script.
+
+// TODO:
+// IMPLEMENT: closing window gracefully should force windowed mode (no fullscreen)
+//            reopen should restore the window mode
+// FIX      : closing window gracefully in floating mode (not tiling) (SUPER + T) and
+//            reopen by focus (on graceWorkspace) causes edges cut edges to flicker
+// FIX      : closing window gracefully in popped out mode (SUPER + O)
+//            does not move the window to grace workspace
 
 import QtQuick
 import Quickshell
@@ -83,10 +94,10 @@ Item {
   // appends the managed block from its own hypr/bindings.lua when it is not
   // already present, then reloads Hyprland. Re-running is a safe no-op, so
   // shell restarts and plugin hot-reloads never duplicate the block.
-  readonly property string bindingsBlockStart:
-    "-- BEGIN Grace Window (jam.grace-window) managed block - do not edit"
+  readonly property string bindingsBlockBgn:
+    "-- BEGIN Grace Window (jam.grace-window) managed block - do not edit this comment"
   readonly property string bindingsBlockEnd:
-    "-- END Grace Window (jam.grace-window) managed block"
+    "-- END Grace Window (jam.grace-window) managed block - do not edit this comment"
 
   function wireBindings() {
     const manifestDir = root.manifest && root.manifest.__sourceDir
@@ -151,9 +162,84 @@ Item {
     wireProc.command = ["bash", "-c", script, "--",
       sourceDir + "/hypr/bindings.lua",
       Quickshell.env("HOME") + "/.config/hypr/bindings.lua",
-      root.bindingsBlockStart,
+      root.bindingsBlockBgn,
       root.bindingsBlockEnd]
     wireProc.running = true
+  }
+
+  // Reverses wireBindings: removes ONLY the managed keybinding block from
+  // ~/.config/hypr/bindings.lua, plus the blank line wireBindings inserts
+  // right before it (dropped only while it is still present), restoring every
+  // binding that predated the plugin. Runs detached (Quickshell.execDetached)
+  // because it is triggered from Component.onDestruction, when the service's
+  // own objects are already being torn down and a child Process could not
+  // reliably outlive them. The script never depends on the plugin's own files,
+  // which omarchy deletes right after it disables the plugin. Fails closed on
+  // any marker mismatch, leaving the file untouched.
+  function unwireBindings() {
+    const target = Quickshell.env("HOME") + "/.config/hypr/bindings.lua"
+    const script =
+      'set -u\n' +
+      'target="$1"; start="$2"; end="$3"\n' +
+      'tmpfile=""\n' +
+      'say() { echo "grace-window: $*"; }\n' +
+      'fail() {\n' +
+      '  if [[ -n "$tmpfile" ]]; then rm -f "$tmpfile"; fi\n' +
+      '  say "ERROR: $*"\n' +
+      '  exit 1\n' +
+      '}\n' +
+      'if [[ "$target" != /* ]]; then fail "target is not absolute: $target"; fi\n' +
+      'if [[ ! -f "$target" ]]; then say "bindings file not found: $target; nothing to clean"; exit 0; fi\n' +
+      'starts=$(grep -cFs -- "$start" "$target" || true)\n' +
+      'ends=$(grep -cFs -- "$end" "$target" || true)\n' +
+      'if (( starts == 0 )) || (( ends == 0 )) || (( starts != ends )); then\n' +
+      '  say "managed block markers not found intact in $target; leaving file untouched"; exit 0\n' +
+      'fi\n' +
+      'uid=$(id -u)\n' +
+      'cur="/"\n' +
+      'IFS=/ read -r -a comps <<< "${target#/}"\n' +
+      'for comp in "${comps[@]}"; do\n' +
+      '  [[ -n "$comp" ]] || continue\n' +
+      '  cur="${cur%/}/$comp"\n' +
+      '  [[ -L "$cur" ]] && fail "refusing to write: $cur is a symlink"\n' +
+      '  owner=$(stat -c "%u" "$cur" 2>/dev/null) || fail "cannot stat $cur"\n' +
+      '  if [[ "$owner" != "$uid" && "$owner" != 0 ]]; then fail "refusing to write: $cur is owned by uid $owner, not you"; fi\n' +
+      '  if [[ -d "$cur" ]]; then\n' +
+      '    mode=$(stat -c "%a" "$cur")\n' +
+      '    if (( (8#$mode & 0022) != 0 )); then fail "refusing to write: $cur is group/other writable (mode $mode)"; fi\n' +
+      '  fi\n' +
+      'done\n' +
+      'cp "$target" "$target.bak.$(date -u +%Y%m%d%H%M%S)"\n' +
+      'tmpfile=$(mktemp "${target}.tmp.XXXXXX") || fail "could not create temporary file"\n' +
+      'orig_mode=$(stat -c "%a" "$target")\n' +
+      'awk -v s="$start" -v e="$end" \'\n' +
+      '  {\n' +
+      '    if (skip) {\n' +
+      '      if (index($0, e) == 1) skip = 0\n' +
+      '      next\n' +
+      '    }\n' +
+      '    if (index($0, s) == 1) {\n' +
+      '      skip = 1\n' +
+      '      if (prev_set && prev != "") print prev\n' +
+      '      prev_set = 0\n' +
+      '      next\n' +
+      '    }\n' +
+      '    if (prev_set) print prev\n' +
+      '    prev = $0\n' +
+      '    prev_set = 1\n' +
+      '  }\n' +
+      '  END { if (prev_set) print prev }\n' +
+      '\' "$target" > "$tmpfile" || fail "could not write temporary file"\n' +
+      'chmod "$orig_mode" "$tmpfile" || fail "could not set permissions on temporary file"\n' +
+      'mv -f "$tmpfile" "$target" || fail "could not atomically replace $target"\n' +
+      'tmpfile=""\n' +
+      'if grep -qFs -- "$start" "$target"; then fail "failed to remove managed block from $target"; fi\n' +
+      'hyprctl reload >/dev/null 2>&1 || true\n' +
+      'say "managed keybinding block removed from $target and hyprland reloaded"\n'
+    Quickshell.execDetached(["bash", "-c", script, "--",
+      target,
+      root.bindingsBlockBgn,
+      root.bindingsBlockEnd])
   }
 
   Process {
@@ -477,4 +563,11 @@ Item {
     root.lastTick = Date.now()
     Qt.callLater(root.wireBindings)
   }
+
+  // The shell destroys this service when the plugin is disabled or removed, so
+  // teardown here is what unwires the managed keybinding block - omarchy's
+  // plugin remove then leaves nothing behind. It also fires on shell shutdown;
+  // the block is simply re-wired on the next shell start (an idempotent no-op
+  // when still present).
+  Component.onDestruction: root.unwireBindings()
 }
