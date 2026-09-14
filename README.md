@@ -10,18 +10,19 @@ including its content with
 closed for real:
 
 - <kbd>SUPER</kbd>+<kbd>W</kbd>: close window gracefully: silently move the
-  focused window to workspace 10 and start the one-minute reopen grace period.
-  Active workspace stays where it was.
+  focused window to **workspace 10** and start the one-minute reopen grace
+  period. Active workspace stays where it was.
 - <kbd>SUPER</kbd>+<kbd>SHIFT</kbd>+<kbd>W</kbd>: reopen closed window:
-  bring it back, focus it, and cancel its auto-close. If the focused window is
-  itself a gracefully closed window, that one is reopened instead. Otherwise
-  reopens the most recent gracefully closed window.
+  bring it back, focus it, and cancel its grace period. If the focused window
+  is itself a gracefully closed window, that one is reopened instead.
+  Otherwise reopens the most recent gracefully closed window.
 - <kbd>SUPER</kbd>+<kbd>SHIFT</kbd>+<kbd>CTRL</kbd>+<kbd>W</kbd>: close window,
   for real, immediately. It can not be reopened again.
 - **Grace period**: time to reopen gracefully closed window before it gets
   closed for real. Pauses if gracefully closed window is focused.
 - **Grace look**: A gracefully closed window gets a distinctive look so you
-  can tell it will close soon: a 10% lower opacity and cut corners.
+  can tell it will close soon: a 10% lower opacity, cut corners and always in 
+  *tiling* mode.
 
 The feature is a *service* plugin: the state lives in the long-lived
 `omarchy-shell` process, and the keybindings drive it over Quickshell IPC
@@ -47,7 +48,7 @@ keybinding block from its own `hypr/bindings.lua` to
 `~/.config/hypr/bindings.lua` and reloads Hyprland, but only if the block is
 not already present, so it is safe across shell restarts and plugin
 hot-reloads. Every line it adds lives inside a `-- BEGIN Grace Window ...`
-/ `-- END Grace Window ...` managed block pair; nothing outside that block is
+/ `-- END Grace Window ...` managed block pair. Nothing outside that block is
 ever modified.
 
 ## Uninstall
@@ -61,7 +62,7 @@ exactly the plugin's managed binding block from
 `~/.config/hypr/bindings.lua` and reloads Hyprland. Every binding that was
 already present before the plugin was installed is preserved unchanged. If
 the managed block cannot be located intact, the service fails closed and
-leaves the file untouched. No uninstaller script is needed.
+leaves the file untouched.
 
 ## Usage without the keybindings
 
@@ -75,20 +76,22 @@ omarchy-shell grace-window cancel     # forget pendings without closing
 ```
 
 ## Configuration
-
-- Grace period can be edited in `Service.qml` (`graceMs`).
+The plugin gets installed to `~/.config/omarchy/plugins/jam.grace-window`.
+Here you can change what you want. Just disable and enable the plugin again
+for changes to take effect.
+- Grace period in `Service.qml` can be edited: `graceMs`.
 - The grace look (workspace, cut corners, opacity reduction) can be tuned in
   `Service.qml` too: `graceWorkspace`, `graceRounding`,
   `graceRoundingPower`, `graceOpacityFactor`.
-- Keybindings can be edited in `hypr/bindings.lua` before install, or in
-  `~/.config/hypr/bindings.lua` after install.
+- Keybindings should be edited in the plugins `hypr/bindings.lua` for them to
+  persist `Service.qml` restarts.
 
 ## Notes
 
 - Multiple windows can be closed gracefully in sequence. Each one keeps its
   own grace period, and `reopen` restores the most recent one if not focused
   on a gracefully closed window.
-- Auto-close uses Hyprland's Lua dispatcher syntax
-  (`hl.dsp.window.close({ window = "address:..." })`), which needs Hyprland
-  >= 0.55 (Omarchy 4.x ships 0.56).
+- Uses Hyprland's Lua dispatcher syntax
+  (e.g. `hl.dsp.window.close({ window = "address:..." })`),
+  which needs Hyprland >= 0.55 (present in Omarchy 4.x).
 - Validated with `omarchy plugin validate`.

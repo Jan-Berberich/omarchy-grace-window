@@ -4,9 +4,13 @@
 //   hide()     Move the focused window silently to workspace 10 and give it a
 //              one-minute grace period. Returns "requested" when the address
 //              query started, "busy" when a previous query is still in flight.
-//              The grace timer pauses while the hidden window keeps focus.
+//              The window is forced back to plain tiling (no floating,
+//              fullscreen, or pin) while hidden; its previous mode is captured
+//              and restored on reopen. The grace timer pauses while the hidden
+//              window keeps focus.
 //   reopen()   Bring a hidden window back to the current workspace and focus
-//              it, cancelling its pending auto-close. When the focused window
+//              it, cancelling its pending auto-close and restoring the window
+//              mode it had before it was hidden. When the focused window
 //              is itself hidden it is preferred; otherwise the most recently
 //              hidden window is reopened. Returns "none" when there is nothing
 //              pending.
@@ -19,18 +23,19 @@
 // No install.sh: on service start the managed keybinding block from this
 // plugin's own hypr/bindings.lua is appended to ~/.config/hypr/bindings.lua
 // (when not already present) and Hyprland is reloaded, so enabling the plugin
-// is all that is needed. The managed block is also removed when the service is
-// torn down (plugin remove/disable, shell shutdown), so removing the plugin
+// is all that is needed. The managed block is also removed when the service
+// is torn down (plugin remove/disable, shell shutdown), so removing the plugin
 // through omarchy's plugin system cleans up cleanly without an uninstaller
 // script.
 
 // TODO:
-// IMPLEMENT: closing window gracefully should force windowed mode (no fullscreen)
-//            reopen should restore the window mode
-// FIX      : closing window gracefully in floating mode (not tiling) (SUPER + T) and
-//            reopen by focus (on graceWorkspace) causes edges cut edges to flicker
-// FIX      : closing window gracefully in popped out mode (SUPER + O)
-//            does not move the window to grace workspace
+// REMOVE   : backup (.bak) in unwireBindings? (no backup in wireBindings...)
+// IMPLEMENT: Reopen tiled window where it was
+// IMPLEMENT: Reopen in scratchpad does not work yet
+// IMPLEMENT: Grouping behaviour:
+//            Currently: Whole group gets hidden in grace workspace
+//            Should be: hide  : move out of group, then hide
+//                       reopen: reopen, then move to group where it was
 
 import QtQuick
 import Quickshell
@@ -328,6 +333,14 @@ Item {
       root._reopenOpacityInactive = String(entry.opacityInactive)
       root._reopenRounding = String(entry.rounding)
       root._reopenRoundingPower = String(entry.roundingPower)
+      root._reopenFloating = String(entry.floating)
+      root._reopenFullscreen = String(entry.fullscreen)
+      root._reopenFullscreenClient = String(entry.fullscreenClient)
+      root._reopenPinned = String(entry.pinned)
+      root._reopenX = String(entry.x)
+      root._reopenY = String(entry.y)
+      root._reopenW = String(entry.w)
+      root._reopenH = String(entry.h)
       workspaceProc.running = true
       return
     }
@@ -350,10 +363,31 @@ Item {
       "hyprctl getprop address:" + addr + " opacity; hyprctl getprop address:" + addr + " opacity_inactive; hyprctl getprop address:" + addr + " rounding; hyprctl getprop address:" + addr + " rounding_power",
     ]
     root._hideAddress = addr
+    // Capture the window's current mode (floating / fullscreen / pinned) and
+    // geometry so they can be restored exactly when the window is reopened;
+    // hidden windows are forced back to plain tiling.
+    root._hideFloating = String(win.floating === true)
+    root._hideFullscreen = String(win.fullscreen || 0)
+    root._hideFullscreenClient = String(win.fullscreenClient || 0)
+    root._hidePinned = String(win.pinned === true)
+    const pos = win.at || [0, 0]
+    const size = win.size || [0, 0]
+    root._hideX = String(pos[0] || 0)
+    root._hideY = String(pos[1] || 0)
+    root._hideW = String(size[0] || 0)
+    root._hideH = String(size[1] || 0)
     propProc.running = true
   }
 
   property string _hideAddress: ""
+  property string _hideFloating: ""
+  property string _hideFullscreen: ""
+  property string _hideFullscreenClient: ""
+  property string _hidePinned: ""
+  property string _hideX: ""
+  property string _hideY: ""
+  property string _hideW: ""
+  property string _hideH: ""
 
   Process {
     id: propProc
@@ -367,6 +401,22 @@ Item {
     const addr = root._hideAddress
     root._hideAddress = ""
     if (!addr) return
+    const floating = root._hideFloating
+    const fullscreen = root._hideFullscreen
+    const fullscreenClient = root._hideFullscreenClient
+    const pinned = root._hidePinned
+    const x = root._hideX
+    const y = root._hideY
+    const w = root._hideW
+    const h = root._hideH
+    root._hideFloating = ""
+    root._hideFullscreen = ""
+    root._hideFullscreenClient = ""
+    root._hidePinned = ""
+    root._hideX = ""
+    root._hideY = ""
+    root._hideW = ""
+    root._hideH = ""
     const values = String(raw || "").split("\n").map(function (line) {
       return line.trim()
     })
@@ -384,7 +434,29 @@ Item {
       opacityInactive: opacityInactive,
       rounding: rounding,
       roundingPower: roundingPower,
+      floating: floating,
+      fullscreen: fullscreen,
+      fullscreenClient: fullscreenClient,
+      pinned: pinned,
+      x: x,
+      y: y,
+      w: w,
+      h: h,
     })
+    // Force the hidden window back to plain tiling (no floating, no
+    // fullscreen, no pin); the captured mode is restored on reopen.
+    root.dispatch([
+      "hyprctl", "dispatch",
+      'hl.dsp.window.float({ window = "address:' + addr + '", action = "off" })',
+    ])
+    root.dispatch([
+      "hyprctl", "dispatch",
+      'hl.dsp.window.fullscreen_state({ window = "address:' + addr + '", internal = 0, client = 0, action = "set" })',
+    ])
+    root.dispatch([
+      "hyprctl", "dispatch",
+      'hl.dsp.window.pin({ window = "address:' + addr + '", action = "off" })',
+    ])
     root.dispatch([
       "hyprctl", "dispatch",
       'hl.dsp.window.move({ window = "address:' + addr + '", workspace = "' + root.graceWorkspace + '", follow = false })',
@@ -425,6 +497,14 @@ Item {
   property string _reopenOpacityInactive: ""
   property string _reopenRounding: ""
   property string _reopenRoundingPower: ""
+  property string _reopenFloating: ""
+  property string _reopenFullscreen: ""
+  property string _reopenFullscreenClient: ""
+  property string _reopenPinned: ""
+  property string _reopenX: ""
+  property string _reopenY: ""
+  property string _reopenW: ""
+  property string _reopenH: ""
 
   Process {
     id: workspaceProc
@@ -478,6 +558,47 @@ Item {
       "hyprctl", "dispatch",
       'hl.dsp.focus({ window = "address:' + addr + '" })',
     ])
+    // Restore the window mode and geometry it had before it was hidden.
+    if (root._reopenFloating === "true") {
+      root.dispatch([
+        "hyprctl", "dispatch",
+        'hl.dsp.window.float({ window = "address:' + addr + '", action = "on" })',
+      ])
+      const w = Number(root._reopenW)
+      const h = Number(root._reopenH)
+      if (w > 0 && h > 0) {
+        root.dispatch([
+          "hyprctl", "dispatch",
+          'hl.dsp.window.resize({ window = "address:' + addr + '", x = ' + root._reopenW + ', y = ' + root._reopenH + ' })',
+        ])
+      }
+      root.dispatch([
+        "hyprctl", "dispatch",
+        'hl.dsp.window.move({ window = "address:' + addr + '", x = ' + root._reopenX + ', y = ' + root._reopenY + ' })',
+      ])
+    }
+    if (root._reopenPinned === "true") {
+      root.dispatch([
+        "hyprctl", "dispatch",
+        'hl.dsp.window.pin({ window = "address:' + addr + '", action = "on" })',
+      ])
+    }
+    const fullscreen = Number(root._reopenFullscreen)
+    const fullscreenClient = Number(root._reopenFullscreenClient)
+    if (fullscreen > 0 || fullscreenClient > 0) {
+      root.dispatch([
+        "hyprctl", "dispatch",
+        'hl.dsp.window.fullscreen_state({ window = "address:' + addr + '", internal = ' + root._reopenFullscreen + ', client = ' + root._reopenFullscreenClient + ', action = "set" })',
+      ])
+    }
+    root._reopenFloating = ""
+    root._reopenFullscreen = ""
+    root._reopenFullscreenClient = ""
+    root._reopenPinned = ""
+    root._reopenX = ""
+    root._reopenY = ""
+    root._reopenW = ""
+    root._reopenH = ""
   }
 
   // ---------------------------------------------------------------- sweep

@@ -6,7 +6,8 @@
 --
 -- On service start the plugin copies the block below into your
 -- ~/.config/hypr/bindings.lua, exactly once. This file is the source of the
--- managed block; uninstall.sh removes only that block and never touches any
+-- managed block.
+-- On service teardown the plugin removes only that block and never touches any
 -- other binding.
 
 -- BEGIN Grace Window (jam.grace-window) managed block - do not edit this comment
