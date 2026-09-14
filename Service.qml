@@ -6,14 +6,17 @@
 //              query started, "busy" when a previous query is still in flight.
 //              The window is forced back to plain tiling (no floating,
 //              fullscreen, or pin) while hidden; its previous mode is captured
-//              and restored on reopen. The grace timer pauses while the hidden
-//              window keeps focus.
+//              and restored on reopen. If the window is part of a tabbed
+//              group, only the focused window is pulled out and hidden; the
+//              rest of the group stays in place. The grace timer pauses while
+//              the hidden window keeps focus.
 //   reopen()   Bring a hidden window back to the current workspace and focus
 //              it, cancelling its pending auto-close and restoring the window
-//              mode it had before it was hidden. When the focused window
-//              is itself hidden it is preferred; otherwise the most recently
-//              hidden window is reopened. Returns "none" when there is nothing
-//              pending.
+//              mode it had before it was hidden. If the window was previously
+//              part of a group on the current workspace it is moved back into
+//              that group. When the focused window is itself hidden it is
+//              preferred; otherwise the most recently hidden window is
+//              reopened. Returns "none" when there is nothing pending.
 //   status()   "idle", or "pending Ns" for the most recent hidden window.
 //   cancel()   Forget every pending window (does not close them).
 //
@@ -32,10 +35,7 @@
 // REMOVE   : backup (.bak) in unwireBindings? (no backup in wireBindings...)
 // IMPLEMENT: Reopen tiled window where it was
 // IMPLEMENT: Reopen in scratchpad does not work yet
-// IMPLEMENT: Grouping behaviour:
-//            Currently: Whole group gets hidden in grace workspace
-//            Should be: hide  : move out of group, then hide
-//                       reopen: reopen, then move to group where it was
+// IMPLEMENT: Cancel should remove grace look?
 
 import QtQuick
 import Quickshell
@@ -341,6 +341,7 @@ Item {
       root._reopenY = String(entry.y)
       root._reopenW = String(entry.w)
       root._reopenH = String(entry.h)
+      root._reopenGrouped = (entry.grouped || []).slice()
       workspaceProc.running = true
       return
     }
@@ -376,6 +377,10 @@ Item {
     root._hideY = String(pos[1] || 0)
     root._hideW = String(size[0] || 0)
     root._hideH = String(size[1] || 0)
+    // Remember any tabbed group the window belonged to (win.grouped lists
+    // every member, including the window itself) so reopen can send it back.
+    const grouped = win.grouped || []
+    root._hideGrouped = grouped.length > 0 ? grouped.slice() : []
     propProc.running = true
   }
 
@@ -388,6 +393,7 @@ Item {
   property string _hideY: ""
   property string _hideW: ""
   property string _hideH: ""
+  property var _hideGrouped: []
 
   Process {
     id: propProc
@@ -409,6 +415,7 @@ Item {
     const y = root._hideY
     const w = root._hideW
     const h = root._hideH
+    const grouped = root._hideGrouped
     root._hideFloating = ""
     root._hideFullscreen = ""
     root._hideFullscreenClient = ""
@@ -417,6 +424,7 @@ Item {
     root._hideY = ""
     root._hideW = ""
     root._hideH = ""
+    root._hideGrouped = []
     const values = String(raw || "").split("\n").map(function (line) {
       return line.trim()
     })
@@ -442,7 +450,17 @@ Item {
       y: y,
       w: w,
       h: h,
+      grouped: grouped,
     })
+    // Pull the window out of any tabbed group before moving it so only this
+    // window is hidden; the remaining members stay together on the original
+    // workspace.
+    if (grouped.length > 0) {
+      root.dispatch([
+        "hyprctl", "dispatch",
+        'hl.dsp.window.move({ window = "address:' + addr + '", out_of_group = true })',
+      ])
+    }
     // Force the hidden window back to plain tiling (no floating, no
     // fullscreen, no pin); the captured mode is restored on reopen.
     root.dispatch([
@@ -505,6 +523,7 @@ Item {
   property string _reopenY: ""
   property string _reopenW: ""
   property string _reopenH: ""
+  property var _reopenGrouped: []
 
   Process {
     id: workspaceProc
@@ -599,6 +618,40 @@ Item {
     root._reopenY = ""
     root._reopenW = ""
     root._reopenH = ""
+    // Re-insert the window into the tabbed group it was in before it was
+    // hidden.  The direction is computed from live geometry so the window
+    // joins the correct group regardless of layout.  Routed through the
+    // dispatch queue so it lands after the move and focus above.
+    if (root._reopenGrouped.length > 0) {
+      root.dispatch(root.regroupCommand(addr, root._reopenGrouped))
+    }
+    root._reopenGrouped = []
+  }
+
+  // Builds a queue entry that waits for the preceding move/focus dispatches
+  // to land, then computes the direction from the window to the nearest
+  // remaining member of its old group and joins that group via into_group.
+  function regroupCommand(addr, grouped) {
+    const members = grouped.join(",")
+    const jqProg =
+      'def cx: .at[0] + (.size[0] / 2);\n' +
+      'def cy: .at[1] + (.size[1] / 2);\n' +
+      '($m | split(",")) as $mems\n' +
+      '| (map(select(.address == $a)) | first // empty) as $win\n' +
+      '| map(select(.address != $a and ([.address] - $mems | length == 0))) as $group\n' +
+      '| $group | map(select(.workspace.id == $win.workspace.id)) | map({dx: (cx - ($win | cx)), dy: (cy - ($win | cy)), d: (((cx - ($win|cx)) * (cx - ($win|cx))) + ((cy - ($win|cy)) * (cy - ($win|cy))))}) | sort_by(.d)[0] as $best\n' +
+      '| if $best then (if (($best.dx | fabs) >= ($best.dy | fabs)) then (if $best.dx > 0 then "r" else "l" end) else (if $best.dy > 0 then "d" else "u" end) end) else empty end\n'
+    const body =
+      'set -u\n' +
+      'a="$1"\n' +
+      'm="$2"\n' +
+      'prog="$3"\n' +
+      'sleep 0.2\n' +
+      'dir=$(hyprctl -j clients 2>/dev/null | jq -r --arg a "$a" --arg m "$m" "$prog")\n' +
+      'if [[ -n "$dir" ]]; then\n' +
+      '  hyprctl dispatch "hl.dsp.window.move({ window = \\\"address:$a\\\", into_group = \\\"$dir\\\" })" >/dev/null 2>&1\n' +
+      'fi\n'
+    return ["bash", "-c", body, "grace-regroup", addr, members, jqProg]
   }
 
   // ---------------------------------------------------------------- sweep

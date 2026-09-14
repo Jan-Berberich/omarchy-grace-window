@@ -20,9 +20,12 @@ closed for real:
   for real, immediately. It can not be reopened again.
 - **Grace period**: time to reopen gracefully closed window before it gets
   closed for real. Pauses if gracefully closed window is focused.
-- **Grace look**: A gracefully closed window gets a distinctive look so you
+- **Grace look**: a gracefully closed window gets a distinctive look so you
   can tell it will close soon: a 10% lower opacity, cut corners and always in 
   *tiling* mode.
+- **Grace groups**: only the focused window of a tabbed group is hidden; the
+  rest of the group stays in place. On reopen it is moved back into the group
+  it was in.
 
 The feature is a *service* plugin: the state lives in the long-lived
 `omarchy-shell` process, and the keybindings drive it over Quickshell IPC
