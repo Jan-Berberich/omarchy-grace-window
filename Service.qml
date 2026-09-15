@@ -13,7 +13,8 @@
 //   reopen()   Bring a hidden window back to the current workspace and focus
 //              it, cancelling its pending auto-close and restoring the window
 //              mode it had before it was hidden. If the window the user is
-//              focusing is part of a tabbed group, the reopened window is
+//              focusing is part of a tabbed group and the reopened window was
+//              in tiling mode before it was hidden, the reopened window is
 //              moved into that group. When the focused window is itself
 //              hidden it is preferred; otherwise the most recently hidden
 //              window is reopened. Returns "none" when there is nothing
@@ -54,6 +55,10 @@ Item {
   readonly property double graceRoundingPower: 1
   // Windows in grace period also fade to 90% of their normal opacity.
   readonly property double graceOpacityFactor: 0.9
+
+  // Grouping delay is needed for some apps to refresh graphics properly after
+  // grouping. Set to 0.1 or higher if needed for your apps
+  readonly property double groupingDelay: 0.0
 
   // The shell wires the enabled plugin's manifest (including its __sourceDir)
   // onto services that declare this property, so the service can find its own
@@ -461,12 +466,16 @@ Item {
     // workspace.
     if (grouped.length > 0) {
       root.dispatch([
-        "hyprctl", "dispatch",
-        'hl.dsp.window.move({ window = "address:' + addr + '", out_of_group = true })',
+        "bash", "-c",
+        'hyprctl dispatch "hl.dsp.window.move({ window = \\\"address:' + addr + '\\\", out_of_group = true })"; ' +
+        'sleep ' + String(root.groupingDelay),
       ])
     }
-    // Force the hidden window back to plain tiling (no floating, no
-    // fullscreen, no pin); the captured mode is restored on reopen.
+    // Hide the window, force it to tiling mode and set the grace look
+    root.dispatch([
+      "hyprctl", "dispatch",
+      'hl.dsp.window.move({ window = "address:' + addr + '", workspace = "' + root.graceWorkspace + '", follow = false })',
+    ])
     root.dispatch([
       "hyprctl", "dispatch",
       'hl.dsp.window.float({ window = "address:' + addr + '", action = "off" })',
@@ -478,10 +487,6 @@ Item {
     root.dispatch([
       "hyprctl", "dispatch",
       'hl.dsp.window.pin({ window = "address:' + addr + '", action = "off" })',
-    ])
-    root.dispatch([
-      "hyprctl", "dispatch",
-      'hl.dsp.window.move({ window = "address:' + addr + '", workspace = "' + root.graceWorkspace + '", follow = false })',
     ])
     // Cut corners and a slight fade mark the window as being in its grace period.
     root.dispatch([
@@ -573,20 +578,6 @@ Item {
     ])
     root._reopenRounding = ""
     root._reopenRoundingPower = ""
-    root.dispatch([
-      "hyprctl", "dispatch",
-      'hl.dsp.window.move({ window = "address:' + addr + '", workspace = "' + id + '" })',
-    ])
-    // If the window that had focus when reopening was triggered is part of a
-    // tabbed group, move the reopened window into that group. It targets the
-    // group by the focused window's address, so it is independent of whatever
-    // has focus by the time the dispatches run. It no-ops when the focused
-    // window is not in a group (or is gone).
-    root.dispatch(root.regroupCommand(addr, root._reopenFocusAddress))
-    root.dispatch([
-      "hyprctl", "dispatch",
-      'hl.dsp.focus({ window = "address:' + addr + '" })',
-    ])
     // Restore the window mode and geometry it had before it was hidden.
     if (root._reopenFloating === "true") {
       root.dispatch([
@@ -620,6 +611,16 @@ Item {
         'hl.dsp.window.fullscreen_state({ window = "address:' + addr + '", internal = ' + root._reopenFullscreen + ', client = ' + root._reopenFullscreenClient + ', action = "set" })',
       ])
     }
+    root.dispatch([
+      "hyprctl", "dispatch",
+      'hl.dsp.window.move({ window = "address:' + addr + '", workspace = "' + id + '" })',
+    ])
+    // If the window that had focus when reopening was triggered is part of a
+    // tabbed group, move the reopened window into that group. It targets the
+    // group by the focused window's address, so it is independent of whatever
+    // has focus by the time the dispatches run. It no-ops when the focused
+    // window is not in a group (or is gone).
+    root.dispatch(root.regroupCommand(addr, root._reopenFocusAddress))
     root._reopenFloating = ""
     root._reopenFullscreen = ""
     root._reopenFullscreenClient = ""
@@ -658,7 +659,8 @@ Item {
       'clients=$(hyprctl -j clients 2>/dev/null)\n' +
       'dir=$(printf "%s" "$clients" | jq -r --arg a "$a" --arg f "$f" "$prog")\n' +
       'if [[ -n "$dir" ]]; then\n' +
-      '  hyprctl dispatch "hl.dsp.window.move({ window = \\\"address:$a\\\", into_group = \\\"$dir\\\" })" >/dev/null 2>&1\n' +
+      '  sleep ' + String(root.groupingDelay) + '; ' +
+        'hyprctl dispatch "hl.dsp.window.move({ window = \\\"address:$a\\\", into_group = \\\"$dir\\\" })" >/dev/null 2>&1\n' +
       'fi\n'
     return ["bash", "-c", body, "grace-regroup", addr, focusAddr, jqProg]
   }

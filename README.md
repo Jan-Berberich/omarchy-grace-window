@@ -23,9 +23,10 @@ closed for real:
 - **Grace look**: a gracefully closed window gets a distinctive look so you
   can tell it will close soon: a 10% lower opacity, cut corners and always in 
   *tiling* mode.
-- **Grace groups**: only the focused window of a tabbed group is hidden, the
-  rest of the group stays in place. On reopen the window joins the group that
-  currently has focus.
+- **Grace groups**: the behaviour is as you would expect in omarchy:
+  Only the focused window of a tabbed group get gracefully closed, the rest of
+  the group stays in place. On reopen the window (if in tiling mode) joins the
+  group that currently has focus.
 
 The feature is a *service* plugin: the state lives in the long-lived
 `omarchy-shell` process, and the keybindings drive it over Quickshell IPC
@@ -82,12 +83,15 @@ omarchy-shell grace-window cancel     # forget pendings without closing
 The plugin gets installed to `~/.config/omarchy/plugins/jam.grace-window`.
 Here you can change what you want. Just disable and enable the plugin again
 for changes to take effect.
-- Grace period in `Service.qml` can be edited: `graceMs`.
-- The grace look (workspace, cut corners, opacity reduction) can be tuned in
+- **Keybindings** should be edited in the plugins `hypr/bindings.lua` for them to
+  persist `Service.qml` restarts.
+- **Grace period** in `Service.qml` can be edited: `graceMs`.
+- **Grace look** (workspace, cut corners, opacity reduction) can be tuned in
   `Service.qml` too: `graceWorkspace`, `graceRounding`,
   `graceRoundingPower`, `graceOpacityFactor`.
-- Keybindings should be edited in the plugins `hypr/bindings.lua` for them to
-  persist `Service.qml` restarts.
+- If you experience graphical glitches for some apps when using the
+  **Grace groups** feature, try to increase `groupingDelay`, or move the
+  window slightly to refresh graphics.
 
 ## Notes
 
