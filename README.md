@@ -28,6 +28,10 @@ closed for real:
   the group stays in place. On reopen the window (if in tiling mode) joins the
   group that currently has focus.
 
+The Plugin also can be used nicely to reoder windows on your workspace, as
+they will reopen predictably to the right or bottom of the focused window,
+depending on its aspect ratio.
+
 The feature is a *service* plugin: the state lives in the long-lived
 `omarchy-shell` process, and the keybindings drive it over Quickshell IPC
 (`omarchy-shell grace-window hide` / `reopen`), so there is no standalone
@@ -83,15 +87,16 @@ omarchy-shell grace-window cancel     # forget pendings without closing
 The plugin gets installed to `~/.config/omarchy/plugins/jam.grace-window`.
 Here you can change what you want. Just disable and enable the plugin again
 for changes to take effect.
-- **Keybindings** should be edited in the plugins `hypr/bindings.lua` for them to
-  persist `Service.qml` restarts.
+- **Keybindings** should be edited in the plugins `hypr/bindings.lua` for them
+  to persist `Service.qml` restarts.
 - **Grace period** in `Service.qml` can be edited: `graceMs`.
 - **Grace look** (workspace, cut corners, opacity reduction) can be tuned in
   `Service.qml` too: `graceWorkspace`, `graceRounding`,
   `graceRoundingPower`, `graceOpacityFactor`.
 - If you experience graphical glitches for some apps when using the
-  **Grace groups** feature, try to increase `groupingDelay`, or move the
-  window slightly to refresh graphics.
+  **Grace groups** feature, try to increase `groupingDelay`, or refresh the
+  graphics manually (e.g. by toggling fullscreen and back). Note that this
+  plugin exposes these glitches, rather then being the root cause of them.
 
 ## Notes
 
