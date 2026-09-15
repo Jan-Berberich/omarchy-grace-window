@@ -578,9 +578,9 @@ Item {
       'hl.dsp.window.move({ window = "address:' + addr + '", workspace = "' + id + '" })',
     ])
     // If the window that had focus when reopening was triggered is part of a
-    // tabbed group, move the reopened window into that group.  It targets the
+    // tabbed group, move the reopened window into that group. It targets the
     // group by the focused window's address, so it is independent of whatever
-    // has focus by the time the dispatches run.  It no-ops when the focused
+    // has focus by the time the dispatches run. It no-ops when the focused
     // window is not in a group (or is gone).
     root.dispatch(root.regroupCommand(addr, root._reopenFocusAddress))
     root.dispatch([
@@ -631,13 +631,14 @@ Item {
     root._reopenFocusAddress = ""
   }
 
-  // Builds a queue entry that waits until the move above has landed, then looks
-  // up the window that had focus when reopening was triggered (focusAddr).
-  // If that window still exists, is part of a tabbed group, and the group is
-  // on the same workspace as the reopened window, the reopened window is
-  // moved into that group via into_group.  It does nothing when the focused
-  // window is not in a group, when the reopened window already belongs to a
-  // group, or when the group is on another workspace.
+  // Builds a queue entry that runs after the move above has been applied (the
+  // dispatch queue keeps ordering), then looks up the window that had focus
+  // when reopening was triggered (focusAddr). If that window still exists,
+  // is part of a tabbed group, and the group is on the same workspace as the
+  // reopened window, the reopened window is moved into that group via
+  // into_group. It does nothing when the focused window is not in a group,
+  // when the reopened window already belongs to a group, or when the group is
+  // on another workspace.
   function regroupCommand(addr, focusAddr) {
     const jqProg =
       'def cx: .at[0] + (.size[0] / 2);\n' +
@@ -654,7 +655,6 @@ Item {
       'a="$1"\n' +
       'f="$2"\n' +
       'prog="$3"\n' +
-      'sleep 0.2\n' +
       'clients=$(hyprctl -j clients 2>/dev/null)\n' +
       'dir=$(printf "%s" "$clients" | jq -r --arg a "$a" --arg f "$f" "$prog")\n' +
       'if [[ -n "$dir" ]]; then\n' +
