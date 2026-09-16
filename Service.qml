@@ -36,7 +36,7 @@
 // TODO:
 // REMOVE   : backup (.bak) in unwireBindings? (no backup in wireBindings...)
 // IMPLEMENT: Reopen in scratchpad does not work yet
-// IMPLEMENT: Cancel should remove grace look?
+// IMPLEMENT: Cancel should remove grace look? (and run on teardown?)
 
 import QtQuick
 import Quickshell
@@ -386,8 +386,9 @@ Item {
     root._hideY = String(pos[1] || 0)
     root._hideW = String(size[0] || 0)
     root._hideH = String(size[1] || 0)
-    // Remember any tabbed group the window belonged to (win.grouped lists
-    // every member, including the window itself) so reopen can send it back.
+    // Remember whether the window belonged to a tabbed group (win.grouped
+    // lists every member, including the window itself) so hide can pull it
+    // out of the group before moving it to the grace workspace.
     const grouped = win.grouped || []
     root._hideGrouped = grouped.length > 0 ? grouped.slice() : []
     propProc.running = true
@@ -459,7 +460,6 @@ Item {
       y: y,
       w: w,
       h: h,
-      grouped: grouped,
     })
     // Pull the window out of any tabbed group before moving it so only this
     // window is hidden; the remaining members stay together on the original
@@ -619,7 +619,8 @@ Item {
     // tabbed group, move the reopened window into that group. It targets the
     // group by the focused window's address, so it is independent of whatever
     // has focus by the time the dispatches run. It no-ops when the focused
-    // window is not in a group (or is gone).
+    // window is not in a group (or is gone). This operation only works for
+    // tiled windows
     root.dispatch(root.regroupCommand(addr, root._reopenFocusAddress))
     root._reopenFloating = ""
     root._reopenFullscreen = ""
