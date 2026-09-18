@@ -1,40 +1,35 @@
-// Grace Window — hide to workspace 10 with a reopen grace period.
+// Grace Window — hide a window to workspace 10 with a one-minute reopen grace.
 //
 // IPC target: "grace-window"
-//   hide()     Move the focused window silently to workspace 10 and give it a
-//              one-minute grace period. Returns "requested" when the address
-//              query started, "busy" when a previous query is still in flight.
-//              The window is forced back to plain tiling (no floating,
-//              fullscreen, or pin) while hidden; its previous mode is captured
-//              and restored on reopen. If the window is part of a tabbed
-//              group, only the focused window is pulled out and hidden; the
-//              rest of the group stays in place. The grace timer pauses while
-//              the hidden window keeps focus.
-//   reopen()   Bring a hidden window back to the current workspace and focus
-//              it, cancelling its pending auto-close and restoring the window
-//              mode it had before it was hidden. If the window the user is
-//              focusing is part of a tabbed group and the reopened window was
-//              in tiling mode before it was hidden, the reopened window is
-//              moved into that group. When the focused window is itself
-//              hidden it is preferred; otherwise the most recently hidden
-//              window is reopened. Returns "none" when there is nothing
-//              pending.
+//   hide()     Move the focused window silently to workspace 10 and start its
+//              grace period: force it to plain tiling (no floating, no
+//              fullscreen, no pin) and capture its look, mode and geometry so
+//              reopen can restore them. In a tabbed group only the focused
+//              window is pulled out; the rest stays. The grace timer pauses
+//              while the hidden window keeps focus. Returns "requested" when
+//              the operation starts, "busy" while another is in flight.
+//   reopen()   Bring a hidden window back to the current workspace, focus it,
+//              cancel its auto-close and restore its captured state. The
+//              focused window is preferred when hidden; otherwise the most
+//              recently hidden is reopened. A tiled reopened window joins the
+//              tabbed group that currently has focus. Returns "none" when
+//              nothing is pending.
 //   status()   "idle", or "pending Ns" for the most recent hidden window.
 //   cancel()   Forget every pending window (does not close them).
 //
-// Window death on an expired grace period uses Hyprland's Lua dispatcher
-// syntax (Hyprland >= 0.55): hyprctl dispatch 'hl.dsp.window.close(...)'.
+// Grace expiry closes the window through Hyprland's Lua dispatcher (>= 0.55).
+// A dispatch expression is evaluated in Hyprland's config Lua VM as
+// `return hl.dispatch(<expr>)`, so it must evaluate to a dispatcher. The
+// plugin dispatches through scripts/grace-window.lua — the single file
+// holding every hl.dsp call — whose functions return their dispatcher.
 //
-// No install.sh: on service start the managed keybinding block from this
-// plugin's own hypr/bindings.lua is appended to ~/.config/hypr/bindings.lua
-// (when not already present) and Hyprland is reloaded, so enabling the plugin
-// is all that is needed. The managed block is also removed when the service
-// is torn down (plugin remove/disable, shell shutdown), so removing the plugin
-// through omarchy's plugin system cleans up cleanly without an uninstaller
-// script.
+// The service is a thin state machine over scripts/: one shell script answers
+// the hide and reopen queries with ready-to-use JSON, and the other shell
+// operations (binding wiring, grouping) are its subcommands. On start the
+// plugin's managed keybinding block from hypr/bindings.lua is appended to
+// ~/.config/hypr/bindings.lua (when missing); on teardown it is removed.
 
 // TODO:
-// REMOVE   : backup (.bak) in unwireBindings? (no backup in wireBindings...)
 // IMPLEMENT: Reopen in scratchpad does not work yet
 // IMPLEMENT: Cancel should remove grace look? (and run on teardown?)
 
@@ -45,6 +40,7 @@ import Quickshell.Io
 Item {
   id: root
 
+  // ------------------------------------------------------------ configuration
   // Grace period in milliseconds before a hidden window is closed for real.
   readonly property int graceMs: 60000
 
@@ -56,20 +52,29 @@ Item {
   // Windows in grace period also fade to 90% of their normal opacity.
   readonly property double graceOpacityFactor: 0.9
 
-  // Grouping delay is needed for some apps to refresh graphics properly after
-  // grouping. Set to 0.1 or higher if needed for your apps
-  readonly property double groupingDelay: 0.0
+  // Some apps need a beat to refresh their graphics after (un)grouping.
+  // set to 0.0 for faster animations (may glitch graphics after (un)grouping)
+  // set to 0.1 or higher for slower animations (prevent graphical glitches)
+  readonly property double groupingDelay: 0.1
 
-  // The shell wires the enabled plugin's manifest (including its __sourceDir)
-  // onto services that declare this property, so the service can find its own
-  // hypr/bindings.lua without any install script.
+  // ------------------------------------------------------------ the plugin dir
+  // The shell wires the plugin manifest (with __sourceDir) onto services that
+  // declare `manifest`, locating this plugin's hypr/ and scripts/ without an
+  // install script. Falls back to the well-known install location if the
+  // shell ever stops wiring it.
   property var manifest: null
+  readonly property string sourceDir:
+    root.manifest && root.manifest.__sourceDir
+      ? String(root.manifest.__sourceDir)
+      : Quickshell.env("HOME") + "/.config/omarchy/plugins/jam.grace-window"
+
+  readonly property string scriptsDir: root.sourceDir + "/scripts"
+  readonly property string bashScript: root.scriptsDir + "/grace-window.sh"
+  readonly property string luaScript: root.scriptsDir + "/grace-window.lua"
 
   // Pending hidden windows, newest last. Each entry keeps its remaining
   // grace time; the sweep pauses it while that window keeps focus.
   property var pending: []
-
-  property bool queryBusy: false
 
   // Timestamp of the last sweep tick and address of the currently focused
   // window, used to pause a window's grace timer while it is focused.
@@ -97,172 +102,9 @@ Item {
     }
   }
 
-  // --------------------------------------------------- keybinding wiring
-  //
-  // install.sh used to append the plugin's keybindings to
-  // ~/.config/hypr/bindings.lua. The service now owns that step: on start it
-  // appends the managed block from its own hypr/bindings.lua when it is not
-  // already present, then reloads Hyprland. Re-running is a safe no-op, so
-  // shell restarts and plugin hot-reloads never duplicate the block.
-  readonly property string bindingsBlockBgn:
-    "-- BEGIN Grace Window (jam.grace-window) managed block - do not edit this comment"
-  readonly property string bindingsBlockEnd:
-    "-- END Grace Window (jam.grace-window) managed block - do not edit this comment"
-
-  function wireBindings() {
-    const manifestDir = root.manifest && root.manifest.__sourceDir
-      ? String(root.manifest.__sourceDir) : ""
-    // Fall back to the well-known install location in case a shell version
-    // ever stops wiring the manifest property.
-    const sourceDir = manifestDir
-      || Quickshell.env("HOME") + "/.config/omarchy/plugins/jam.grace-window"
-    // The block is installed with an owner-checked, symlink-resistant atomic
-    // replace instead of an in-place append (">>"), which follows symlinks and
-    // could strand a partially written block on failure. Every path component
-    // of the target must be owned by the current user (or root), must not be a
-    // symlink, and directories must not be group/other writable. The new
-    // content is staged in a temp file in the same directory (so the rename is
-    // atomic) and never touches anything outside the managed block.
-    const script =
-      'set -u\n' +
-      'src="$1"; target="$2"; start="$3"; end="$4"\n' +
-      'tmpfile=""\n' +
-      'say() { echo "grace-window: $*"; }\n' +
-      'fail() {\n' +
-      '  if [[ -n "$tmpfile" ]]; then rm -f "$tmpfile"; fi\n' +
-      '  say "ERROR: $*"\n' +
-      '  exit 1\n' +
-      '}\n' +
-      'uid=$(id -u)\n' +
-      '[[ "$target" == /* ]] || fail "target is not absolute: $target"\n' +
-      'if [[ ! -f "$src" ]]; then say "source bindings missing: $src"; exit 0; fi\n' +
-      'if [[ ! -f "$target" ]]; then say "hyprland bindings file not found: $target"; exit 0; fi\n' +
-      'if grep -qFs -- "$start" "$target"; then say "keybindings already wired; nothing to do"; exit 0; fi\n' +
-      'l0=$(grep -nFs -- "$start" "$src" | head -n1 | cut -d: -f1)\n' +
-      'l1=$(grep -nFs -- "$end" "$src" | head -n1 | cut -d: -f1)\n' +
-      'if [[ -z "$l0" || -z "$l1" ]]; then fail "managed block not found in $src"; fi\n' +
-      'if (( l0 > l1 )); then fail "managed block markers out of order in $src"; fi\n' +
-      'cur="/"\n' +
-      'IFS=/ read -r -a comps <<< "${target#/}"\n' +
-      'for comp in "${comps[@]}"; do\n' +
-      '  [[ -n "$comp" ]] || continue\n' +
-      '  cur="${cur%/}/$comp"\n' +
-      '  [[ -L "$cur" ]] && fail "refusing to write: $cur is a symlink"\n' +
-      '  owner=$(stat -c "%u" "$cur" 2>/dev/null) || fail "cannot stat $cur"\n' +
-      '  if [[ "$owner" != "$uid" && "$owner" != 0 ]]; then fail "refusing to write: $cur is owned by uid $owner, not you"; fi\n' +
-      '  if [[ -d "$cur" ]]; then\n' +
-      '    mode=$(stat -c "%a" "$cur")\n' +
-      '    if (( (8#$mode & 0022) != 0 )); then fail "refusing to write: $cur is group/other writable (mode $mode)"; fi\n' +
-      '  fi\n' +
-      'done\n' +
-      'dir=$(dirname "$target")\n' +
-      'tmpfile=$(mktemp "$dir/bindings.lua.tmp.XXXXXX") || fail "could not create temporary file"\n' +
-      'orig_mode=$(stat -c "%a" "$target")\n' +
-      '{\n' +
-      '  cat "$target"\n' +
-      '  echo ""\n' +
-      '  sed -n "${l0},${l1}p" "$src"\n' +
-      '} > "$tmpfile" || fail "could not write temporary file"\n' +
-      'chmod "$orig_mode" "$tmpfile" || fail "could not set permissions on temporary file"\n' +
-      'mv -f "$tmpfile" "$target" || fail "could not atomically replace $target"\n' +
-      'tmpfile=""\n' +
-      'if ! grep -qFs -- "$start" "$target"; then fail "failed to wire keybindings into $target"; fi\n' +
-      'hyprctl reload >/dev/null 2>&1 || true\n' +
-      'say "keybindings wired into $target and hyprland reloaded"'
-    wireProc.command = ["bash", "-c", script, "--",
-      sourceDir + "/hypr/bindings.lua",
-      Quickshell.env("HOME") + "/.config/hypr/bindings.lua",
-      root.bindingsBlockBgn,
-      root.bindingsBlockEnd]
-    wireProc.running = true
-  }
-
-  // Reverses wireBindings: removes ONLY the managed keybinding block from
-  // ~/.config/hypr/bindings.lua, plus the blank line wireBindings inserts
-  // right before it (dropped only while it is still present), restoring every
-  // binding that predated the plugin. Runs detached (Quickshell.execDetached)
-  // because it is triggered from Component.onDestruction, when the service's
-  // own objects are already being torn down and a child Process could not
-  // reliably outlive them. The script never depends on the plugin's own files,
-  // which omarchy deletes right after it disables the plugin. Fails closed on
-  // any marker mismatch, leaving the file untouched.
-  function unwireBindings() {
-    const target = Quickshell.env("HOME") + "/.config/hypr/bindings.lua"
-    const script =
-      'set -u\n' +
-      'target="$1"; start="$2"; end="$3"\n' +
-      'tmpfile=""\n' +
-      'say() { echo "grace-window: $*"; }\n' +
-      'fail() {\n' +
-      '  if [[ -n "$tmpfile" ]]; then rm -f "$tmpfile"; fi\n' +
-      '  say "ERROR: $*"\n' +
-      '  exit 1\n' +
-      '}\n' +
-      'if [[ "$target" != /* ]]; then fail "target is not absolute: $target"; fi\n' +
-      'if [[ ! -f "$target" ]]; then say "bindings file not found: $target; nothing to clean"; exit 0; fi\n' +
-      'starts=$(grep -cFs -- "$start" "$target" || true)\n' +
-      'ends=$(grep -cFs -- "$end" "$target" || true)\n' +
-      'if (( starts == 0 )) || (( ends == 0 )) || (( starts != ends )); then\n' +
-      '  say "managed block markers not found intact in $target; leaving file untouched"; exit 0\n' +
-      'fi\n' +
-      'uid=$(id -u)\n' +
-      'cur="/"\n' +
-      'IFS=/ read -r -a comps <<< "${target#/}"\n' +
-      'for comp in "${comps[@]}"; do\n' +
-      '  [[ -n "$comp" ]] || continue\n' +
-      '  cur="${cur%/}/$comp"\n' +
-      '  [[ -L "$cur" ]] && fail "refusing to write: $cur is a symlink"\n' +
-      '  owner=$(stat -c "%u" "$cur" 2>/dev/null) || fail "cannot stat $cur"\n' +
-      '  if [[ "$owner" != "$uid" && "$owner" != 0 ]]; then fail "refusing to write: $cur is owned by uid $owner, not you"; fi\n' +
-      '  if [[ -d "$cur" ]]; then\n' +
-      '    mode=$(stat -c "%a" "$cur")\n' +
-      '    if (( (8#$mode & 0022) != 0 )); then fail "refusing to write: $cur is group/other writable (mode $mode)"; fi\n' +
-      '  fi\n' +
-      'done\n' +
-      'cp "$target" "$target.bak.$(date -u +%Y%m%d%H%M%S)"\n' +
-      'tmpfile=$(mktemp "${target}.tmp.XXXXXX") || fail "could not create temporary file"\n' +
-      'orig_mode=$(stat -c "%a" "$target")\n' +
-      'awk -v s="$start" -v e="$end" \'\n' +
-      '  {\n' +
-      '    if (skip) {\n' +
-      '      if (index($0, e) == 1) skip = 0\n' +
-      '      next\n' +
-      '    }\n' +
-      '    if (index($0, s) == 1) {\n' +
-      '      skip = 1\n' +
-      '      if (prev_set && prev != "") print prev\n' +
-      '      prev_set = 0\n' +
-      '      next\n' +
-      '    }\n' +
-      '    if (prev_set) print prev\n' +
-      '    prev = $0\n' +
-      '    prev_set = 1\n' +
-      '  }\n' +
-      '  END { if (prev_set) print prev }\n' +
-      '\' "$target" > "$tmpfile" || fail "could not write temporary file"\n' +
-      'chmod "$orig_mode" "$tmpfile" || fail "could not set permissions on temporary file"\n' +
-      'mv -f "$tmpfile" "$target" || fail "could not atomically replace $target"\n' +
-      'tmpfile=""\n' +
-      'if grep -qFs -- "$start" "$target"; then fail "failed to remove managed block from $target"; fi\n' +
-      'hyprctl reload >/dev/null 2>&1 || true\n' +
-      'say "managed keybinding block removed from $target and hyprland reloaded"\n'
-    Quickshell.execDetached(["bash", "-c", script, "--",
-      target,
-      root.bindingsBlockBgn,
-      root.bindingsBlockEnd])
-  }
-
-  Process {
-    id: wireProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: console.log(text)
-    }
-  }
-
   // ------------------------------------------------------- dispatch queue
-  // A Process cannot be re-run while it is running, so every hyprctl call
-  // goes through one FIFO queue drained by a single Process.
+  // Commands must run in the order they were asked for, so every hyprctl call
+  // is pushed to one FIFO queue drained by a single Process.
   property var queue: []
 
   function dispatch(args) {
@@ -279,391 +121,234 @@ Item {
   Process {
     id: dispatchProc
     running: false
+    stdout: StdioCollector {
+      id: dispatchOut
+      waitForEnd: true
+    }
     onRunningChanged: {
       if (!running) root.pump()
+    }
+    // hyprctl reports a failed dispatch (missing or broken grace-window.lua, a
+    // rejected expression) on stdout and exits nonzero; say so instead of
+    // letting the queue fail silently.
+    onExited: function(exitCode, exitStatus) {
+      const detail = String(dispatchOut.text || "").trim()
+      if (exitCode !== 0 || detail.indexOf("error") === 0) {
+        console.warn("grace-window: dispatch failed (exit " + exitCode + "): " + detail)
+      }
+    }
+  }
+
+  // ------------------------------------------------------ hyprctl query
+  // hide() and reopen() each ask Hyprland once, through a script that answers
+  // in ready-to-use JSON. The promise resolves with the collected stdout; the
+  // continuation parses defensively so a bad answer never leaves an operation
+  // stuck. opBusy serializes operations: there is one opProc, and concurrent
+  // hides could otherwise capture the same window twice.
+  property bool opBusy: false
+  property var opToken: null
+
+  function runOpQuery(args) {
+    return new Promise(function (resolve) {
+      root.opToken = resolve
+      opProc.command = args
+      opProc.running = true
+    })
+  }
+
+  Process {
+    id: opProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        const resolve = root.opToken
+        root.opToken = null
+        if (resolve) resolve(text)
+      }
     }
   }
 
   // ----------------------------------------------------------- hide path
   function hide() {
-    if (root.queryBusy || activeProc.running) return "busy"
-    root.queryBusy = true
-    root._queryMode = "hide"
-    activeProc.running = true
+    if (root.opBusy) return "busy"
+    root.opBusy = true
+    root.runOpQuery(["bash", root.bashScript, "hide-query"]).then(root.finishHide, root.finishHide)
     return "requested"
   }
 
-  property string _queryMode: "hide"
-
-  Process {
-    id: activeProc
-    command: ["hyprctl", "-j", "activewindow"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.onActiveRead(text)
-    }
-  }
-
-  function onActiveRead(raw) {
-    const resumingReopen = root._queryMode === "reopen"
-    root.queryBusy = false
-    let win
-    try {
-      win = JSON.parse(raw || "{}")
-    } catch (e) {
-      win = null
-      root.queryBusy = false
-      return
-    }
-    const addr = String(win && win.address || "")
-    if (addr === "0x0") return
-    if (resumingReopen) {
-      // Prefer the focused window when it is the one in grace period; otherwise
-      // reopen the most recently hidden one.
-      let index = -1
-      if (addr) {
-        for (let i = 0; i < root.pending.length; i++) {
-          if (root.pending[i].address !== addr) continue
-          index = i
-          break
-        }
-      }
-      let entry
-      if (index !== -1) entry = root.pending.splice(index, 1)[0]
-      else entry = root.pending.pop()
-      root._queryMode = "hide"
-      if (!entry) return
-      root._reopenAddress = entry.address
-      root._reopenOpacity = String(entry.opacity)
-      root._reopenOpacityInactive = String(entry.opacityInactive)
-      root._reopenRounding = String(entry.rounding)
-      root._reopenRoundingPower = String(entry.roundingPower)
-      root._reopenFloating = String(entry.floating)
-      root._reopenFullscreen = String(entry.fullscreen)
-      root._reopenFullscreenClient = String(entry.fullscreenClient)
-      root._reopenPinned = String(entry.pinned)
-      root._reopenX = String(entry.x)
-      root._reopenY = String(entry.y)
-      root._reopenW = String(entry.w)
-      root._reopenH = String(entry.h)
-      // The window that is being reopened gets focused right after it lands,
-      // so remember the window that has focus right now (while reopening was
-      // triggered).  If it belongs to a group, the reopened window joins that
-      // group on landing.
-      root._reopenFocusAddress = win.address || ""
-      workspaceProc.running = true
-      return
-    }
+  function finishHide(raw) {
+    root.opBusy = false
+    const rec = root.parseJson(raw)
+    if (!rec) return
+    const addr = String(rec.address || "")
     if (!addr) return
-    // Already hidden: only relocate the window to the grace workspace.
-    // Keep its captured look and grace period untouched.
-    for (let i = 0; i < root.pending.length; i++) {
-      if (root.pending[i].address !== addr) continue
-      root.dispatch([
-        "hyprctl", "dispatch",
-        'hl.dsp.window.move({ window = "address:' + addr + '", workspace = "' + root.graceWorkspace + '", follow = false })',
-      ])
+    // Already hidden: just relocate it, keeping look and grace timer.
+    if (root.findPending(addr)) {
+      root.moveToGraceWorkspace(addr)
       return
     }
-    // Capture the window's current corners and opacity so they can be
-    // restored exactly when it is reopened.
-    if (propProc.running) return
-    propProc.command = [
-      "bash", "-c",
-      "hyprctl getprop address:" + addr + " opacity; hyprctl getprop address:" + addr + " opacity_inactive; hyprctl getprop address:" + addr + " rounding; hyprctl getprop address:" + addr + " rounding_power",
-    ]
-    root._hideAddress = addr
-    // Capture the window's current mode (floating / fullscreen / pinned) and
-    // geometry so they can be restored exactly when the window is reopened;
-    // hidden windows are forced back to plain tiling.
-    root._hideFloating = String(win.floating === true)
-    root._hideFullscreen = String(win.fullscreen || 0)
-    root._hideFullscreenClient = String(win.fullscreenClient || 0)
-    root._hidePinned = String(win.pinned === true)
-    const pos = win.at || [0, 0]
-    const size = win.size || [0, 0]
-    root._hideX = String(pos[0] || 0)
-    root._hideY = String(pos[1] || 0)
-    root._hideW = String(size[0] || 0)
-    root._hideH = String(size[1] || 0)
-    // Remember whether the window belonged to a tabbed group (win.grouped
-    // lists every member, including the window itself) so hide can pull it
-    // out of the group before moving it to the grace workspace.
-    const grouped = win.grouped || []
-    root._hideGrouped = grouped.length > 0 ? grouped.slice() : []
-    propProc.running = true
-  }
-
-  property string _hideAddress: ""
-  property string _hideFloating: ""
-  property string _hideFullscreen: ""
-  property string _hideFullscreenClient: ""
-  property string _hidePinned: ""
-  property string _hideX: ""
-  property string _hideY: ""
-  property string _hideW: ""
-  property string _hideH: ""
-  property var _hideGrouped: []
-
-  Process {
-    id: propProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.onPropsRead(text)
-    }
-  }
-
-  function onPropsRead(raw) {
-    const addr = root._hideAddress
-    root._hideAddress = ""
-    if (!addr) return
-    const floating = root._hideFloating
-    const fullscreen = root._hideFullscreen
-    const fullscreenClient = root._hideFullscreenClient
-    const pinned = root._hidePinned
-    const x = root._hideX
-    const y = root._hideY
-    const w = root._hideW
-    const h = root._hideH
-    const grouped = root._hideGrouped
-    root._hideFloating = ""
-    root._hideFullscreen = ""
-    root._hideFullscreenClient = ""
-    root._hidePinned = ""
-    root._hideX = ""
-    root._hideY = ""
-    root._hideW = ""
-    root._hideH = ""
-    root._hideGrouped = []
-    const values = String(raw || "").split("\n").map(function (line) {
-      return line.trim()
-    })
-    const opacity = values[0] || ""
-    const opacityInactive = values[1] || ""
-    const rounding = values[2] || ""
-    const roundingPower = values[3] || ""
+    // Refuse windows that report no opacity or rounding values.
+    const opacity = String(rec.opacity || "")
+    const opacityInactive = String(rec.opacityInactive || "")
+    const rounding = String(rec.rounding || "")
     if (opacity === "" || opacityInactive === "" || rounding === "") return
-    const graceOpacity = String(Number(opacity) * root.graceOpacityFactor)
-    const graceOpacityInactive = String(Number(opacityInactive) * root.graceOpacityFactor)
-    root.pending.push({
+    // Capture look, mode and geometry so reopen can restore them exactly.
+    const entry = {
       address: addr,
       remaining: root.graceMs,
       opacity: opacity,
       opacityInactive: opacityInactive,
       rounding: rounding,
-      roundingPower: roundingPower,
-      floating: floating,
-      fullscreen: fullscreen,
-      fullscreenClient: fullscreenClient,
-      pinned: pinned,
-      x: x,
-      y: y,
-      w: w,
-      h: h,
-    })
-    // Pull the window out of any tabbed group before moving it so only this
-    // window is hidden; the remaining members stay together on the original
-    // workspace.
-    if (grouped.length > 0) {
-      root.dispatch([
-        "bash", "-c",
-        'hyprctl dispatch "hl.dsp.window.move({ window = \\\"address:' + addr + '\\\", out_of_group = true })"; ' +
-        'sleep ' + String(root.groupingDelay),
-      ])
+      roundingPower: String(rec.roundingPower || ""),
+      floating: String(rec.floating === true),
+      fullscreen: String(rec.fullscreen || 0),
+      fullscreenClient: String(rec.fullscreenClient || 0),
+      pinned: String(rec.pinned === true),
+      x: String(rec.x || 0),
+      y: String(rec.y || 0),
+      w: String(rec.w || 0),
+      h: String(rec.h || 0),
     }
-    // Hide the window, force it to tiling mode and set the grace look
-    root.dispatch([
-      "hyprctl", "dispatch",
-      'hl.dsp.window.move({ window = "address:' + addr + '", workspace = "' + root.graceWorkspace + '", follow = false })',
-    ])
-    root.dispatch([
-      "hyprctl", "dispatch",
-      'hl.dsp.window.float({ window = "address:' + addr + '", action = "off" })',
-    ])
-    root.dispatch([
-      "hyprctl", "dispatch",
-      'hl.dsp.window.fullscreen_state({ window = "address:' + addr + '", internal = 0, client = 0, action = "set" })',
-    ])
-    root.dispatch([
-      "hyprctl", "dispatch",
-      'hl.dsp.window.pin({ window = "address:' + addr + '", action = "off" })',
-    ])
-    // Cut corners and a slight fade mark the window as being in its grace period.
-    root.dispatch([
-      "hyprctl", "dispatch",
-      'hl.dsp.window.set_prop({ window = "address:' + addr + '", prop = "opacity", value = "' + graceOpacity + '" })',
-    ])
-    root.dispatch([
-      "hyprctl", "dispatch",
-      'hl.dsp.window.set_prop({ window = "address:' + addr + '", prop = "opacity_inactive", value = "' + graceOpacityInactive + '" })',
-    ])
-    root.dispatch([
-      "hyprctl", "dispatch",
-      'hl.dsp.window.set_prop({ window = "address:' + addr + '", prop = "rounding", value = "' + root.graceRounding + '" })',
-    ])
-    root.dispatch([
-      "hyprctl", "dispatch",
-      'hl.dsp.window.set_prop({ window = "address:' + addr + '", prop = "rounding_power", value = "' + root.graceRoundingPower + '" })',
-    ])
+    root.pending.push(entry)
+    // Pull the window out of any tabbed group first, so only it is hidden.
+    const grouped = Array.isArray(rec.grouped) ? rec.grouped : []
+    if (grouped.length > 0) {
+      root.dispatch(["bash", root.bashScript, "leave-group", addr, String(root.groupingDelay)])
+    }
+    // Hide the window: force tiling and apply the grace look.
+    root.moveToGraceWorkspace(addr)
+    root.setWindowFloat(addr, false)
+    root.setWindowFullscreen(addr, "0", "0")
+    root.setWindowPin(addr, false)
+    const graceOpacity = String(Number(opacity) * root.graceOpacityFactor)
+    const graceOpacityInactive = String(Number(opacityInactive) * root.graceOpacityFactor)
+    root.setWindowProp(addr, "opacity", graceOpacity)
+    root.setWindowProp(addr, "opacity_inactive", graceOpacityInactive)
+    root.setWindowProp(addr, "rounding", String(root.graceRounding))
+    root.setWindowProp(addr, "rounding_power", String(root.graceRoundingPower))
   }
 
   // --------------------------------------------------------- reopen path
   function reopen() {
     if (root.pending.length === 0) return "none"
-    if (root.queryBusy || workspaceProc.running || activeProc.running) return "busy"
-    // Resolve the target (focused hidden window, else most recent) via the
-    // active window query; the restore path continues in onActiveRead.
-    root.queryBusy = true
-    root._queryMode = "reopen"
-    activeProc.running = true
+    if (root.opBusy) return "busy"
+    root.opBusy = true
+    root.runOpQuery(["bash", root.bashScript, "reopen-query"]).then(root.finishReopen, root.finishReopen)
     return "requested"
   }
 
-  property string _reopenAddress: ""
-  property string _reopenOpacity: ""
-  property string _reopenOpacityInactive: ""
-  property string _reopenRounding: ""
-  property string _reopenRoundingPower: ""
-  property string _reopenFloating: ""
-  property string _reopenFullscreen: ""
-  property string _reopenFullscreenClient: ""
-  property string _reopenPinned: ""
-  property string _reopenX: ""
-  property string _reopenY: ""
-  property string _reopenW: ""
-  property string _reopenH: ""
-  property string _reopenFocusAddress: ""
-
-  Process {
-    id: workspaceProc
-    command: ["hyprctl", "-j", "activeworkspace"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.onWorkspaceRead(text)
-    }
-  }
-
-  function onWorkspaceRead(raw) {
-    const addr = root._reopenAddress
-    root._reopenAddress = ""
-    if (!addr) return
-    let ws
-    try {
-      ws = JSON.parse(raw || "{}")
-    } catch (e) {
-      return
-    }
-    // preserveHyprlandIdEsque: keep the id as a plain string for the Lua arg.
-    let id = ""
-    if (ws && ws.id !== undefined && ws.id !== null) id = String(ws.id)
-    if (id === "" || id === "null") return
-    // Restore the values the window had before it was hidden.
-    root.dispatch([
-      "hyprctl", "dispatch",
-      'hl.dsp.window.set_prop({ window = "address:' + addr + '", prop = "opacity", value = "' + root._reopenOpacity + '" })',
-    ])
-    root.dispatch([
-      "hyprctl", "dispatch",
-      'hl.dsp.window.set_prop({ window = "address:' + addr + '", prop = "opacity_inactive", value = "' + root._reopenOpacityInactive + '" })',
-    ])
-    root._reopenOpacity = ""
-    root._reopenOpacityInactive = ""
-    root.dispatch([
-      "hyprctl", "dispatch",
-      'hl.dsp.window.set_prop({ window = "address:' + addr + '", prop = "rounding", value = "' + root._reopenRounding + '" })',
-    ])
-    root.dispatch([
-      "hyprctl", "dispatch",
-      'hl.dsp.window.set_prop({ window = "address:' + addr + '", prop = "rounding_power", value = "' + root._reopenRoundingPower + '" })',
-    ])
-    root._reopenRounding = ""
-    root._reopenRoundingPower = ""
-    // Restore the window mode and geometry it had before it was hidden.
-    if (root._reopenFloating === "true") {
-      root.dispatch([
-        "hyprctl", "dispatch",
-        'hl.dsp.window.float({ window = "address:' + addr + '", action = "on" })',
-      ])
-      const w = Number(root._reopenW)
-      const h = Number(root._reopenH)
-      if (w > 0 && h > 0) {
-        root.dispatch([
-          "hyprctl", "dispatch",
-          'hl.dsp.window.resize({ window = "address:' + addr + '", x = ' + root._reopenW + ', y = ' + root._reopenH + ' })',
-        ])
+  function finishReopen(raw) {
+    root.opBusy = false
+    const data = root.parseJson(raw)
+    if (!data) return
+    const win = data.aw || {}
+    const addr = String(win.address || "")
+    // A desktop without a focused window has nothing to reopen.
+    if (addr === "0x0") return
+    // Prefer the focused window when it is in grace; otherwise reopen the
+    // most recently hidden one.
+    let index = -1
+    if (addr) {
+      for (let i = 0; i < root.pending.length; i++) {
+        if (root.pending[i].address !== addr) continue
+        index = i
+        break
       }
-      root.dispatch([
-        "hyprctl", "dispatch",
-        'hl.dsp.window.move({ window = "address:' + addr + '", x = ' + root._reopenX + ', y = ' + root._reopenY + ' })',
-      ])
     }
-    if (root._reopenPinned === "true") {
-      root.dispatch([
-        "hyprctl", "dispatch",
-        'hl.dsp.window.pin({ window = "address:' + addr + '", action = "on" })',
-      ])
-    }
-    const fullscreen = Number(root._reopenFullscreen)
-    const fullscreenClient = Number(root._reopenFullscreenClient)
-    if (fullscreen > 0 || fullscreenClient > 0) {
-      root.dispatch([
-        "hyprctl", "dispatch",
-        'hl.dsp.window.fullscreen_state({ window = "address:' + addr + '", internal = ' + root._reopenFullscreen + ', client = ' + root._reopenFullscreenClient + ', action = "set" })',
-      ])
-    }
+    const entry = index !== -1 ? root.pending.splice(index, 1)[0] : root.pending.pop()
+    if (!entry) return
+    const workspace = data.ws || {}
+    // Plain string id for the Lua arg (e.g. "4", never 4.0).
+    const id = workspace.id !== undefined && workspace.id !== null ? String(workspace.id) : ""
+    if (id === "" || id === "null") return
+    root.restoreWindow(entry, id)
+    // Join the group that had focus when reopening was triggered (the
+    // reopened window gets focused right after landing).
     root.dispatch([
-      "hyprctl", "dispatch",
-      'hl.dsp.window.move({ window = "address:' + addr + '", workspace = "' + id + '" })',
+      "bash", root.bashScript, "regroup",
+      entry.address, String(win.address || ""), String(root.groupingDelay),
     ])
-    // If the window that had focus when reopening was triggered is part of a
-    // tabbed group, move the reopened window into that group. It targets the
-    // group by the focused window's address, so it is independent of whatever
-    // has focus by the time the dispatches run. It no-ops when the focused
-    // window is not in a group (or is gone). This operation only works for
-    // tiled windows
-    root.dispatch(root.regroupCommand(addr, root._reopenFocusAddress))
-    root._reopenFloating = ""
-    root._reopenFullscreen = ""
-    root._reopenFullscreenClient = ""
-    root._reopenPinned = ""
-    root._reopenX = ""
-    root._reopenY = ""
-    root._reopenW = ""
-    root._reopenH = ""
-    root._reopenFocusAddress = ""
   }
 
-  // Builds a queue entry that runs after the move above has been applied (the
-  // dispatch queue keeps ordering), then looks up the window that had focus
-  // when reopening was triggered (focusAddr). If that window still exists,
-  // is part of a tabbed group, and the group is on the same workspace as the
-  // reopened window, the reopened window is moved into that group via
-  // into_group. It does nothing when the focused window is not in a group,
-  // when the reopened window already belongs to a group, or when the group is
-  // on another workspace.
-  function regroupCommand(addr, focusAddr) {
-    const jqProg =
-      'def cx: .at[0] + (.size[0] / 2);\n' +
-      'def cy: .at[1] + (.size[1] / 2);\n' +
-      '(map(select(.address == $f)) | first // null) as $fwin\n' +
-      '| select($fwin != null and ($fwin.grouped | length) > 0)\n' +
-      '| (map(select(.address == $a)) | first // null) as $tgt\n' +
-      '| select($tgt != null and ($tgt.grouped | length) == 0 and $fwin.workspace.id == $tgt.workspace.id)\n' +
-      '| (($fwin | cx) - ($tgt | cx)) as $dx\n' +
-      '| (($fwin | cy) - ($tgt | cy)) as $dy\n' +
-      '| if (($dx | fabs) >= ($dy | fabs)) then (if $dx > 0 then "r" else "l" end) else (if $dy > 0 then "d" else "u" end) end\n'
-    const body =
-      'set -u\n' +
-      'a="$1"\n' +
-      'f="$2"\n' +
-      'prog="$3"\n' +
-      'clients=$(hyprctl -j clients 2>/dev/null)\n' +
-      'dir=$(printf "%s" "$clients" | jq -r --arg a "$a" --arg f "$f" "$prog")\n' +
-      'if [[ -n "$dir" ]]; then\n' +
-      '  sleep ' + String(root.groupingDelay) + '; ' +
-        'hyprctl dispatch "hl.dsp.window.move({ window = \\\"address:$a\\\", into_group = \\\"$dir\\\" })" >/dev/null 2>&1\n' +
-      'fi\n'
-    return ["bash", "-c", body, "grace-regroup", addr, focusAddr, jqProg]
+  function restoreWindow(entry, workspaceId) {
+    // Undo the grace look, then restore the captured mode and geometry.
+    root.setWindowProp(entry.address, "opacity", entry.opacity)
+    root.setWindowProp(entry.address, "opacity_inactive", entry.opacityInactive)
+    root.setWindowProp(entry.address, "rounding", entry.rounding)
+    root.setWindowProp(entry.address, "rounding_power", entry.roundingPower)
+    if (entry.floating === "true") {
+      root.setWindowFloat(entry.address, true)
+      const w = Number(entry.w)
+      const h = Number(entry.h)
+      if (w > 0 && h > 0) root.resizeWindow(entry.address, entry.w, entry.h)
+      root.moveWindowTo(entry.address, entry.x, entry.y)
+    }
+    if (entry.pinned === "true") root.setWindowPin(entry.address, true)
+    if (Number(entry.fullscreen) > 0 || Number(entry.fullscreenClient) > 0) {
+      root.setWindowFullscreen(entry.address, entry.fullscreen, entry.fullscreenClient)
+    }
+    root.moveWindowToWorkspace(entry.address, workspaceId)
+  }
+
+  // ------------------------------------------------------ dispatch helpers
+  // Thin dispatches into grace-window.lua, the single file holding every
+  // hl.dsp call. A dispatch expression must evaluate to a dispatcher, so the
+  // lua functions return their hl.dsp call.
+  function luaDispatch(body) {
+    root.dispatch([
+      "hyprctl", "dispatch",
+      "dofile('" + root.luaScript + "')." + body,
+    ])
+  }
+
+  function setWindowProp(addr, prop, value) {
+    root.luaDispatch("window_set_prop('" + addr + "', '" + prop + "', '" + value + "')")
+  }
+
+  function setWindowFloat(addr, enabled) {
+    root.luaDispatch("window_float('" + addr + "', " + (enabled ? "true" : "false") + ")")
+  }
+
+  function setWindowPin(addr, enabled) {
+    root.luaDispatch("window_pin('" + addr + "', " + (enabled ? "true" : "false") + ")")
+  }
+
+  function setWindowFullscreen(addr, internal, client) {
+    root.luaDispatch("window_fullscreen('" + addr + "', '" + internal + "', '" + client + "')")
+  }
+
+  function moveWindowToWorkspace(addr, workspace) {
+    root.luaDispatch("window_to_workspace('" + addr + "', '" + workspace + "')")
+  }
+
+  function moveToGraceWorkspace(addr) {
+    root.luaDispatch("window_to_grace_workspace('" + addr + "', '" + root.graceWorkspace + "')")
+  }
+
+  function moveWindowTo(addr, x, y) {
+    root.luaDispatch("window_to_position('" + addr + "', '" + x + "', '" + y + "')")
+  }
+
+  function resizeWindow(addr, w, h) {
+    root.luaDispatch("window_resize('" + addr + "', '" + w + "', '" + h + "')")
+  }
+
+  // ------------------------------------------------------------- helpers
+  // Returns the pending entry for addr, or null. Defensive JSON parsing so a
+  // malformed query answer never leaves an operation stuck or crashes.
+  function findPending(addr) {
+    for (let i = 0; i < root.pending.length; i++) {
+      if (root.pending[i].address === addr) return root.pending[i]
+    }
+    return null
+  }
+
+  function parseJson(raw) {
+    try {
+      return JSON.parse(raw || "{}")
+    } catch (e) {
+      return null
+    }
   }
 
   // ---------------------------------------------------------------- sweep
@@ -688,7 +373,7 @@ Item {
     const alive = []
     for (let i = 0; i < root.pending.length; i++) {
       const entry = root.pending[i]
-      // While the window itself keeps focus its grace timer is paused.
+      // While the hidden window keeps focus its grace timer is paused.
       if (entry.address === root.focusedAddress) {
         alive.push(entry)
         continue
@@ -699,10 +384,7 @@ Item {
     }
     root.pending = alive
     for (let i = 0; i < dead.length; i++) {
-      root.dispatch([
-        "hyprctl", "dispatch",
-        'hl.dsp.window.close({ window = "address:' + dead[i].address + '" })',
-      ])
+      root.luaDispatch("window_close('" + dead[i].address + "')")
     }
     // Refresh the focused-window probe that decides the next tick's pauses.
     if (!focusProc.running) focusProc.running = true
@@ -718,14 +400,12 @@ Item {
   }
 
   function onFocusRead(raw) {
-    let win
-    try {
-      win = JSON.parse(raw || "{}")
-    } catch (e) {
+    const win = root.parseJson(raw)
+    if (!win) {
       root.focusedAddress = ""
       return
     }
-    const addr = String(win && win.address || "")
+    const addr = String(win.address || "")
     root.focusedAddress = addr === "0x0" ? "" : addr
   }
 
@@ -742,18 +422,95 @@ Item {
     return "ok"
   }
 
+  // --------------------------------------------------- keybinding wiring
+  // On start the managed keybinding block from hypr/bindings.lua is appended
+  // to ~/.config/hypr/bindings.lua when not already present, then Hyprland is
+  // reloaded — idempotent across shell restarts and hot-reloads. On teardown
+  // the block is removed again, so disabling the plugin restores the previous
+  // bindings.
+  readonly property string bindingsBlockBgn:
+    "-- BEGIN Grace Window (jam.grace-window) managed block - do not edit this comment"
+  readonly property string bindingsBlockEnd:
+    "-- END Grace Window (jam.grace-window) managed block - do not edit this comment"
+
+  function wireBindings() {
+    wireProc.command = ["bash", root.bashScript, "wire",
+      root.sourceDir + "/hypr/bindings.lua",
+      Quickshell.env("HOME") + "/.config/hypr/bindings.lua",
+      root.bindingsBlockBgn,
+      root.bindingsBlockEnd]
+    wireProc.running = true
+  }
+
+  Process {
+    id: wireProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: console.log(text)
+    }
+  }
+
+  // Reverses wireBindings: removes exactly the managed block (plus the blank
+  // line before it) from ~/.config/hypr/bindings.lua. Runs detached
+  // (Quickshell.execDetached): it is triggered from Component.onDestruction,
+  // where a child Process could not outlive the service objects being torn
+  // down.
+  //
+  // Teardown cannot depend on the plugin's own files, which omarchy removes
+  // when the plugin is disabled. So at startup the shell script and its awk
+  // partner are copied to a stable per-user path (installUnwireScript);
+  // teardown runs that copy. A failed copy fails closed and leaves the
+  // bindings untouched.
+  readonly property string unwireRuntimeDir:
+    Quickshell.env("XDG_RUNTIME_DIR") || Quickshell.env("HOME") + "/.cache/grace-window"
+  readonly property string unwireRuntimeScript: root.unwireRuntimeDir + "/grace-window.sh"
+  property bool unwireInstalled: false
+
+  function installUnwireScript() {
+    unwireCopy.command = ["bash", root.bashScript, "install-unwire", root.unwireRuntimeDir]
+    unwireCopy.running = true
+  }
+
+  Process {
+    id: unwireCopy
+    onExited: function(exitCode, exitStatus) {
+      root.unwireInstalled = exitCode === 0
+    }
+  }
+
+  function unwireBindings() {
+    const target = Quickshell.env("HOME") + "/.config/hypr/bindings.lua"
+    if (!root.unwireInstalled) {
+      console.warn("grace-window: unwire script not installed; leaving bindings untouched")
+      return
+    }
+    Quickshell.execDetached(["bash", root.unwireRuntimeScript, "unwire",
+      target,
+      root.bindingsBlockBgn,
+      root.bindingsBlockEnd])
+  }
+
+  // Runs one harmless dispatch through grace-window.lua at startup, so an
+  // unreadable or broken file is reported right away instead of at the first
+  // keybinding press.
+  function selfCheck() {
+    root.luaDispatch("check()")
+  }
+
   // ---------------------------------------------------------------- startup
   Component.onCompleted: {
     // The shell assigns root.manifest right after creating this service, so
-    // defer the wiring until that property is populated.
+    // defer the wiring, the unwire-script copy and the dispatcher self-check
+    // until that property is set.
     root.lastTick = Date.now()
     Qt.callLater(root.wireBindings)
+    Qt.callLater(root.installUnwireScript)
+    Qt.callLater(root.selfCheck)
   }
 
-  // The shell destroys this service when the plugin is disabled or removed, so
-  // teardown here is what unwires the managed keybinding block - omarchy's
-  // plugin remove then leaves nothing behind. It also fires on shell shutdown;
-  // the block is simply re-wired on the next shell start (an idempotent no-op
-  // when still present).
+  // The shell destroys this service when the plugin is disabled or removed,
+  // so teardown unwires the managed block — omarchy's plugin remove then
+  // leaves nothing behind. It also fires on shell shutdown; the next start
+  // re-wires the block (a no-op when already present).
   Component.onDestruction: root.unwireBindings()
 }

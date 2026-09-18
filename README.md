@@ -44,6 +44,7 @@ background script.
 | `manifest.json` | Omarchy plugin manifest (schema v1, kind `service`) |
 | `Service.qml` | The service: IPC handlers, hyprctl dispatch queue, grace sweep, auto-wires the keybindings on start and unwires them on teardown |
 | `hypr/bindings.lua` | The keybindings, wrapped in the managed block the service copies on start |
+| `scripts/*` | `.sh`, `.lua`, `.jq` and `.awk` scripts backing the service |
 
 ## Install
 
@@ -79,14 +80,19 @@ Talk to the service directly from Hyprland bindings (or a terminal):
 ```bash
 omarchy-shell grace-window hide       # hide focused window, start grace
 omarchy-shell grace-window reopen     # bring the newest hidden window back
-omarchy-shell grace-window status     # idle / pending Ns
+omarchy-shell grace-window status     # idle or pending <secs>
 omarchy-shell grace-window cancel     # forget pendings without closing
 ```
 
 ## Configuration
 The plugin gets installed to `~/.config/omarchy/plugins/jam.grace-window`.
-Here you can change what you want. Just disable and enable the plugin again
-for changes to take effect.
+Here you can change what you want. Just disable and enable the plugin again,
+then restart the shell for any changes to take effect:
+```bash
+omarchy plugin disable jam.grace-window
+omarchy plugin enable jam.grace-window
+omarchy restart shell
+```
 - **Keybindings** should be edited in the plugins `hypr/bindings.lua` for them
   to persist `Service.qml` restarts.
 - **Grace period** in `Service.qml` can be edited: `graceMs`.
