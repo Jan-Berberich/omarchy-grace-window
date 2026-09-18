@@ -28,9 +28,10 @@ closed for real:
   the group stays in place. On reopen the window (if in tiling mode) joins the
   group that currently has focus.
 
-The Plugin also can be used nicely to reoder windows on your workspace, as
-they will reopen predictably to the right or bottom of the focused window,
-depending on its aspect ratio.
+The Plugin also can be used nicely to reorganize your tiled workspace, as
+reopened windows will appear to the right or bottom of the focused window,
+depending on its aspect ratio (like a newly opened window would).
+You can even change the order of the windows in your tabbed group with this.
 
 The feature is a *service* plugin: the state lives in the long-lived
 `omarchy-shell` process, and the keybindings drive it over Quickshell IPC
