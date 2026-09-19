@@ -391,6 +391,7 @@ Item {
       if (existing.expiring) {
         existing.expiring = false
         existing.remaining = root.graceMs
+        existing.closeFails = 0
       }
       // Pull the window out of any tabbed group first, just like a fresh
       // hide, so re-hiding a window that has been regrouped doesn't drag the
