@@ -272,6 +272,11 @@ Item {
   property bool opBusy: false
   property var opToken: null
   property bool opAborted: false
+  // Set by cancel() while a hide/reopen query is still in flight, so the
+  // operation's finish handler aborts instead of applying after the
+  // cancellation (hide() would otherwise resurrect a pending entry it already
+  // cleared, reopen() would move a window back it just restored in place).
+  property bool opCancelPending: false
 
   function runOpQuery(args) {
     return new Promise(function (resolve) {
@@ -353,6 +358,12 @@ Item {
   }
 
   function finishHide(raw) {
+    if (root.opCancelPending) {
+      root.opCancelPending = false
+      root.opBusy = false
+      root.reportOperation("hide", "none")
+      return
+    }
     const verdict = root.classifyHide(raw)
     root.opBusy = false
     root.reportOperation("hide", verdict)
@@ -451,6 +462,12 @@ Item {
   }
 
   function finishReopen(raw) {
+    if (root.opCancelPending) {
+      root.opCancelPending = false
+      root.opBusy = false
+      root.reportOperation("reopen", "none")
+      return
+    }
     const verdict = root.classifyReopen(raw)
     root.opBusy = false
     root.reportOperation("reopen", verdict)
@@ -792,6 +809,10 @@ Item {
     // moves it back. Queued auto-closes are cancelled so the windows really
     // are left alone.
     root.cancelScheduledCloses()
+    // A hide/reopen query already in flight would apply its effect after this
+    // cancellation (classifyHide pushes a fresh pending entry, classifyReopen
+    // moves a window). Flag it so the finish handler reports "none" instead.
+    if (root.opBusy) root.opCancelPending = true
     for (let i = 0; i < root.pending.length; i++) {
       root.undoGraceState(root.pending[i])
     }
