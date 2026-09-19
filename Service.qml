@@ -326,6 +326,15 @@ Item {
     const addr = String(win.address || "")
     // A desktop without a focused window has nothing to reopen.
     if (addr === "0x0") return
+    // The reopen target must be resolvable before any pending entry is
+    // disturbed: an unparseable answer (e.g. a transient hyprctl failure
+    // yielding an empty workspace) must not drop the chosen entry, whose
+    // queued close would then be cancelled while the window stays hidden and
+    // untracked forever.
+    const workspace = data.ws || {}
+    // Plain string id for the Lua arg (e.g. "4", never 4.0).
+    const id = workspace.id !== undefined && workspace.id !== null ? String(workspace.id) : ""
+    if (id === "" || id === "null") return
     // Prefer the focused window when it is in grace; otherwise reopen the
     // most recently hidden one. Entries whose close is already running
     // (`closing`) are not reopened — their window is lost either way.
@@ -348,10 +357,6 @@ Item {
       entry.closeTag = ""
       entry.expiring = false
     }
-    const workspace = data.ws || {}
-    // Plain string id for the Lua arg (e.g. "4", never 4.0).
-    const id = workspace.id !== undefined && workspace.id !== null ? String(workspace.id) : ""
-    if (id === "" || id === "null") return
     root.restoreWindow(entry, id)
     // Join the group that had focus when reopening was triggered (the
     // reopened window gets focused right after landing).
