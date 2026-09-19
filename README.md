@@ -82,7 +82,7 @@ Talk to the service directly from Hyprland bindings (or a terminal):
 omarchy-shell grace-window hide       # hide focused window, start grace
 omarchy-shell grace-window reopen     # bring the newest hidden window back
 omarchy-shell grace-window status     # idle or pending <secs>
-omarchy-shell grace-window cancel     # forget pendings without closing
+omarchy-shell grace-window cancel     # forget pendings, restore their grace look in place
 ```
 
 ## Configuration
@@ -110,6 +110,8 @@ omarchy restart shell
 - Multiple windows can be closed gracefully in sequence. Each one keeps its
   own grace period, and `reopen` restores the most recent one if not focused
   on a gracefully closed window.
+- `cancel` (or stopping the service) restores the grace look of every pending
+  window in place. It does not move or close them.
 - Uses Hyprland's Lua dispatcher syntax
   (e.g. `hl.dsp.window.close({ window = "address:..." })`),
   which needs Hyprland >= 0.55 (present in Omarchy 4.x).

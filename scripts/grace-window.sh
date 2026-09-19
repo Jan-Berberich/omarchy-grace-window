@@ -8,19 +8,31 @@
 #                             is hidden (applies the grouping delay).
 #   regroup ADDR FOCUS DELAY  Move a reopened window into the focused window's
 #                             tabbed group.
+#   close ADDR                Close window ADDR for real, then verify it is gone
+#                             from Hyprland: exit 0 when the address no longer
+#                             exists (final), exit 1 when the window is still
+#                             alive (dispatch failed, retryable) or the clients
+#                             query itself failed, so a transient hyprland
+#                             outage never looks like a successful close.
 #   wire SRC TARGET S E       Append the managed keybinding block from SRC to
 #                             TARGET between markers S and E (owner-checked,
 #                             atomic, no-op when already present).
 #   unwire TARGET S E         Remove exactly the managed block again (fails
 #                             closed when the markers are not intact).
-#   install-unwire DIR        Copy this script and its awk partner into DIR,
-#                             creating it first. Teardown later runs the copy,
-#                             when the plugin directory is already gone.
+#   undo-grace JSON           Restore the grace look of the pending windows in
+#                             JSON in place (no workspace change). Runs at
+#                             teardown, after the plugin directory may be gone,
+#                             so it uses this runtime copy of the scripts.
+#   install-unwire DIR        Copy this script and its awk and lua partners into
+#                             DIR (atomically), creating it first. Teardown later
+#                             runs the copy, when the plugin directory is already
+#                             gone.
 #
 # The heavy lifting lives next to this file: grace-window.lua carries every
 # hl.dsp dispatch, grace-window.jq every jq filter and grace-window.awk the
-# unwire stripper. "unwire" also runs after the plugin directory is gone, so it
-# must not depend on anything but its arguments and this file's directory.
+# unwire stripper. "unwire" and "undo-grace" also run after the plugin directory
+# is gone, so they must not depend on anything but their arguments and this
+# file's directory.
 set -u
 
 self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -119,29 +131,61 @@ cmd_regroup() {
   fi
 }
 
+# Close for real and verify it took. The dispatch's own error output cannot
+# tell a dead address from a failed dispatch, so the outcome is decided by
+# whether the address still exists in Hyprland afterwards.
+cmd_close() {
+  local addr="$1" clients
+  hyprctl dispatch "dofile('$self/grace-window.lua').window_close('$addr')" >/dev/null 2>&1
+  clients=$(hyprctl -j clients 2>/dev/null) || return 1
+  if jq -e --arg a "$addr" 'any(.[]; .address == $a)' <<<"$clients" >/dev/null 2>&1; then
+    return 1  # still alive → retryable failure
+  fi
+  return 0    # gone → closed for real
+}
+
 cmd_wire() {
-  local src="$1" target="$2" start="$3" end="$4" orig_mode l0 l1
+  local src="$1" target="$2" start="$3" end="$4" orig_mode l0 l1 target_dir
   if [[ ! -f "$src" ]]; then say "source bindings missing: $src"; return; fi
-  if [[ ! -f "$target" ]]; then say "hyprland bindings file not found: $target"; return; fi
-  if grep -qFs -- "$start" "$target"; then say "keybindings already wired; nothing to do"; return; fi
+  if grep -qFs -- "$start" "$target" 2>/dev/null; then
+    say "keybindings already wired; nothing to do"
+    return
+  fi
   l0=$(grep -nFs -- "$start" "$src" | head -n 1 | cut -d: -f1)
   l1=$(grep -nFs -- "$end" "$src" | head -n 1 | cut -d: -f1)
   if [[ -z "$l0" || -z "$l1" ]]; then die "managed block not found in $src"; fi
   if (( l0 > l1 )); then die "managed block markers out of order in $src"; fi
-  check_target "$target"
-  tmpfile=$(mktemp "$(dirname "$target")/bindings.lua.tmp.XXXXXX") || die "could not create temporary file"
-  orig_mode=$(stat -c "%a" "$target")
-  {
-    cat "$target"
-    echo ""
-    sed -n "${l0},${l1}p" "$src"
-  } > "$tmpfile" || die "could not write temporary file"
+  target_dir="$(dirname "$target")"
+  if [[ ! -d "$target_dir" ]]; then die "target directory missing: $target_dir"; fi
+  if [[ -f "$target" ]]; then
+    # Appending to an existing file: verify the whole path first.
+    check_target "$target"
+  else
+    # Fresh install without a bindings file yet: only its directory needs the
+    # owner/symlink checks, the file itself is created here.
+    check_target "$target_dir"
+  fi
+  tmpfile=$(mktemp "$target_dir/bindings.lua.tmp.XXXXXX") || die "could not create temporary file"
+  if [[ -f "$target" ]]; then
+    orig_mode=$(stat -c "%a" "$target")
+    {
+      cat "$target"
+      echo ""
+      sed -n "${l0},${l1}p" "$src"
+    } > "$tmpfile" || die "could not write temporary file"
+  else
+    orig_mode=644
+    sed -n "${l0},${l1}p" "$src" > "$tmpfile" || die "could not write temporary file"
+  fi
   chmod "$orig_mode" "$tmpfile" || die "could not set permissions on temporary file"
   mv -f "$tmpfile" "$target" || die "could not atomically replace $target"
   tmpfile=""
   if ! grep -qFs -- "$start" "$target"; then die "failed to wire keybindings into $target"; fi
-  hyprctl reload >/dev/null 2>&1 || true
-  say "keybindings wired into $target and hyprland reloaded"
+  if hyprctl reload >/dev/null 2>&1; then
+    say "keybindings wired into $target and hyprland reloaded"
+  else
+    say "warning: keybindings wired into $target, but hyprland reload failed"
+  fi
 }
 
 cmd_unwire() {
@@ -162,14 +206,69 @@ cmd_unwire() {
   mv -f "$tmpfile" "$target" || die "could not atomically replace $target"
   tmpfile=""
   if grep -qFs -- "$start" "$target"; then die "failed to remove managed block from $target"; fi
-  hyprctl reload >/dev/null 2>&1 || true
-  say "managed keybinding block removed from $target and hyprland reloaded"
+  if hyprctl reload >/dev/null 2>&1; then
+    say "managed keybinding block removed from $target and hyprland reloaded"
+  else
+    say "warning: managed keybinding block removed from $target, but hyprland reload failed"
+  fi
 }
 
 cmd_install_unwire() {
-  local dir="$1"
+  local dir="$1" f tmp
   mkdir -p "$dir" || die "cannot create runtime dir: $dir"
-  cp "$self/grace-window.sh" "$self/grace-window.awk" "$dir/" || die "cannot copy unwire scripts to $dir"
+  # Copy each file atomically (write next to it, then rename), so an
+  # interrupted copy can never leave a truncated teardown script behind.
+  for f in grace-window.sh grace-window.awk grace-window.lua; do
+    tmp="$dir/$f.tmp.$$"
+    cp "$self/$f" "$tmp" || die "cannot copy $f to $dir"
+    mv -f "$tmp" "$dir/$f" || { rm -f "$tmp"; die "cannot replace $f in $dir"; }
+  done
+  # The teardown subcommand must exist in the installed copy — a stale script
+  # would silently strand the grace look on service stop.
+  grep -q 'undo-grace' "$dir/grace-window.sh" || die "installed unwire script lacks undo-grace"
+}
+
+# Teardown variant of cancel(): restore the grace look of every pending window
+# in place (they stay on the grace workspace). Works the same way as the QML
+# undoGraceState, but runs detached from this runtime copy after the plugin
+# directory may already be gone. No workspace moves, no geometry restore.
+# A window that vanished (or a failed dispatch) must not abort the rest, so
+# each window's restore is best-effort and the loop carries on to the next one.
+cmd_undo_grace() {
+  local data="$1" rec addr opacity opacity_inactive rounding rounding_power \
+    floating fullscreen fullscreen_client pinned
+  [[ -n "$data" ]] || return 0
+  while read -r rec; do
+    addr=$(jq -r '.address // empty' <<<"$rec")
+    [[ -n "$addr" ]] || continue
+    opacity=$(jq -r '.opacity // empty' <<<"$rec")
+    opacity_inactive=$(jq -r '.opacityInactive // empty' <<<"$rec")
+    rounding=$(jq -r '.rounding // empty' <<<"$rec")
+    rounding_power=$(jq -r '.roundingPower // empty' <<<"$rec")
+    # Look fields are always captured by hide-query; an incomplete record can
+    # not be restored faithfully, so skip it instead of injecting empty values.
+    if [[ -z "$opacity" || -z "$opacity_inactive" || -z "$rounding" ]]; then
+      say "skipping $addr: captured grace look incomplete"
+      continue
+    fi
+    floating=$(jq -r '.floating // "false"' <<<"$rec")
+    pinned=$(jq -r '.pinned // "false"' <<<"$rec")
+    fullscreen=$(jq -r '.fullscreen // 0' <<<"$rec")
+    fullscreen_client=$(jq -r '.fullscreenClient // 0' <<<"$rec")
+    lua_call "window_set_prop('$addr', 'opacity', '$opacity')" || continue
+    lua_call "window_set_prop('$addr', 'opacity_inactive', '$opacity_inactive')" || continue
+    lua_call "window_set_prop('$addr', 'rounding', '$rounding')" || continue
+    lua_call "window_set_prop('$addr', 'rounding_power', '$rounding_power')" || continue
+    if [[ "$floating" == "true" ]]; then
+      lua_call "window_float('$addr', true)" || continue
+    fi
+    if [[ "$pinned" == "true" ]]; then
+      lua_call "window_pin('$addr', true)" || continue
+    fi
+    if (( fullscreen > 0 || fullscreen_client > 0 )); then
+      lua_call "window_fullscreen('$addr', '$fullscreen', '$fullscreen_client')" || continue
+    fi
+  done < <(jq -c '.[]?' <<<"$data")
 }
 
 case "${1:-}" in
@@ -177,8 +276,10 @@ case "${1:-}" in
   reopen-query) shift; cmd_reopen_query "$@" ;;
   leave-group) shift; cmd_leave_group "$@" ;;
   regroup) shift; cmd_regroup "$@" ;;
+  close) shift; cmd_close "$@" ;;
   wire) shift; cmd_wire "$@" ;;
   unwire) shift; cmd_unwire "$@" ;;
+  undo-grace) shift; cmd_undo_grace "$@" ;;
   install-unwire) shift; cmd_install_unwire "$@" ;;
   *) say "unknown subcommand: ${1:-}"; exit 1 ;;
 esac
