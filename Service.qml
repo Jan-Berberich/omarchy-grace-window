@@ -7,18 +7,24 @@
 //              reopen can restore them. In a tabbed group only the focused
 //              window is pulled out; the rest stays. The grace timer pauses
 //              while the hidden window keeps focus. Returns "requested" when
-//              the operation starts, "busy" while another is in flight.
+//              the operation is handed off, "busy" while another is in flight.
 //   reopen()   Bring a hidden window back to the current workspace, focus it,
 //              cancel its auto-close and restore its captured state. The
 //              focused window is preferred when hidden; otherwise the most
 //              recently hidden is reopened. A tiled reopened window joins the
 //              tabbed group that currently has focus. Returns "none" when
-//              nothing is pending.
+//              nothing is pending, "requested"/"busy" otherwise.
 //   status()   "idle", or "pending Ns" for the most recent hidden window.
 //   cancel()   Forget every pending window without closing it, restoring its
 //              grace look in place (the window stays on the grace workspace).
 //              Teardown also does this, so a stopped service never leaves
 //              pending windows behind with the grace look.
+//   result()   Signal (not a call): the truthful final verdict of each hide or
+//              reopen — "ok" when it did something, "none" when it could not
+//              (empty desktop, missing look properties, no reopenable entry).
+//              IPC functions run synchronously, so a call can only report the
+//              handoff; the outcome is emitted on this signal, observable with
+//              `qs ipc wait grace-window result`.
 //
 // Grace expiry closes the window through Hyprland's Lua dispatcher (>= 0.55).
 // A dispatch expression is evaluated in Hyprland's config Lua VM as
@@ -100,7 +106,15 @@ Item {
 
   // ---------------------------------------------------------------- IPC
   IpcHandler {
+    id: ipc
     target: "grace-window"
+
+    // A call returns the synchronous handoff status — "requested" when the
+    // operation is in flight, "busy" while another one runs, "none" when there
+    // is nothing to undo right now. The operation itself is asynchronous, so
+    // its final verdict is emitted on this signal (observe it with
+    // `qs ipc wait grace-window result`) rather than being claimed up front.
+    signal result(result: string)
 
     function hide(): string {
       return root.hide()
@@ -186,12 +200,22 @@ Item {
   // continuation parses defensively so a bad answer never leaves an operation
   // stuck. opBusy serializes operations: there is one opProc, and concurrent
   // hides could otherwise capture the same window twice.
+  //
+  // The promise is settled from the collector's onStreamFinished — never from
+  // the watchdog alone. A timed-out run is aborted (the process is killed) but
+  // its promise is resolved by that aborted run's own trailing stream finish,
+  // and opBusy stays set until then. A query issued in the meantime therefore
+  // answers "busy" instead of silently receiving the aborted run's stale
+  // output. opAbortFallback settles the promise anyway if the finish never
+  // arrives, so a kill that never lands cannot leave the plugin "busy" forever.
   property bool opBusy: false
   property var opToken: null
+  property bool opAborted: false
 
   function runOpQuery(args) {
     return new Promise(function (resolve) {
       root.opToken = resolve
+      root.opAborted = false
       opProc.command = args
       opProc.running = true
       // Abort a query that never finishes: without this the promise stays
@@ -207,9 +231,15 @@ Item {
       waitForEnd: true
       onStreamFinished: {
         opProcTimeout.stop()
+        opAbortFallback.stop()
         const resolve = root.opToken
         root.opToken = null
-        if (resolve) resolve(text)
+        const aborted = root.opAborted
+        root.opAborted = false
+        // An aborted run resolves the JSON literal "null"; the defensive
+        // parsers in the finish handlers then bail out exactly like an empty
+        // answer, leaving opBusy cleared. A healthy run resolves its output.
+        if (resolve) resolve(aborted ? "null" : text)
       }
     }
   }
@@ -218,19 +248,42 @@ Item {
     id: opProcTimeout
     repeat: false
     onTriggered: {
+      if (!root.opToken) return
+      console.warn("grace-window: hyprctl query timed out; aborting it")
+      // Do not settle the promise here. Resolving eagerly (as a plain abort)
+      // would release opBusy while the aborted run's process may still be
+      // finishing, letting a query issued in that window be answered by this
+      // run's stale output. The run's own trailing stream finish settles it;
+      // opAbortFallback covers the case where that finish never comes.
+      root.opAborted = true
+      opProc.running = false
+      opAbortFallback.interval = Math.max(1000, Math.round(root.queryTimeoutMs / 4))
+      opAbortFallback.restart()
+    }
+  }
+
+  // Safety net for an aborted run whose stream finish never arrives (e.g. the
+  // killed process lingers): settle the outstanding promise with "null" so
+  // opBusy is released and the plugin stays useable.
+  Timer {
+    id: opAbortFallback
+    repeat: false
+    onTriggered: {
+      if (!root.opToken) return
+      console.warn("grace-window: aborted hyprctl query did not finish; discarding it")
       const resolve = root.opToken
       root.opToken = null
-      if (!resolve) return
-      console.warn("grace-window: hyprctl query timed out; aborting it")
-      opProc.running = false
-      // Resolve with the JSON literal "null": the defensive parsing in the
-      // finish handlers then bails out exactly like an empty answer, leaving
-      // opBusy cleared.
+      root.opAborted = false
       resolve("null")
     }
   }
 
   // ----------------------------------------------------------- hide path
+  // The IPC call hands off synchronously ("requested"), so the operation's
+  // actual verdict is reported when the async query settles: finishHide
+  // classifies every outcome and reportOperation surfaces it on the `result`
+  // IPC signal (and as a warning when nothing was hidden). opBusy is released
+  // at the same moment.
   function hide() {
     if (root.opBusy) return "busy"
     root.opBusy = true
@@ -239,13 +292,21 @@ Item {
   }
 
   function finishHide(raw) {
+    const verdict = root.classifyHide(raw)
     root.opBusy = false
+    root.reportOperation("hide", verdict)
+  }
+
+  // Returns "ok" when a window was hidden, "none" when nothing was (no focused
+  // window, a window already closing, or a window whose look could not be
+  // captured exactly).
+  function classifyHide(raw) {
     const rec = root.parseJson(raw)
-    if (!rec) return
+    if (!rec) return "none"
     const addr = String(rec.address || "")
-    if (!addr) return
+    if (!addr) return "none"
     const existing = root.findPending(addr)
-    if (existing && existing.closing) return
+    if (existing && existing.closing) return "none"
     if (existing) {
       // Re-hiding a window whose grace already expired cancels its close —
       // whether already queued or not — and grants a fresh grace period.
@@ -260,7 +321,7 @@ Item {
         existing.remaining = root.graceMs
       }
       root.moveToGraceWorkspace(addr)
-      return
+      return "ok"
     }
     // Refuse windows that report no opacity or rounding values: the look
     // could not be restored faithfully on reopen, so better not hide at all.
@@ -268,11 +329,11 @@ Item {
     const opacityInactive = String(rec.opacityInactive || "")
     const rounding = String(rec.rounding || "")
     const roundingPower = String(rec.roundingPower || "")
-    if (opacity === "" || opacityInactive === "" || rounding === "" || roundingPower === "") return
+    if (opacity === "" || opacityInactive === "" || rounding === "" || roundingPower === "") return "none"
     // A non-numeric getprop value would otherwise turn into a "NaN" prop value.
     const graceOpacity = Number(opacity) * root.graceOpacityFactor
     const graceOpacityInactive = Number(opacityInactive) * root.graceOpacityFactor
-    if (isNaN(graceOpacity) || isNaN(graceOpacityInactive)) return
+    if (isNaN(graceOpacity) || isNaN(graceOpacityInactive)) return "none"
     // Capture look, mode and geometry so reopen can restore them exactly.
     const entry = {
       address: addr,
@@ -307,6 +368,16 @@ Item {
     root.setWindowProp(addr, "opacity_inactive", String(graceOpacityInactive))
     root.setWindowProp(addr, "rounding", String(root.graceRounding))
     root.setWindowProp(addr, "rounding_power", String(root.graceRoundingPower))
+    return "ok"
+  }
+
+  // Reports the final verdict of an asynchronous hide or reopen. No-ops are
+  // the interesting ones: a "requested" handoff must not silently be a nothing.
+  function reportOperation(op, verdict) {
+    if (verdict !== "ok") {
+      console.warn("grace-window: " + op + " finished with no effect (" + verdict + ")")
+    }
+    ipc.result(verdict)
   }
 
   // --------------------------------------------------------- reopen path
@@ -319,9 +390,18 @@ Item {
   }
 
   function finishReopen(raw) {
+    const verdict = root.classifyReopen(raw)
     root.opBusy = false
+    root.reportOperation("reopen", verdict)
+  }
+
+  // Returns "ok" when a window was reopened and restored, "none" when nothing
+  // could be reopened (no reopenable entry, or a query answer too broken to
+  // act on). The focused window is preferred when it is in grace; otherwise
+  // the most recently hidden one is reopened.
+  function classifyReopen(raw) {
     const data = root.parseJson(raw)
-    if (!data) return
+    if (!data) return "none"
     const win = data.aw || {}
     const addr = String(win.address || "")
     // The focused window is only used below to prefer reopening it when it is
@@ -336,7 +416,7 @@ Item {
     const workspace = data.ws || {}
     // Plain string id for the Lua arg (e.g. "4", never 4.0).
     const id = workspace.id !== undefined && workspace.id !== null ? String(workspace.id) : ""
-    if (id === "" || id === "null") return
+    if (id === "" || id === "null") return "none"
     // Prefer the focused window when it is in grace; otherwise reopen the
     // most recently hidden one. Entries whose close is already running
     // (`closing`) are not reopened — their window is lost either way.
@@ -349,7 +429,7 @@ Item {
       }
     }
     const entry = index !== -1 ? root.pending.splice(index, 1)[0] : root.popReopenable()
-    if (!entry) return
+    if (!entry) return "none"
     // If the chosen window's grace expired and the sweep already queued its
     // close, cancel that close now — otherwise it would fire right after the
     // restore dispatches and close the window just brought back. A close that
@@ -366,6 +446,7 @@ Item {
       "bash", root.bashScript, "regroup",
       entry.address, String(win.address || ""), String(root.groupingDelay),
     ])
+    return "ok"
   }
 
   function undoGraceState(entry) {
