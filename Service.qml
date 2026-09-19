@@ -392,6 +392,13 @@ Item {
         existing.expiring = false
         existing.remaining = root.graceMs
       }
+      // Pull the window out of any tabbed group first, just like a fresh
+      // hide, so re-hiding a window that has been regrouped doesn't drag the
+      // whole group to the grace workspace.
+      const grouped = Array.isArray(rec.grouped) ? rec.grouped : []
+      if (grouped.length > 0) {
+        root.dispatch(["bash", root.bashScript, "leave-group", addr, String(root.groupingDelay)])
+      }
       root.moveToGraceWorkspace(addr)
       return "ok"
     }
