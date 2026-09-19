@@ -324,8 +324,10 @@ Item {
     if (!data) return
     const win = data.aw || {}
     const addr = String(win.address || "")
-    // A desktop without a focused window has nothing to reopen.
-    if (addr === "0x0") return
+    // The focused window is only used below to prefer reopening it when it is
+    // in grace and to pick the group to join on landing. Its absence (an
+    // empty desktop, where hyprctl reports no window at all) is a normal case:
+    // the newest hidden window is then reopened onto the active workspace.
     // The reopen target must be resolvable before any pending entry is
     // disturbed: an unparseable answer (e.g. a transient hyprctl failure
     // yielding an empty workspace) must not drop the chosen entry, whose
