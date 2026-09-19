@@ -590,7 +590,35 @@ Item {
     command: ["hyprctl", "-j", "activewindow"]
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.onFocusRead(text)
+      onStreamFinished: {
+        focusProcTimeout.stop()
+        root.onFocusRead(text)
+      }
+    }
+    // Arm the watchdog on every probe start and disarm it on completion. A
+    // hung hyprctl must not leave focusProc.running true, because the sweep
+    // gates its next probe (and thereby the focus-pause) on that flag.
+    onRunningChanged: {
+      if (focusProc.running) {
+        focusProcTimeout.interval = root.queryTimeoutMs
+        focusProcTimeout.restart()
+      } else {
+        focusProcTimeout.stop()
+      }
+    }
+  }
+
+  // Watchdog for the focus probe, mirroring opProcTimeout. On timeout the
+  // hung probe is aborted and the last known focused address is kept:
+  // clearing it would unpause a focused hidden window during the outage and
+  // let the sweep close it out from under the user.
+  Timer {
+    id: focusProcTimeout
+    interval: root.queryTimeoutMs
+    repeat: false
+    onTriggered: {
+      console.warn("grace-window: focus probe timed out; aborting it")
+      focusProc.running = false
     }
   }
 
