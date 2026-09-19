@@ -143,12 +143,19 @@ Item {
   // reopenable); it leaves the pending list only when the close reports
   // success. A close reporting failure keeps the entry pending so the next
   // sweep retries it — up to closeRetryMax attempts, after which its grace
-  // look is restored in place instead of the window being stranded.
+  // look is restored in place instead of the window being stranded. A dispatch
+  // that hangs is aborted by dispatchTimeout, so a stuck hyprctl can never
+  // block the queue forever; the abort counts as a failure and the close is
+  // retried like any other.
   property var queue: []
   // Tag of the dispatch currently running in dispatchProc ("" when untagged),
   // so onExited can attribute the close's success or failure to the right
   // pending entry.
   property string runningTag: ""
+  // Set while a hung dispatch has been aborted but its outcome is not yet
+  // attributed, mirroring opAborted: dispatchAbortFallback acts only while it
+  // stays set, so an onExited that arrives later never double-handles.
+  property bool dispatchAborted: false
 
   function dispatch(args, tag) {
     root.queue.push({ args: args, tag: tag || "" })
@@ -180,9 +187,25 @@ Item {
     // signal. Calling pump() synchronously while dispatchProc.running may still
     // be true would early-return and strand the whole queue until another
     // dispatch happens to kick it.
+    //
+    // Arm the watchdog on every start and disarm it on completion. A hung
+    // hyprctl must not leave dispatchProc.running true, because the queue
+    // drains — and thereby every close, grace-look set and regroup — on that
+    // flag alone.
+    onRunningChanged: {
+      if (dispatchProc.running) {
+        dispatchTimeout.interval = root.queryTimeoutMs
+        dispatchTimeout.restart()
+      } else {
+        dispatchTimeout.stop()
+      }
+    }
     onExited: function(exitCode, exitStatus) {
       const tag = root.runningTag
       root.runningTag = ""
+      dispatchTimeout.stop()
+      dispatchAbortFallback.stop()
+      root.dispatchAborted = false
       const detail = String(dispatchOut.text || "").trim()
       if (exitCode !== 0 || detail.indexOf("error") === 0) {
         console.warn("grace-window: dispatch failed (exit " + exitCode + "): " + detail)
@@ -190,6 +213,44 @@ Item {
       } else if (tag) {
         root.closeStarted(tag)
       }
+      Qt.callLater(root.pump)
+    }
+  }
+
+  // Watchdog for a hung dispatch, mirroring focusProcTimeout: on timeout the
+  // process is killed (running = false) and its outcome is attributed as a
+  // failure, so a close gets retried and the queue drains again. Without this
+  // a stuck hyprctl would leave dispatchProc.running true, stranding the FIFO
+  // and every later close, grace-look set, regroup and leave-group behind it.
+  Timer {
+    id: dispatchTimeout
+    repeat: false
+    onTriggered: {
+      if (!dispatchProc.running) return
+      console.warn("grace-window: dispatch timed out; aborting it")
+      root.dispatchAborted = true
+      dispatchProc.running = false
+      dispatchAbortFallback.interval = Math.max(1000, Math.round(root.queryTimeoutMs / 4))
+      dispatchAbortFallback.restart()
+    }
+  }
+
+  // Safety net for an aborted dispatch whose onExited never arrives (e.g. the
+  // killed process lingers): attribute the running tag as a failure and drain
+  // the queue, so a stuck dispatch can never block the FIFO forever. The
+  // onExited handler clears dispatchAborted when it does fire, so this only
+  // acts while the abort is still unattributed.
+  Timer {
+    id: dispatchAbortFallback
+    repeat: false
+    onTriggered: {
+      if (!root.dispatchAborted) return
+      console.warn("grace-window: aborted dispatch did not finish; discarding it")
+      dispatchTimeout.stop()
+      root.dispatchAborted = false
+      const tag = root.runningTag
+      root.runningTag = ""
+      if (tag) root.closeAborted(tag)
       Qt.callLater(root.pump)
     }
   }
