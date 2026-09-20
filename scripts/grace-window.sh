@@ -3,7 +3,10 @@
 #
 # Subcommands:
 #   hide-query                Capture the focused window for the hide path.
-#   reopen-query              Query the state the reopen path needs.
+#   reopen-query              Query the state the reopen path needs: active
+#                             window and workspace plus the focused monitor's
+#                             active special workspace (the scratchpad), so a
+#                             reopen can land on the scratchpad when it is up.
 #   leave-group ADDR DELAY    Pull a window out of its tabbed group before it
 #                             is hidden (applies the grouping delay).
 #   regroup ADDR FOCUS DELAY  Move a reopened window into the focused window's
@@ -100,15 +103,18 @@ cmd_hide_query() {
 }
 
 cmd_reopen_query() {
-  local aw ws
+  local aw ws mn
   aw=$(hyprctl -j activewindow 2>/dev/null || true)
   ws=$(hyprctl -j activeworkspace 2>/dev/null || true)
+  mn=$(hyprctl -j monitors 2>/dev/null || true)
   [[ -n "$aw" ]] || aw="{}"
   [[ -n "$ws" ]] || ws="{}"
+  [[ -n "$mn" ]] || mn="[]"
   jq -L "$self" -c -n \
     --argjson aw "$aw" \
     --argjson ws "$ws" \
-    'include "grace-window"; reopenQuery($aw; $ws)'
+    --argjson mn "$mn" \
+    'include "grace-window"; reopenQuery($aw; $ws; $mn)'
 }
 
 cmd_leave_group() {

@@ -24,8 +24,15 @@ def hideQuery($opacity; $opacityInactive; $rounding; $roundingPower):
     grouped: .grouped
   };
 
-# The reopen-path answer ({ aw, ws }) from the two queried documents.
-def reopenQuery($aw; $ws): { aw: $aw, ws: $ws };
+# The reopen-path answer ({ aw, ws, sp }) from the three queried documents.
+# sp is the special workspace shown on the focused monitor (the scratchpad),
+# or null when no special workspace is up — the signal that lets a reopen land
+# on an active scratchpad instead of the regular workspace under its overlay.
+def reopenQuery($aw; $ws; $mn):
+  ({ aw: $aw, ws: $ws,
+     sp: (( $mn | map(select(.focused)) | first // null ) as $m
+          | if $m != null and (($m.specialWorkspace.id // 0) != 0)
+            then $m.specialWorkspace else null end) });
 
 # Regroup direction: from the clients array and the focused ($f) and reopened
 # ($a) addresses, the direction ("l", "r", "u" or "d") in which the reopened

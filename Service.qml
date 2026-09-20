@@ -8,12 +8,14 @@
 //              window is pulled out; the rest stays. The grace timer pauses
 //              while the hidden window keeps focus. Returns "requested" when
 //              the operation is handed off, "busy" while another is in flight.
-//   reopen()   Bring a hidden window back to the current workspace, focus it,
-//              cancel its auto-close and restore its captured state. The
-//              focused window is preferred when hidden; otherwise the most
-//              recently hidden is reopened. A tiled reopened window joins the
-//              tabbed group that currently has focus. Returns "none" when
-//              nothing is pending, "requested"/"busy" otherwise.
+//   reopen()   Bring a hidden window back and focus it, cancel its auto-close
+//              and restore its captured state. It lands on the focused
+//              monitor's active special workspace (the scratchpad) when one is
+//              shown, and on the active workspace otherwise. The focused
+//              window is preferred when hidden; otherwise the most recently
+//              hidden is reopened. A tiled reopened window joins the tabbed
+//              group that currently has focus. Returns "none" when nothing is
+//              pending, "requested"/"busy" otherwise.
 //   status()   "idle", or "pending Ns" for the most recent hidden window.
 //   cancel()   Forget every pending window without closing it, restoring its
 //              grace look in place (the window stays on the grace workspace).
@@ -38,9 +40,6 @@
 // plugin's managed keybinding block from hypr/bindings.lua is appended to
 // ~/.config/hypr/bindings.lua (when missing); on teardown it is removed and
 // the grace look of every pending window is restored in place.
-
-// TODO:
-// IMPLEMENT: Reopen in scratchpad does not work yet
 
 import QtQuick
 import Quickshell
@@ -493,16 +492,30 @@ Item {
     // The focused window is only used below to prefer reopening it when it is
     // in grace and to pick the group to join on landing. Its absence (an
     // empty desktop, where hyprctl reports no window at all) is a normal case:
-    // the newest hidden window is then reopened onto the active workspace.
+    // the newest hidden window is then reopened onto the active workspace (or
+    // the active scratchpad when one is up).
     // The reopen target must be resolvable before any pending entry is
     // disturbed: an unparseable answer (e.g. a transient hyprctl failure
     // yielding an empty workspace) must not drop the chosen entry, whose
     // queued close would then be cancelled while the window stays hidden and
     // untracked forever.
+    //
+    // Target workspace: an active special workspace (the scratchpad, shown on
+    // the focused monitor) is addressed by its "special:<name>" reference —
+    // hyprctl activeworkspace keeps reporting the regular workspace underneath
+    // the overlay, and a bare numeric special id does not resolve reliably. A
+    // regular workspace keeps using its plain string id.
     const workspace = data.ws || {}
-    // Plain string id for the Lua arg (e.g. "4", never 4.0).
-    const id = workspace.id !== undefined && workspace.id !== null ? String(workspace.id) : ""
-    if (id === "" || id === "null") return "none"
+    const special = data.sp || {}
+    const specialName = String(special.name || "")
+    let target = ""
+    if (specialName.indexOf("special:") === 0) {
+      target = specialName
+    } else {
+      const id = workspace.id !== undefined && workspace.id !== null ? String(workspace.id) : ""
+      if (id !== "" && id !== "null") target = id
+    }
+    if (target === "") return "none"
     // Prefer the focused window when it is in grace; otherwise reopen the
     // most recently hidden one. Entries whose close is already running
     // (`closing`) are not reopened — their window is lost either way.
@@ -525,7 +538,7 @@ Item {
       entry.closeTag = ""
       entry.expiring = false
     }
-    root.restoreWindow(entry, id)
+    root.restoreWindow(entry, target)
     // Join the group that had focus when reopening was triggered (the
     // reopened window gets focused right after landing).
     root.dispatch([
