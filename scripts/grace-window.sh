@@ -263,8 +263,10 @@ cmd_undo_grace() {
     rounding=$(jq -r '.rounding // empty' <<<"$rec")
     rounding_power=$(jq -r '.roundingPower // empty' <<<"$rec")
     # Look fields are always captured by hide-query; an incomplete record can
-    # not be restored faithfully, so skip it instead of injecting empty values.
-    if [[ -z "$opacity" || -z "$opacity_inactive" || -z "$rounding" ]]; then
+    # not be restored faithfully, so skip it instead of injecting empty values
+    # (an empty rounding_power would otherwise become a malformed dispatch that
+    # aborts the rest of this window's restore).
+    if [[ -z "$opacity" || -z "$opacity_inactive" || -z "$rounding" || -z "$rounding_power" ]]; then
       say "skipping $addr: captured grace look incomplete"
       continue
     fi
