@@ -934,7 +934,9 @@ Item {
   // Forget every pending window (of every workspace's buffer) without closing
   // it, restoring its grace look (and pin) in place. The windows stay on the
   // grace workspace; only reopen moves them back. Queued auto-closes are
-  // cancelled so the windows really are left alone.
+  // cancelled so the windows really are left alone. The now-empty pending
+  // state is persisted too, so a later restart cannot resurrect a cancelled
+  // (or close-given-up) window from a stale state file and re-arm its close.
   function cancel() {
     // Invalidate every operation that is still in flight so its finish
     // handler reports "none" instead of applying after the cancellation.
@@ -952,6 +954,9 @@ Item {
     // The windows currently being reopened are left to their restores; the
     // service simply forgets them.
     root.pending = []
+    // Persist the (now empty) pending state, clearing any stale state.json,
+    // while the restoring entries are recorded in `cancelled`.
+    root.saveStateDetached()
     return "ok"
   }
 
@@ -1146,7 +1151,10 @@ Item {
   // restored: anything a user moved or closed while the service was down is
   // dropped by the startup probe. Entries already closing when teardown fires
   // cannot be saved (their close is in flight), and cancelled scheduled closes
-  // are simply re-queued from the restored `remaining` (≤ 0 ⇒ `expiring`).
+  // are simply re-queued from the restored `remaining` (≤ 0 ⇒ `expiring`). An
+  // empty pending set is saved as an empty state, which clears the file: a
+  // window forgotten by cancel() (or given up after closeRetryMax) must never
+  // be resurrected into pending with a re-armed auto-close on the next start.
 
   // Every entry teardown must account for: the pending windows plus the windows
   // currently being reopened (`restoring`). A restoring entry is by definition
@@ -1162,7 +1170,8 @@ Item {
   }
 
   // The persistable subset of teardownEntries: every entry whose window is
-  // still reopenable (not closing). The transients that only mean something
+  // still reopenable (not closing) and was not forgotten by cancel() (its
+  // address is in `cancelled`). The transients that only mean something
   // inside a running service (closeTag, closeFails, the state flag) are derived
   // anew on load, so the file stays a stable snapshot of the captured state.
   function saveableEntries() {
@@ -1171,6 +1180,7 @@ Item {
     for (let i = 0; i < all.length; i++) {
       const e = all[i]
       if (e.state === "closing") continue
+      if (root.cancelled.has(e.address)) continue
       out.push({
         address: e.address,
         workspace: e.workspace,
@@ -1199,10 +1209,12 @@ Item {
   // Saves the pending state for the next startup, atomically, through the
   // runtime script. Runs detached, mirroring cancelDetached: on
   // Component.onDestruction a child Process could not outlive the service
-  // objects being torn down. No state is saved when nothing is pending.
+  // objects being torn down. An empty state (nothing pending, or a cancel()
+  // that forgot everything) sends the empty array so the script clears (or
+  // keeps cleared) state.json — a stale save must never resurrect forgotten
+  // windows or re-arm their auto-close on the next start.
   function saveStateDetached() {
     const saveable = root.saveableEntries()
-    if (saveable.length === 0) return
     const script = root.unwireInstalled ? root.unwireRuntimeScript : root.bashScript
     Quickshell.execDetached(["bash", script, "save-state",
       root.unwireRuntimeDir, JSON.stringify(saveable)])

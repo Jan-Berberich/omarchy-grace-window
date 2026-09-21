@@ -29,7 +29,9 @@
 #   save-state DIR JSON       Persist the pending state as DIR/state.json
 #                             (atomically), so the next startup can restore the
 #                             pre-teardown buffers. Also runs at teardown from
-#                             this runtime copy.
+#                             this runtime copy. An empty JSON (nothing pending)
+#                             clears any stale save instead: a leftover file
+#                             must never resurrect forgotten windows.
 #   state-probe               List every client's address and the workspace it
 #                             sits on (id string plus name), so a startup load
 #                             can keep only windows still on their saved grace
@@ -319,12 +321,18 @@ cmd_undo_grace() {
 
 # Persist the pending state as $dir/state.json so teardown's state survives into
 # the next startup. Atomic (write next to it, then rename), so an interrupted
-# write can never leave a truncated state file that parses to garbage.
+# write can never leave a truncated state file that parses to garbage. An empty
+# state (nothing pending, or a cancel that forgot everything) removes any stale
+# file: a saved window that is no longer pending must not be resurrected with a
+# re-armed auto-close on the next start.
 cmd_save_state() {
   local dir="$1" data="$2" tmp
-  [[ -n "$data" ]] || return 0
   mkdir -p "$dir" || die "cannot create state dir: $dir"
   check_target "$dir"
+  if [[ -z "$data" || "$data" == "[]" ]]; then
+    rm -f "$dir/state.json" || die "cannot remove stale state file"
+    return 0
+  fi
   tmp="$dir/state.json.tmp.$$"
   printf '%s\n' "$data" > "$tmp" || { rm -f "$tmp"; die "cannot write state file"; }
   chmod 600 "$tmp" 2>/dev/null || true

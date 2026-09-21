@@ -148,7 +148,10 @@ such workflows can coexist.
   stopped. Windows that moved or were closed while the service was down are
   skipped, and nothing is ever saved once a window's close is already in
   flight. A window that was still mid-reopen when the service stopped is
-  treated the same way, so a restart during a reopen never strands it.
+  treated the same way, so a restart during a reopen never strands it. `cancel`
+  (or a close given up after `closeRetryMax` retries) clears the saved state,
+  so such a window is never resurrected into grace — and its auto-close never
+  re-armed — by a later restart.
 - Re-hiding a window always restarts its full grace period, so `status`
   reports the fresh pending seconds. A pending window that is gone from
   Hyprland for any other reason (closed on its own, crashed) is dropped by the
