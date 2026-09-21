@@ -608,10 +608,14 @@ Item {
   }
 
   function undoGraceState(entry) {
-    // Undo everything hide() did to the window's look and mode — the lower
-    // opacity, the cut corners and the forced tiling. Never touches the
-    // workspace, so the window stays where it is (the grace workspace for a
-    // pending window, or the current one when reopening).
+    // Undo what hide() did to the window's look — the lower opacity and the
+    // cut corners — and the forced tiling/fullscreen/float mode changes. Never
+    // restores the pin: hide() may have dropped it, but pinning is the last
+    // step of a restore and must follow the move, so the callers handle it
+    // (restoreWindow after the workspace move, restoreInPlace alongside the
+    // in-place restore). Never touches the workspace, so the window stays
+    // where it is (the grace workspace for a pending window, or the current
+    // one when reopening).
     root.setWindowProp(entry.address, "opacity", entry.opacity)
     root.setWindowProp(entry.address, "opacity_inactive", entry.opacityInactive)
     root.setWindowProp(entry.address, "rounding", entry.rounding)
@@ -623,13 +627,24 @@ Item {
   }
 
   function restoreWindow(entry, workspaceId) {
-    // Undo the grace look, then restore the captured mode and geometry.
+    // Undo the grace look, then restore the captured mode and geometry. The
+    // pin is restored last, only after the window sits on its target
+    // workspace: a moved window must never be pinned mid-flight.
     root.undoGraceState(entry)
     if (entry.floating) {
       if (entry.w > 0 && entry.h > 0) root.resizeWindow(entry.address, entry.w, entry.h)
       root.moveWindowTo(entry.address, entry.x, entry.y)
     }
     root.moveWindowToWorkspace(entry.address, workspaceId)
+    if (entry.pinned) root.setWindowPin(entry.address, "on")
+  }
+
+  // In-place restore for a window that stays where it is (cancel, give-up
+  // close): undo the grace look and re-pin it, mirroring restoreWindow where
+  // the pin always ends the restore. There is no move here, so it simply
+  // follows the look undo.
+  function restoreInPlace(entry) {
+    root.undoGraceState(entry)
     if (entry.pinned) root.setWindowPin(entry.address, "on")
   }
 
@@ -802,7 +817,7 @@ Item {
       entry.closeFails = (entry.closeFails || 0) + 1
       if (entry.closeFails >= root.closeRetryMax) {
         console.warn(`grace-window: giving up closing ${entry.address} after ${entry.closeFails} attempts; restoring its look in place`)
-        root.undoGraceState(entry)
+        root.restoreInPlace(entry)
         root.pending.splice(i, 1)
         return
       }
@@ -971,16 +986,16 @@ Item {
 
   function cancel() {
     // Forget every pending window (of every workspace's buffer) without
-    // closing it, restoring its grace look in place. The windows stay on the
-    // grace workspace; only reopen moves them back. Queued auto-closes are
-    // cancelled so the windows really are left alone.
+    // closing it, restoring its grace look (and pin) in place. The windows
+    // stay on the grace workspace; only reopen moves them back. Queued
+    // auto-closes are cancelled so the windows really are left alone.
     root.cancelScheduledCloses()
     // A hide/reopen query already in flight would apply its effect after this
     // cancellation (classifyHide pushes a fresh pending entry, classifyReopen
     // moves a window). Flag it so the finish handler reports "none" instead.
     if (root.opBusy) root.opCancelPending = true
     for (let i = 0; i < root.pending.length; i++) {
-      root.undoGraceState(root.pending[i])
+      root.restoreInPlace(root.pending[i])
     }
     root.pending = []
     return "ok"
