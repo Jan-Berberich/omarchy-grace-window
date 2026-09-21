@@ -113,6 +113,14 @@ Item {
   // clients probe, so status only ever counts grace windows that still exist.
   property var pending: []
 
+  // The entries currently being reopened, keyed by window address (one restore
+  // per address; a window is spliced out of `pending` for the duration). Each
+  // is held out of `pending` while its restore dispatches are in flight — so
+  // the sweep cannot expire it, the liveness probe cannot prune it and reopen
+  // cannot pick it again — and put back under its workspace buffer when the
+  // restore fails. Empty when no reopen is in flight.
+  property var restoring: {}
+
   // Timestamp of the last sweep tick and address of the currently focused
   // window, used to pause a window's grace timer while it is focused.
   property double lastTick: 0
@@ -239,11 +247,18 @@ Item {
       dispatchAbortFallback.stop()
       root.dispatchAborted = false
       const detail = (dispatchOut.text || "").trim()
-      if (exitCode !== 0 || detail.indexOf("error") === 0) {
+      const failed = exitCode !== 0 || detail.indexOf("error") === 0
+      if (tag && tag.indexOf("restore:") === 0) {
+        // A reopen's restore dispatch finished: settle the in-flight reopen.
+        if (failed) console.warn(`grace-window: a restore dispatch failed (exit ${exitCode}): ${detail}`)
+        root.settleRestore(tag, !failed)
+      } else if (failed && tag) {
         console.warn(`grace-window: dispatch failed (exit ${exitCode}): ${detail}`)
-        if (tag) root.closeAborted(tag)
+        root.closeAborted(tag)
       } else if (tag) {
         root.closeStarted(tag)
+      } else if (failed) {
+        console.warn(`grace-window: dispatch failed (exit ${exitCode}): ${detail}`)
       }
       Qt.callLater(root.pump)
     }
@@ -286,7 +301,10 @@ Item {
       root.dispatchAborted = false
       const tag = root.runningTag
       root.runningTag = ""
-      if (tag) root.closeAborted(tag)
+      if (tag) {
+        if (tag.indexOf("restore:") === 0) root.settleRestore(tag, false)
+        else root.closeAborted(tag)
+      }
       Qt.callLater(root.pump)
     }
   }
@@ -606,25 +624,36 @@ Item {
     // If the chosen window's grace expired and the sweep already queued its
     // close, cancel that close now — otherwise it would fire right after the
     // restore dispatches and close the window just brought back. A close that
-    // is already running cannot be undone (inherent).
+    // is already running cannot be undone (inherent). On a failed restore the
+    // re-queued entry re-derives its expiry from `remaining` (≤ 0 ⇒ expiring),
+    // so the cancelled close is re-queued by the sweep as before.
     if (entry.closeTag) {
       root.cancelQueuedClose(entry.closeTag)
       entry.closeTag = ""
       entry.expiring = false
     }
-    root.restoreWindow(entry, target)
+    // Hold the entry out of the pending list while the restore runs, tagging
+    // every restore dispatch "restore:<address>" so settleRestore can put the
+    // entry back under its workspace buffer when the reopen fails — a window
+    // must never be stranded hidden and untracked because its restore did not
+    // complete. While held, the sweep cannot expire it and reopen cannot pick
+    // it again.
+    const restoreTag = "restore:" + entry.address
+    root.restoring[entry.address] = entry
+    root.restoreWindow(entry, target, restoreTag)
     // Join the group that had focus when reopening was triggered.
     root.dispatch([
       "bash", root.bashScript, "regroup",
       entry.address, win.address || "", String(root.groupingDelay),
-    ])
+    ], restoreTag)
     // Landed, regrouped (with its delay), look restored — end on the window
-    // being focused, so the reopen lands the user where they left off.
-    root.focusWindow(entry.address)
+    // being focused, so the reopen lands the user where they left off. This is
+    // the last restore-tagged dispatch, so settleRestore settles on it.
+    root.focusWindow(entry.address, restoreTag)
     return "ok"
   }
 
-  function undoGraceState(entry) {
+  function undoGraceState(entry, tag) {
     // Undo what hide() did to the window's look — the lower opacity and the
     // cut corners — and the forced tiling/fullscreen/float mode changes. Never
     // restores the pin: hide() may have dropped it, but pinning is the last
@@ -632,28 +661,29 @@ Item {
     // (restoreWindow after the workspace move, restoreInPlace alongside the
     // in-place restore). Never touches the workspace, so the window stays
     // where it is (the grace workspace for a pending window, or the current
-    // one when reopening).
-    root.setWindowProp(entry.address, "opacity", entry.opacity)
-    root.setWindowProp(entry.address, "opacity_inactive", entry.opacityInactive)
-    root.setWindowProp(entry.address, "rounding", entry.rounding)
-    root.setWindowProp(entry.address, "rounding_power", entry.roundingPower)
+    // one when reopening). `tag` — passed along to every dispatch — lets a
+    // reopen's restore be attributed as a whole by settleRestore.
+    root.setWindowProp(entry.address, "opacity", entry.opacity, tag)
+    root.setWindowProp(entry.address, "opacity_inactive", entry.opacityInactive, tag)
+    root.setWindowProp(entry.address, "rounding", entry.rounding, tag)
+    root.setWindowProp(entry.address, "rounding_power", entry.roundingPower, tag)
     if (entry.fullscreen > 0 || entry.fullscreenClient > 0) {
-      root.setWindowFullscreen(entry.address, entry.fullscreen, entry.fullscreenClient)
+      root.setWindowFullscreen(entry.address, entry.fullscreen, entry.fullscreenClient, tag)
     }
-    if (entry.floating) root.setWindowFloat(entry.address, "on")
+    if (entry.floating) root.setWindowFloat(entry.address, "on", tag)
   }
 
-  function restoreWindow(entry, workspaceId) {
+  function restoreWindow(entry, workspaceId, tag) {
     // Undo the grace look, then restore the captured mode and geometry. The
     // pin is restored last, only after the window sits on its target
     // workspace: a moved window must never be pinned mid-flight.
-    root.undoGraceState(entry)
+    root.undoGraceState(entry, tag)
     if (entry.floating) {
-      if (entry.w > 0 && entry.h > 0) root.resizeWindow(entry.address, entry.w, entry.h)
-      root.moveWindowTo(entry.address, entry.x, entry.y)
+      if (entry.w > 0 && entry.h > 0) root.resizeWindow(entry.address, entry.w, entry.h, tag)
+      root.moveWindowTo(entry.address, entry.x, entry.y, tag)
     }
-    root.moveWindowToWorkspace(entry.address, workspaceId)
-    if (entry.pinned) root.setWindowPin(entry.address, "on")
+    root.moveWindowToWorkspace(entry.address, workspaceId, tag)
+    if (entry.pinned) root.setWindowPin(entry.address, "on", tag)
   }
 
   // In-place restore for a window that stays where it is (cancel, give-up
@@ -663,6 +693,34 @@ Item {
   function restoreInPlace(entry) {
     root.undoGraceState(entry)
     if (entry.pinned) root.setWindowPin(entry.address, "on")
+  }
+
+  // Settles the in-flight reopen of the entry in `restoring[address]`: every
+  // restore dispatch carries the same "restore:<address>" tag, so this runs
+  // for each of them, but only the last one settles — once the queue holds no
+  // further command with the tag. A success keeps the entry out for good (the
+  // window is back); a failure puts it back under its workspace buffer, still
+  // in grace, so it can be reopened again or closed by the sweep instead of
+  // being stranded hidden and untracked.
+  function settleRestore(tag, success) {
+    if (tag.indexOf("restore:") !== 0) return
+    const address = tag.slice("restore:".length)
+    const entry = root.restoring[address]
+    if (!entry) return
+    for (let i = 0; i < root.queue.length; i++) {
+      if (root.queue[i].tag === tag) return  // more restore dispatches queued; keep waiting
+    }
+    delete root.restoring[address]
+    if (success) {
+      console.log(`grace-window: reopened ${entry.address}`)
+      return
+    }
+    // A re-hide of the same window since the reopen started supersedes this
+    // entry: classifyHide captured it fresh, so dropping this one is right.
+    if (root.findPending(entry.address)) return
+    console.warn(`grace-window: reopen of ${entry.address} failed; keeping it pending`)
+    root.pending.push(entry)
+    entry.expiring = entry.remaining <= 0
   }
 
   // ------------------------------------------------------ dispatch helpers
@@ -676,40 +734,40 @@ Item {
     ], tag)
   }
 
-  function setWindowProp(addr, prop, value) {
-    root.luaDispatch(`window_set_prop('${addr}', '${prop}', ${value})`)
+  function setWindowProp(addr, prop, value, tag) {
+    root.luaDispatch(`window_set_prop('${addr}', '${prop}', ${value})`, tag)
   }
 
-  function setWindowFloat(addr, action) {
-    root.luaDispatch(`window_float('${addr}', '${action}')`)
+  function setWindowFloat(addr, action, tag) {
+    root.luaDispatch(`window_float('${addr}', '${action}')`, tag)
   }
 
-  function setWindowPin(addr, action) {
-    root.luaDispatch(`window_pin('${addr}', '${action}')`)
+  function setWindowPin(addr, action, tag) {
+    root.luaDispatch(`window_pin('${addr}', '${action}')`, tag)
   }
 
-  function setWindowFullscreen(addr, internal, client) {
-    root.luaDispatch(`window_fullscreen('${addr}', ${internal}, ${client})`)
+  function setWindowFullscreen(addr, internal, client, tag) {
+    root.luaDispatch(`window_fullscreen('${addr}', ${internal}, ${client})`, tag)
   }
 
-  function moveWindowToWorkspace(addr, workspace) {
-    root.luaDispatch(`window_to_workspace('${addr}', '${workspace}')`)
+  function moveWindowToWorkspace(addr, workspace, tag) {
+    root.luaDispatch(`window_to_workspace('${addr}', '${workspace}')`, tag)
   }
 
-  function moveToGraceWorkspace(addr, workspace) {
-    root.luaDispatch(`window_to_grace_workspace('${addr}', '${workspace}')`)
+  function moveToGraceWorkspace(addr, workspace, tag) {
+    root.luaDispatch(`window_to_grace_workspace('${addr}', '${workspace}')`, tag)
   }
 
-  function moveWindowTo(addr, x, y) {
-    root.luaDispatch(`window_to_position('${addr}', ${x}, ${y})`)
+  function moveWindowTo(addr, x, y, tag) {
+    root.luaDispatch(`window_to_position('${addr}', ${x}, ${y})`, tag)
   }
 
-  function resizeWindow(addr, w, h) {
-    root.luaDispatch(`window_resize('${addr}', ${w}, ${h})`)
+  function resizeWindow(addr, w, h, tag) {
+    root.luaDispatch(`window_resize('${addr}', ${w}, ${h})`, tag)
   }
 
-  function focusWindow(addr) {
-    root.luaDispatch(`window_focus('${addr}')`)
+  function focusWindow(addr, tag) {
+    root.luaDispatch(`window_focus('${addr}')`, tag)
   }
 
   // ------------------------------------------------------------- helpers
