@@ -83,7 +83,7 @@ Item {
   property var manifest: null
   readonly property string sourceDir:
     root.manifest && root.manifest.__sourceDir
-      ? String(root.manifest.__sourceDir)
+      ? root.manifest.__sourceDir
       : Quickshell.env("HOME") + "/.config/omarchy/plugins/jam.grace-window"
 
   readonly property string scriptsDir: root.sourceDir + "/scripts"
@@ -205,9 +205,9 @@ Item {
       dispatchTimeout.stop()
       dispatchAbortFallback.stop()
       root.dispatchAborted = false
-      const detail = String(dispatchOut.text || "").trim()
+      const detail = (dispatchOut.text || "").trim()
       if (exitCode !== 0 || detail.indexOf("error") === 0) {
-        console.warn("grace-window: dispatch failed (exit " + exitCode + "): " + detail)
+        console.warn(`grace-window: dispatch failed (exit ${exitCode}): ${detail}`)
         if (tag) root.closeAborted(tag)
       } else if (tag) {
         root.closeStarted(tag)
@@ -374,7 +374,7 @@ Item {
   function classifyHide(raw) {
     const rec = root.parseJson(raw)
     if (!rec) return "none"
-    const addr = String(rec.address || "")
+    const addr = rec.address || ""
     if (!addr) return "none"
     const existing = root.findPending(addr)
     if (existing && existing.closing) return "none"
@@ -404,49 +404,49 @@ Item {
     }
     // Refuse windows that report no opacity or rounding values: the look
     // could not be restored faithfully on reopen, so better not hide at all.
-    const opacity = String(rec.opacity || "")
-    const opacityInactive = String(rec.opacityInactive || "")
-    const rounding = String(rec.rounding || "")
-    const roundingPower = String(rec.roundingPower || "")
+    const opacity = rec.opacity || ""
+    const opacityInactive = rec.opacityInactive || ""
+    const rounding = rec.rounding || ""
+    const roundingPower = rec.roundingPower || ""
     if (opacity === "" || opacityInactive === "" || rounding === "" || roundingPower === "") return "none"
-    // A non-numeric getprop value would otherwise turn into a "NaN" prop value.
-    const graceOpacity = Number(opacity) * root.graceOpacityFactor
-    const graceOpacityInactive = Number(opacityInactive) * root.graceOpacityFactor
-    if (isNaN(graceOpacity) || isNaN(graceOpacityInactive)) return "none"
-    // Capture look, mode and geometry so reopen can restore them exactly.
-    const entry = {
-      address: addr,
-      remaining: root.graceMs,
-      opacity: opacity,
-      opacityInactive: opacityInactive,
-      rounding: rounding,
-      roundingPower: roundingPower,
-      floating: String(rec.floating === true),
-      fullscreen: String(rec.fullscreen || 0),
-      fullscreenClient: String(rec.fullscreenClient || 0),
-      pinned: String(rec.pinned === true),
-      x: String(rec.x || 0),
-      y: String(rec.y || 0),
-      w: String(rec.w || 0),
-      h: String(rec.h || 0),
-      closing: false,
-      closeFails: 0,
-    }
-    root.pending.push(entry)
-    // Pull the window out of any tabbed group first, so only it is hidden.
-    const grouped = Array.isArray(rec.grouped) ? rec.grouped : []
-    if (grouped.length > 0) {
-      root.dispatch(["bash", root.bashScript, "leave-group", addr, String(root.groupingDelay)])
-    }
-    // Hide the window: force tiling and apply the grace look.
-    root.moveToGraceWorkspace(addr)
-    root.setWindowFloat(addr, false)
-    root.setWindowFullscreen(addr, "0", "0")
-    root.setWindowPin(addr, false)
-    root.setWindowProp(addr, "opacity", String(graceOpacity))
-    root.setWindowProp(addr, "opacity_inactive", String(graceOpacityInactive))
-    root.setWindowProp(addr, "rounding", String(root.graceRounding))
-    root.setWindowProp(addr, "rounding_power", String(root.graceRoundingPower))
+      // A non-numeric getprop value would otherwise turn into a "NaN" prop value.
+      const graceOpacity = Number(opacity) * root.graceOpacityFactor
+      const graceOpacityInactive = Number(opacityInactive) * root.graceOpacityFactor
+      if (isNaN(graceOpacity) || isNaN(graceOpacityInactive)) return "none"
+      // Capture look, mode and geometry so reopen can restore them exactly.
+      const entry = {
+        address: addr,
+        remaining: root.graceMs,
+        opacity: Number(opacity),
+        opacityInactive: Number(opacityInactive),
+        rounding: Number(rounding),
+        roundingPower: Number(roundingPower),
+        floating: rec.floating || false,
+        fullscreen: rec.fullscreen || 0,
+        fullscreenClient: rec.fullscreenClient || 0,
+        pinned: rec.pinned || false,
+        x: rec.x || 0,
+        y: rec.y || 0,
+        w: rec.w || 0,
+        h: rec.h || 0,
+        closing: false,
+        closeFails: 0,
+      }
+      root.pending.push(entry)
+      // Pull the window out of any tabbed group first, so only it is hidden.
+      const grouped = Array.isArray(rec.grouped) ? rec.grouped : []
+      if (grouped.length > 0) {
+        root.dispatch(["bash", root.bashScript, "leave-group", addr, String(root.groupingDelay)])
+      }
+      // Hide the window: force tiling and apply the grace look.
+      root.moveToGraceWorkspace(addr)
+      root.setWindowFloat(addr, "off")
+      root.setWindowFullscreen(addr, 0, 0)
+      root.setWindowPin(addr, "off")
+      root.setWindowProp(addr, "opacity", graceOpacity)
+      root.setWindowProp(addr, "opacity_inactive", graceOpacityInactive)
+      root.setWindowProp(addr, "rounding", root.graceRounding)
+      root.setWindowProp(addr, "rounding_power", root.graceRoundingPower)
     return "ok"
   }
 
@@ -454,7 +454,7 @@ Item {
   // the interesting ones: a "requested" handoff must not silently be a nothing.
   function reportOperation(op, verdict) {
     if (verdict !== "ok") {
-      console.warn("grace-window: " + op + " finished with no effect (" + verdict + ")")
+      console.warn(`grace-window: ${op} finished with no effect (${verdict})`)
     }
     ipc.result(verdict)
   }
@@ -488,7 +488,7 @@ Item {
     const data = root.parseJson(raw)
     if (!data) return "none"
     const win = data.aw || {}
-    const addr = String(win.address || "")
+    const addr = win.address || ""
     // The focused window is only used below to prefer reopening it when it is
     // in grace and to pick the group to join on landing. Its absence (an
     // empty desktop, where hyprctl reports no window at all) is a normal case:
@@ -507,13 +507,13 @@ Item {
     // regular workspace keeps using its plain string id.
     const workspace = data.ws || {}
     const special = data.sp || {}
-    const specialName = String(special.name || "")
+    const specialName = special.name || ""
     let target = ""
     if (specialName.indexOf("special:") === 0) {
       target = specialName
     } else {
-      const id = workspace.id !== undefined && workspace.id !== null ? String(workspace.id) : ""
-      if (id !== "" && id !== "null") target = id
+      const id = workspace.id !== undefined && workspace.id !== null ? workspace.id : ""
+      if (id !== "" && id !== null) target = id
     }
     if (target === "") return "none"
     // Prefer the focused window when it is in grace; otherwise reopen the
@@ -539,11 +539,10 @@ Item {
       entry.expiring = false
     }
     root.restoreWindow(entry, target)
-    // Join the group that had focus when reopening was triggered (the
-    // reopened window gets focused right after landing).
+    // Join the group that had focus when reopening was triggered.
     root.dispatch([
       "bash", root.bashScript, "regroup",
-      entry.address, String(win.address || ""), String(root.groupingDelay),
+      entry.address, win.address || "", String(root.groupingDelay),
     ])
     return "ok"
   }
@@ -557,9 +556,9 @@ Item {
     root.setWindowProp(entry.address, "opacity_inactive", entry.opacityInactive)
     root.setWindowProp(entry.address, "rounding", entry.rounding)
     root.setWindowProp(entry.address, "rounding_power", entry.roundingPower)
-    if (entry.floating === "true") root.setWindowFloat(entry.address, true)
-    if (entry.pinned === "true") root.setWindowPin(entry.address, true)
-    if (Number(entry.fullscreen) > 0 || Number(entry.fullscreenClient) > 0) {
+    if (entry.floating) root.setWindowFloat(entry.address, "on")
+    if (entry.pinned) root.setWindowPin(entry.address, "on")
+    if (entry.fullscreen > 0 || entry.fullscreenClient > 0) {
       root.setWindowFullscreen(entry.address, entry.fullscreen, entry.fullscreenClient)
     }
   }
@@ -567,10 +566,8 @@ Item {
   function restoreWindow(entry, workspaceId) {
     // Undo the grace look, then restore the captured mode and geometry.
     root.undoGraceState(entry)
-    if (entry.floating === "true") {
-      const w = Number(entry.w)
-      const h = Number(entry.h)
-      if (w > 0 && h > 0) root.resizeWindow(entry.address, entry.w, entry.h)
+    if (entry.floating) {
+      if (entry.w > 0 && entry.h > 0) root.resizeWindow(entry.address, entry.w, entry.h)
       root.moveWindowTo(entry.address, entry.x, entry.y)
     }
     root.moveWindowToWorkspace(entry.address, workspaceId)
@@ -583,40 +580,40 @@ Item {
   function luaDispatch(body, tag) {
     root.dispatch([
       "hyprctl", "dispatch",
-      "dofile('" + root.luaScript + "')." + body,
+      `dofile('${root.luaScript}').${body}`,
     ], tag)
   }
 
   function setWindowProp(addr, prop, value) {
-    root.luaDispatch("window_set_prop('" + addr + "', '" + prop + "', '" + value + "')")
+    root.luaDispatch(`window_set_prop('${addr}', '${prop}', ${value})`)
   }
 
-  function setWindowFloat(addr, enabled) {
-    root.luaDispatch("window_float('" + addr + "', " + (enabled ? "true" : "false") + ")")
+  function setWindowFloat(addr, action) {
+    root.luaDispatch(`window_float('${addr}', '${action}')`)
   }
 
-  function setWindowPin(addr, enabled) {
-    root.luaDispatch("window_pin('" + addr + "', " + (enabled ? "true" : "false") + ")")
+  function setWindowPin(addr, action) {
+    root.luaDispatch(`window_pin('${addr}', '${action}')`)
   }
 
   function setWindowFullscreen(addr, internal, client) {
-    root.luaDispatch("window_fullscreen('" + addr + "', '" + internal + "', '" + client + "')")
+    root.luaDispatch(`window_fullscreen('${addr}', ${internal}, ${client})`)
   }
 
   function moveWindowToWorkspace(addr, workspace) {
-    root.luaDispatch("window_to_workspace('" + addr + "', '" + workspace + "')")
+    root.luaDispatch(`window_to_workspace('${addr}', '${workspace}')`)
   }
 
   function moveToGraceWorkspace(addr) {
-    root.luaDispatch("window_to_grace_workspace('" + addr + "', '" + root.graceWorkspace + "')")
+    root.luaDispatch(`window_to_grace_workspace('${addr}', '${root.graceWorkspace}')`)
   }
 
   function moveWindowTo(addr, x, y) {
-    root.luaDispatch("window_to_position('" + addr + "', '" + x + "', '" + y + "')")
+    root.luaDispatch(`window_to_position('${addr}', ${x}, ${y})`)
   }
 
   function resizeWindow(addr, w, h) {
-    root.luaDispatch("window_resize('" + addr + "', '" + w + "', '" + h + "')")
+    root.luaDispatch(`window_resize('${addr}', ${w}, ${h})`)
   }
 
   // ------------------------------------------------------------- helpers
@@ -714,8 +711,7 @@ Item {
       entry.closeTag = ""
       entry.closeFails = (entry.closeFails || 0) + 1
       if (entry.closeFails >= root.closeRetryMax) {
-        console.warn("grace-window: giving up closing " + entry.address + " after " +
-          entry.closeFails + " attempts; restoring its look in place")
+        console.warn(`grace-window: giving up closing ${entry.address} after ${entry.closeFails} attempts; restoring its look in place`)
         root.undoGraceState(entry)
         root.pending.splice(i, 1)
         return
@@ -747,7 +743,7 @@ Item {
       // cancel before the close is ever submitted.
       if (entry.expiring) {
         if (!entry.closeTag) {
-          entry.closeTag = "close:" + entry.address
+          entry.closeTag = `close:${entry.address}`
           root.dispatch(["bash", root.bashScript, "close", entry.address], entry.closeTag)
         }
         continue
@@ -810,7 +806,7 @@ Item {
       root.focusedAddress = ""
       return
     }
-    const addr = String(win.address || "")
+    const addr = win.address || ""
     root.focusedAddress = addr === "0x0" ? "" : addr
   }
 
@@ -821,7 +817,7 @@ Item {
     if (root.pending.length === 0) return "idle"
     const last = root.pending[root.pending.length - 1]
     const remaining = Math.ceil(last.remaining / 1000)
-    return "pending " + (remaining > 0 ? remaining : 0) + "s"
+    return `pending ${remaining > 0 ? remaining : 0}s`
   }
 
   function cancel() {

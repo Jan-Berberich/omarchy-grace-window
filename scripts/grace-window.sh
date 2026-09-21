@@ -261,10 +261,10 @@ cmd_undo_grace() {
     pinned=$(jq -r '.pinned // "false"' <<<"$rec")
     fullscreen=$(jq -r '.fullscreen // 0' <<<"$rec")
     fullscreen_client=$(jq -r '.fullscreenClient // 0' <<<"$rec")
-    lua_call "window_set_prop('$addr', 'opacity', '$opacity')" || continue
-    lua_call "window_set_prop('$addr', 'opacity_inactive', '$opacity_inactive')" || continue
-    lua_call "window_set_prop('$addr', 'rounding', '$rounding')" || continue
-    lua_call "window_set_prop('$addr', 'rounding_power', '$rounding_power')" || continue
+    lua_call "window_set_prop('$addr', 'opacity', $opacity)" || continue
+    lua_call "window_set_prop('$addr', 'opacity_inactive', $opacity_inactive)" || continue
+    lua_call "window_set_prop('$addr', 'rounding', $rounding)" || continue
+    lua_call "window_set_prop('$addr', 'rounding_power', $rounding_power)" || continue
     if [[ "$floating" == "true" ]]; then
       lua_call "window_float('$addr', true)" || continue
     fi
@@ -272,7 +272,7 @@ cmd_undo_grace() {
       lua_call "window_pin('$addr', true)" || continue
     fi
     if (( fullscreen > 0 || fullscreen_client > 0 )); then
-      lua_call "window_fullscreen('$addr', '$fullscreen', '$fullscreen_client')" || continue
+      lua_call "window_fullscreen('$addr', $fullscreen, $fullscreen_client)" || continue
     fi
   done < <(jq -c '.[]?' <<<"$data")
 }

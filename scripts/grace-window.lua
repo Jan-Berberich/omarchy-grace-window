@@ -12,53 +12,57 @@
 
 local gw = {}
 
+local addr = function(address)
+  return ("address:%s"):format(address)
+end
+
 function gw.window_set_prop(address, prop, value)
-  return hl.dsp.window.set_prop({ window = "address:" .. address, prop = prop, value = value })
+  return hl.dsp.window.set_prop({ window = addr(address), prop = prop, value = value })
 end
 
-function gw.window_float(address, enabled)
-  return hl.dsp.window.float({ window = "address:" .. address, action = enabled and "on" or "off" })
+function gw.window_float(address, action)
+  return hl.dsp.window.float({ window = addr(address), action = action })
 end
 
-function gw.window_pin(address, enabled)
-  return hl.dsp.window.pin({ window = "address:" .. address, action = enabled and "on" or "off" })
+function gw.window_pin(address, action)
+  return hl.dsp.window.pin({ window = addr(address), action = action })
 end
 
 function gw.window_fullscreen(address, internal, client)
   return hl.dsp.window.fullscreen_state({
-    window = "address:" .. address,
-    internal = tonumber(internal),
-    client = tonumber(client),
+    window = addr(address),
+    internal = internal,
+    client = client,
     action = "set",
   })
 end
 
 function gw.window_to_workspace(address, workspace)
-  return hl.dsp.window.move({ window = "address:" .. address, workspace = workspace })
+  return hl.dsp.window.move({ window = addr(address), workspace = workspace })
 end
 
 function gw.window_to_grace_workspace(address, workspace)
-  return hl.dsp.window.move({ window = "address:" .. address, workspace = workspace, follow = false })
+  return hl.dsp.window.move({ window = addr(address), workspace = workspace, follow = false })
 end
 
 function gw.window_to_position(address, x, y)
-  return hl.dsp.window.move({ window = "address:" .. address, x = tonumber(x), y = tonumber(y) })
+  return hl.dsp.window.move({ window = addr(address), x = x, y = y })
 end
 
-function gw.window_resize(address, width, height)
-  return hl.dsp.window.resize({ window = "address:" .. address, x = tonumber(width), y = tonumber(height) })
+function gw.window_resize(address, x, y)
+  return hl.dsp.window.resize({ window = addr(address), x = x, y = y })
 end
 
 function gw.window_close(address)
-  return hl.dsp.window.close({ window = "address:" .. address })
+  return hl.dsp.window.close({ window = addr(address) })
 end
 
 function gw.window_out_of_group(address)
-  return hl.dsp.window.move({ window = "address:" .. address, out_of_group = true })
+  return hl.dsp.window.move({ window = addr(address), out_of_group = true })
 end
 
 function gw.window_into_group(address, direction)
-  return hl.dsp.window.move({ window = "address:" .. address, into_group = direction })
+  return hl.dsp.window.move({ window = addr(address), into_group = direction })
 end
 
 -- Startup probe: a harmless dispatcher that proves this file loaded and that
