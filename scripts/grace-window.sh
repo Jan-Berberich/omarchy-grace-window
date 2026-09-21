@@ -89,6 +89,12 @@ check_target() {
   done
 }
 
+# Read one window property's current value (empty when the query fails; the
+# callers refuse to hide a window whose look cannot be captured faithfully).
+window_prop() {
+  hyprctl getprop "address:$1" "$2" 2>/dev/null | tail -n 1
+}
+
 cmd_hide_query() {
   local win addr opacity opacity_inactive rounding rounding_power
   win=$(hyprctl -j activewindow 2>/dev/null) || exit 0
@@ -97,10 +103,10 @@ cmd_hide_query() {
     echo "{}"
     exit 0
   fi
-  opacity=$(hyprctl getprop "address:$addr" opacity | tail -n 1) || true
-  opacity_inactive=$(hyprctl getprop "address:$addr" opacity_inactive | tail -n 1) || true
-  rounding=$(hyprctl getprop "address:$addr" rounding | tail -n 1) || true
-  rounding_power=$(hyprctl getprop "address:$addr" rounding_power | tail -n 1) || true
+  opacity=$(window_prop "$addr" opacity)
+  opacity_inactive=$(window_prop "$addr" opacity_inactive)
+  rounding=$(window_prop "$addr" rounding)
+  rounding_power=$(window_prop "$addr" rounding_power)
   jq -L "$self" -c \
     --arg opacity "$opacity" \
     --arg opacityInactive "$opacity_inactive" \
@@ -147,11 +153,17 @@ cmd_regroup() {
 
 # Close for real and verify it took. The dispatch's own error output cannot
 # tell a dead address from a failed dispatch, so the outcome is decided by
-# whether the address still exists in Hyprland afterwards.
+# whether the address still exists in Hyprland afterwards. A malformed or
+# missing clients answer counts as a retryable failure, never a success — an
+# outage must not look like a successful close.
 cmd_close() {
   local addr="$1" clients
   hyprctl dispatch "dofile('$self/grace-window.lua').window_close('$addr')" >/dev/null 2>&1
   clients=$(hyprctl -j clients 2>/dev/null) || return 1
+  if ! jq -e 'type == "array"' <<<"$clients" >/dev/null 2>&1; then
+    say "clients query returned invalid JSON after close; treating as retryable failure"
+    return 1
+  fi
   if jq -e --arg a "$addr" 'any(.[]; .address == $a)' <<<"$clients" >/dev/null 2>&1; then
     return 1  # still alive → retryable failure
   fi
@@ -203,23 +215,36 @@ cmd_wire() {
 }
 
 cmd_unwire() {
-  local target="$1" start="$2" end="$3" orig_mode starts ends
+  local target="$1" start="$2" end="$3" orig_mode starts ends tmpfile
   if [[ ! -f "$target" ]]; then say "bindings file not found: $target; nothing to clean"; return; fi
   starts=$(grep -cFs -- "$start" "$target" || true)
   ends=$(grep -cFs -- "$end" "$target" || true)
-  if (( starts == 0 )) || (( ends == 0 )) || (( starts != ends )); then
-    say "managed block markers not found intact in $target; leaving file untouched"
+  # Only an intact, single managed block is ever unwired. A bare marker or a
+  # duplicated block means the file is not in a state this plugin created, so
+  # refuse to touch it rather than guessing (or stripping something twice).
+  # Markers are single-line comments, so line-based counts cannot be confounded
+  # by a marker mid-line.
+  if (( starts != 1 )) || (( ends != 1 )); then
+    say "managed block markers not intact in $target ($starts start, $ends end); leaving file untouched"
     return
   fi
   check_target "$target"
   tmpfile=$(mktemp "${target}.tmp.XXXXXX") || die "could not create temporary file"
   orig_mode=$(stat -c "%a" "$target")
-  awk -v s="$start" -v e="$end" -f "$self/grace-window.awk" "$target" > "$tmpfile" \
-    || die "could not write temporary file"
-  chmod "$orig_mode" "$tmpfile" || die "could not set permissions on temporary file"
-  mv -f "$tmpfile" "$target" || die "could not atomically replace $target"
+  # The awk strip happens into a temporary file first; the target is only
+  # renamed over once the result is both produced and verified, so a failure
+  # here can never leave a half-stripped bindings file behind.
+  if ! awk -v s="$start" -v e="$end" -f "$self/grace-window.awk" "$target" > "$tmpfile"; then
+    rm -f "$tmpfile"
+    die "unwire (awk) failed; $target left untouched"
+  fi
+  if grep -qFs -- "$start" "$tmpfile"; then
+    rm -f "$tmpfile"
+    die "unwire produced a malformed result (marker still present); $target left untouched"
+  fi
+  chmod "$orig_mode" "$tmpfile" || { rm -f "$tmpfile"; die "could not set permissions on temporary file"; }
+  mv -f "$tmpfile" "$target" || { rm -f "$tmpfile"; die "could not atomically replace $target"; }
   tmpfile=""
-  if grep -qFs -- "$start" "$target"; then die "failed to remove managed block from $target"; fi
   if hyprctl reload >/dev/null 2>&1; then
     say "managed keybinding block removed from $target and hyprland reloaded"
   else

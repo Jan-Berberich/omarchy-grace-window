@@ -45,7 +45,7 @@ background script.
 | File | Purpose |
 |------|---------|
 | `manifest.json` | Omarchy plugin manifest (schema v1, kind `service`) |
-| `Service.qml` | The service: IPC handlers, hyprctl dispatch queue, grace sweep, auto-wires the keybindings on start and unwires them on teardown |
+| `Service.qml` | The service: IPC handlers, a single serial hyprctl dispatch queue (with watchdog), the grace sweep, and automatic wiring of the keybindings on start / unwiring on teardown |
 | `hypr/bindings.lua` | The keybindings, wrapped in the managed block the service copies on start |
 | `scripts/*` | `.sh`, `.lua`, `.jq` and `.awk` scripts backing the service |
 
@@ -73,8 +73,8 @@ Removing the plugin shuts down its service, and the service first strips
 exactly the plugin's managed binding block from
 `~/.config/hypr/bindings.lua` and reloads Hyprland. Every binding that was
 already present before the plugin was installed is preserved unchanged. If
-the managed block cannot be located intact, the service fails closed and
-leaves the file untouched.
+the managed block cannot be located intact, or appears more than once, the
+service fails closed and leaves the file untouched.
 
 ## Usage without the keybindings
 
