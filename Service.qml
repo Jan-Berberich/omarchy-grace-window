@@ -173,7 +173,11 @@ Item {
   property string runningTag: ""
   // Set while a hung dispatch has been aborted but its outcome is not yet
   // attributed, mirroring opAborted: dispatchAbortFallback acts only while it
-  // stays set, so an onExited that arrives later never double-handles.
+  // stays set, so an onExited that arrives later never double-handles. While
+  // it is set pump() holds the queue, so no fresh dispatch can start — and
+  // overwrite runningTag — before the aborted dispatch's outcome has been
+  // attributed: runningTag always names the stalled dispatch until this flag
+  // clears.
   property bool dispatchAborted: false
 
   function dispatch(args, tag) {
@@ -182,7 +186,12 @@ Item {
   }
 
   function pump() {
-    if (dispatchProc.running || root.queue.length === 0) return
+    // A dispatch that was just aborted must be attributed before the next one
+    // starts: starting one now would overwrite runningTag, and the pending
+    // abort's fallback (or late onExited) could then consume that fresh tag,
+    // flagging the new dispatch as the aborted one. The queue is paused only
+    // until the abort is attributed (onExited or the 2.5s fallback).
+    if (dispatchProc.running || root.dispatchAborted || root.queue.length === 0) return
     const item = root.queue.shift()
     root.runningTag = item.tag
     dispatchProc.command = item.args
@@ -206,6 +215,10 @@ Item {
     // signal. Calling pump() synchronously while dispatchProc.running may still
     // be true would early-return and strand the whole queue until another
     // dispatch happens to kick it.
+    //
+    // Pump holds the queue while an abort is pending, so when this fires for a
+    // process we aborted (dispatchAborted still true) the running tag is
+    // guaranteed to be that stalled dispatch, never a newer one.
     //
     // Arm the watchdog on every start and disarm it on completion. A hung
     // hyprctl must not leave dispatchProc.running true, because the queue
@@ -258,14 +271,18 @@ Item {
   // killed process lingers): attribute the running tag as a failure and drain
   // the queue, so a stuck dispatch can never block the FIFO forever. The
   // onExited handler clears dispatchAborted when it does fire, so this only
-  // acts while the abort is still unattributed.
+  // acts while the abort is still unattributed. Because pump() holds the queue
+  // while the abort is pending, runningTag here is always the stalled dispatch
+  // — no newer dispatch can have overwritten it.
+  // The watchdog is not stopped here: onRunningChanged already disarmed it
+  // when the abort flipped running to false, and it arms itself fresh (from
+  // the current interval) for whichever dispatch this drain starts next.
   Timer {
     id: dispatchAbortFallback
     repeat: false
     onTriggered: {
       if (!root.dispatchAborted) return
       console.warn("grace-window: aborted dispatch did not finish; discarding it")
-      dispatchTimeout.stop()
       root.dispatchAborted = false
       const tag = root.runningTag
       root.runningTag = ""
