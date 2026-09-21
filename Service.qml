@@ -544,6 +544,9 @@ Item {
       "bash", root.bashScript, "regroup",
       entry.address, win.address || "", String(root.groupingDelay),
     ])
+    // Landed, regrouped (with its delay), look restored — end on the window
+    // being focused, so the reopen lands the user where they left off.
+    root.focusWindow(entry.address)
     return "ok"
   }
 
@@ -614,6 +617,10 @@ Item {
 
   function resizeWindow(addr, w, h) {
     root.luaDispatch(`window_resize('${addr}', ${w}, ${h})`)
+  }
+
+  function focusWindow(addr) {
+    root.luaDispatch(`window_focus('${addr}')`)
   }
 
   // ------------------------------------------------------------- helpers

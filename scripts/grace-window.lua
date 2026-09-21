@@ -57,6 +57,10 @@ function gw.window_close(address)
   return hl.dsp.window.close({ window = addr(address) })
 end
 
+function gw.window_focus(address)
+  return hl.dsp.focus({ window = addr(address) })
+end
+
 function gw.window_out_of_group(address)
   return hl.dsp.window.move({ window = addr(address), out_of_group = true })
 end
