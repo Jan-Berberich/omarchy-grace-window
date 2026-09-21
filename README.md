@@ -147,7 +147,8 @@ such workflows can coexist.
   and the ability to reopen it all carry over, as if the service never
   stopped. Windows that moved or were closed while the service was down are
   skipped, and nothing is ever saved once a window's close is already in
-  flight.
+  flight. A window that was still mid-reopen when the service stopped is
+  treated the same way, so a restart during a reopen never strands it.
 - Re-hiding a window always restarts its full grace period, so `status`
   reports the fresh pending seconds. A pending window that is gone from
   Hyprland for any other reason (closed on its own, crashed) is dropped by the

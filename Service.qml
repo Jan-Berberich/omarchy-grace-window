@@ -9,7 +9,9 @@
 //              tabbed group only the focused window is pulled out. The grace
 //              timer pauses while the hidden window keeps focus. Returns
 //              "requested" when the operation is handed off, "busy" while
-//              another hide/reopen/load is in flight.
+//              another hide/reopen/load is in flight, "none" when the
+//              arguments are unusable (non-finite or negative period / grace
+//              look values).
 //   reopen(workspace)
 //              Bring a window hidden into `workspace` back and focus it,
 //              cancel its auto-close and restore its captured state. It lands
@@ -244,7 +246,7 @@ Item {
       }
     }
     onExited: function(exitCode, exitStatus) {
-      if (!root.runningItem) return
+      if (!root.runningItem || root.runningItem.done) return
       runnerTimeout.stop()
       runnerAbortFallback.stop()
       const item = root.runningItem
@@ -263,6 +265,13 @@ Item {
   // stranding the FIFO and every later dispatch, probe and regroup behind it.
   // pump() holds the queue while the outcome is unattributed (abortPending),
   // so runningItem stays the stalled command until attribute time.
+  //
+  // The kill is SIGKILL (signal 9), not just flipping `running` (which only
+  // sends a catchable SIGTERM): an in-D-state hyprctl can otherwise hold off a
+  // term for longer than the fallback window below, and its delayed onExited
+  // would then attribute the next command that already started. SIGKILL dies
+  // promptly and its onExited lands well inside the fallback window, so a
+  // stale exit can no longer be mistaken for a later command's.
   Timer {
     id: runnerTimeout
     repeat: false
@@ -270,19 +279,22 @@ Item {
       if (!runnerProc.running) return
       console.warn("grace-window: command timed out; aborting it")
       root.abortPending = true
+      runnerProc.signal(9)
       runnerProc.running = false
-      runnerAbortFallback.interval = Math.max(1000, Math.round(root.queryTimeoutMs / 4))
+      runnerAbortFallback.interval = Math.max(1000, root.queryTimeoutMs)
       runnerAbortFallback.restart()
     }
   }
 
-  // Safety net for an aborted command whose onExited never arrives (e.g. the
-  // killed process lingers): attribute the running item as failed and drain
-  // the queue, so a stuck dispatch can never block the FIFO forever. The
-  // onExited handler clears abortPending when it does fire, so this only acts
-  // while the abort is still unattributed. The watchdog is not stopped here:
-  // onRunningChanged already disarmed it when the abort flipped running back
-  // to false, and it arms itself fresh for whichever command this drain starts.
+  // Last-resort safety net for an aborted command whose onExited still never
+  // arrives: attribute the running item as failed and drain the queue, so a
+  // stuck dispatch can never block the FIFO forever. The onExited handler
+  // clears abortPending when it does fire, so this only acts while the abort is
+  // still unattributed. Keeping this fence as long as the command timeout gives
+  // the SIGKILLed process (which exits in milliseconds) ample slack, making a
+  // late ghost exit effectively impossible. The watchdog is not stopped here:
+  // onRunningChanged already disarmed it when the abort flipped running back to
+  // false, and it arms itself fresh for whichever command this drain starts.
   Timer {
     id: runnerAbortFallback
     repeat: false
@@ -331,9 +343,24 @@ Item {
   // The IPC call hands off synchronously ("requested"), so the operation's
   // actual verdict is reported when the async query settles: classifyHide
   // classifies every outcome and reportOperation surfaces it on the `result`
-  // IPC signal (and as a warning when nothing was hidden).
+  // IPC signal (and as a warning when nothing was hidden). An unusable call is
+  // rejected up front with "none": a non-finite period (an NaN grace interval
+  // would count down forever) or grace-look argument (a "NaN" prop value), or
+  // a negative period, can only produce a window that never expires or a
+  // malformed dispatch, so nothing is handed off for those.
   function hide(workspace, period, rounding, roundingPower, opacityFactor) {
     if (root.opInFlight > 0) return "busy"
+    const args = [period, rounding, roundingPower, opacityFactor]
+    for (let i = 0; i < args.length; i++) {
+      if (!isFinite(args[i])) {
+        console.warn("grace-window: hide rejected: non-finite argument")
+        return "none"
+      }
+    }
+    if (period < 0) {
+      console.warn("grace-window: hide rejected: negative grace period")
+      return "none"
+    }
     root.opInFlight++
     const myEpoch = root.epoch
     // The IPC period is given in seconds; the sweep counts in milliseconds.
@@ -711,40 +738,49 @@ Item {
     }
   }
 
+  // Quotes a value for interpolation into a Lua single-quoted string literal,
+  // so a workspace name (or any other string) containing a quote or backslash
+  // can never break the dispatch expression into a syntax error that silently
+  // no-ops the operation. Only string values need this; the numeric prop values
+  // are validated to be finite before they reach a dispatch.
+  function luaString(value) {
+    return String(value).replace(/\\/g, "\\\\").replace(/'/g, "\\'")
+  }
+
   function setWindowProp(addr, prop, value, tag) {
-    root.luaDispatch(`window_set_prop('${addr}', '${prop}', ${value})`, tag)
+    root.luaDispatch(`window_set_prop('${root.luaString(addr)}', '${prop}', ${value})`, tag)
   }
 
   function setWindowFloat(addr, action, tag) {
-    root.luaDispatch(`window_float('${addr}', '${action}')`, tag)
+    root.luaDispatch(`window_float('${root.luaString(addr)}', '${action}')`, tag)
   }
 
   function setWindowPin(addr, action, tag) {
-    root.luaDispatch(`window_pin('${addr}', '${action}')`, tag)
+    root.luaDispatch(`window_pin('${root.luaString(addr)}', '${action}')`, tag)
   }
 
   function setWindowFullscreen(addr, internal, client, tag) {
-    root.luaDispatch(`window_fullscreen('${addr}', ${internal}, ${client})`, tag)
+    root.luaDispatch(`window_fullscreen('${root.luaString(addr)}', ${internal}, ${client})`, tag)
   }
 
   function moveWindowToWorkspace(addr, workspace, tag) {
-    root.luaDispatch(`window_to_workspace('${addr}', '${workspace}')`, tag)
+    root.luaDispatch(`window_to_workspace('${root.luaString(addr)}', '${root.luaString(workspace)}')`, tag)
   }
 
   function moveToGraceWorkspace(addr, workspace, tag) {
-    root.luaDispatch(`window_to_grace_workspace('${addr}', '${workspace}')`, tag)
+    root.luaDispatch(`window_to_grace_workspace('${root.luaString(addr)}', '${root.luaString(workspace)}')`, tag)
   }
 
   function moveWindowTo(addr, x, y, tag) {
-    root.luaDispatch(`window_to_position('${addr}', ${x}, ${y})`, tag)
+    root.luaDispatch(`window_to_position('${root.luaString(addr)}', ${x}, ${y})`, tag)
   }
 
   function resizeWindow(addr, w, h, tag) {
-    root.luaDispatch(`window_resize('${addr}', ${w}, ${h})`, tag)
+    root.luaDispatch(`window_resize('${root.luaString(addr)}', ${w}, ${h})`, tag)
   }
 
   function focusWindow(addr, tag) {
-    root.luaDispatch(`window_focus('${addr}')`, tag)
+    root.luaDispatch(`window_focus('${root.luaString(addr)}')`, tag)
   }
 
   // ------------------------------------------------------------- close path
@@ -1084,19 +1120,21 @@ Item {
       root.bindingsBlockEnd])
   }
 
-  // Teardown variant of cancel(): restores the grace look of every pending
-  // window in place (they stay on the grace workspace). Runs detached through
-  // the copied runtime script, for the same reason as unwireBindings: on
-  // Component.onDestruction a child Process could not outlive the service
-  // objects being torn down, and the plugin directory may already be gone.
+  // Teardown variant of cancel(): restores the grace look of every pending and
+  // half-restored (restoring) window in place (they stay where they are). Runs
+  // detached through the copied runtime script, for the same reason as
+  // unwireBindings: on Component.onDestruction a child Process could not outlive
+  // the service objects being torn down, and the plugin directory may already
+  // be gone.
   function cancelDetached() {
-    if (root.pending.length === 0) return
+    const all = root.teardownEntries()
+    if (all.length === 0) return
     if (!root.unwireInstalled) {
       console.warn("grace-window: unwire script not installed; leaving grace look in place")
       return
     }
     Quickshell.execDetached(["bash", root.unwireRuntimeScript, "undo-grace",
-      JSON.stringify(root.pending)])
+      JSON.stringify(all)])
   }
 
   // ------------------------------------------------------- state persistence
@@ -1110,14 +1148,28 @@ Item {
   // cannot be saved (their close is in flight), and cancelled scheduled closes
   // are simply re-queued from the restored `remaining` (≤ 0 ⇒ `expiring`).
 
-  // The persistable subset of pending: every entry whose window is still
-  // reopenable (not closing). The transients that only mean something inside a
-  // running service (closeTag, closeFails, the state flag) are derived anew on
-  // load, so the file stays a stable snapshot of the captured state.
+  // Every entry teardown must account for: the pending windows plus the windows
+  // currently being reopened (`restoring`). A restoring entry is by definition
+  // not fully restored (its dispatches never ran to completion), so teardown
+  // treats it exactly like a pending one: its look is undone in place and its
+  // state saved, so the next startup either reclaims it (the window still sits
+  // on its grace workspace) or drops it (its reopen had already moved it back).
+  function teardownEntries() {
+    const all = []
+    for (let i = 0; i < root.pending.length; i++) all.push(root.pending[i])
+    for (const address of Object.keys(root.restoring)) all.push(root.restoring[address])
+    return all
+  }
+
+  // The persistable subset of teardownEntries: every entry whose window is
+  // still reopenable (not closing). The transients that only mean something
+  // inside a running service (closeTag, closeFails, the state flag) are derived
+  // anew on load, so the file stays a stable snapshot of the captured state.
   function saveableEntries() {
     const out = []
-    for (let i = 0; i < root.pending.length; i++) {
-      const e = root.pending[i]
+    const all = root.teardownEntries()
+    for (let i = 0; i < all.length; i++) {
+      const e = all[i]
       if (e.state === "closing") continue
       out.push({
         address: e.address,
@@ -1289,11 +1341,13 @@ Item {
   }
 
   // The shell destroys this service when the plugin is disabled or removed,
-  // so teardown cancels pending windows in place (restores their grace look),
-  // saves the pending state for the next startup to restore, and unwires the
-  // managed block — omarchy's plugin remove then leaves nothing behind. It also
-  // fires on shell shutdown; the next start re-wires the block (a no-op when
-  // already present) and restores the saved state.
+  // so teardown cancels pending windows in place (restores their grace look —
+  // including windows that were mid-reopen, whose queued restore dispatches die
+  // with the executor), saves the pending state for the next startup to
+  // restore, and unwires the managed block — omarchy's plugin remove then
+  // leaves nothing behind. It also fires on shell shutdown; the next start
+  // re-wires the block (a no-op when already present) and restores the saved
+  // state, reclaiming any window that is still on its grace workspace.
   Component.onDestruction: {
     // Drop queued auto-closes first, so the detached grace-look undo below is
     // not immediately followed by the windows being closed for real. The saved
