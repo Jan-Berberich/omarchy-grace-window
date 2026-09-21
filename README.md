@@ -25,8 +25,8 @@ closed for real:
   *tiling* mode.
 - **Grace groups**: the behaviour is as you would expect in omarchy:
   Only the focused window of a tabbed group get gracefully closed, the rest of
-  the group stays in place. On reopen the window (if in tiling mode) joins the
-  group that currently has focus.
+  the group stays in place. On reopen the window joins the group that
+  currently has focus (if possible).
 - **Grace scratchpad**: when the scratchpad is open, the reopened
   window lands on the scratchpad instead of the workspace underneath it.
 
@@ -59,8 +59,8 @@ When the service starts it appends the managed
 keybinding block from its own `hypr/bindings.lua` to
 `~/.config/hypr/bindings.lua` and reloads Hyprland, but only if the block is
 not already present, so it is safe across shell restarts and plugin
-hot-reloads. Every line it adds lives inside a `-- BEGIN Grace Window ...`
-/ `-- END Grace Window ...` managed block pair. Nothing outside that block is
+hot-reloads. Every line it adds lives inside a `-- BEGIN Grace Window …`
+/ `-- END Grace Window …` managed block pair. Nothing outside that block is
 ever modified.
 
 ## Uninstall
@@ -78,14 +78,25 @@ leaves the file untouched.
 
 ## Usage without the keybindings
 
-Talk to the service directly from Hyprland bindings (or a terminal):
+Talk to the service directly from a terminal:
 
 ```bash
-omarchy-shell grace-window hide       # hide focused window, start grace
-omarchy-shell grace-window reopen     # bring the newest hidden window back
-omarchy-shell grace-window status     # idle or pending <secs>
-omarchy-shell grace-window cancel     # forget pendings, restore their grace look in place
+omarchy-shell grace-window hide '10' 60 30 1 0.9 # hide focused window, start grace
+omarchy-shell grace-window reopen '10'           # bring the newest hidden window back
+omarchy-shell grace-window status                # returns "idle" or "pending <N>s"
+omarchy-shell grace-window cancel                # forget pendings, restore grace look
 ```
+
+The arguments for `hide` command are:
+- `<workspace>`: where the window silently goes
+  (and the key of its grace buffer).
+- `<period>`: the grace period in seconds.
+- `<rounding>`, `<rounding_power>`: change the window's corners
+  to mark the grace look.
+- `<opacity_factor>` scales the window's opacity.
+
+`reopen` takes the `<workspace>` of the window to bring back. Each workspace
+keeps its own buffer of hidden windows, so multiple workflows can coexist.
 
 ## Configuration
 The plugin gets installed to `~/.config/omarchy/plugins/jam.grace-window`.
@@ -96,24 +107,44 @@ omarchy plugin disable jam.grace-window
 omarchy plugin enable jam.grace-window
 omarchy restart shell
 ```
-- **Keybindings** should be edited in the plugins `hypr/bindings.lua` for them
-  to persist `Service.qml` restarts.
-- **Grace period** in `Service.qml` can be edited: `graceMs`.
-- **Grace look** (workspace, cut corners, opacity reduction) can be tuned in
-  `Service.qml` too: `graceWorkspace`, `graceRounding`,
-  `graceRoundingPower`, `graceOpacityFactor`.
+- **Keybindings**: should be edited in the plugins `hypr/bindings.lua` for
+  them to persist `Service.qml` restarts. In here you can also change the
+  following command arguments:
+- **Grace Workspace**: 1st argument of the `hide` / `reopen` commands.
+- **Grace period**: 2nd argument of the `hide` command in seconds.
+- **Grace look**: 3rd … 5th arguments are: rounding, rounding power,
+  opacity factor.
 - If you experience graphical glitches for some apps when using the
-  **Grace groups** feature, try to increase `groupingDelay`, or refresh the
-  graphics manually (e.g. by toggling fullscreen and back). Note that this
-  plugin exposes these glitches, rather then being the root cause of them.
+  **Grace groups** feature, try to increase `groupingDelay` in `Service.qml`,
+  or refresh the graphics manually (e.g. by toggling fullscreen and back).
+  Note that this plugin exposes these glitches, rather then being the root
+  cause of them.
+
+**Example**: You can configure custom behaviour, like a "Minimize / Recover" workflow
+(hide on workspace 9 with no auto-close and only suttle look change) by adding
+the desired keybindings to the managed block in `hypr/bindings.lua`:
+```
+hl.unbind("SUPER + ALT + W")
+o.bind("SUPER + ALT + W", "Minimize window (jam.grace-window)", "omarchy-shell grace-window hide '9' 9e9 9 1 1")
+hl.unbind("SUPER + ALT + SHIFT + W")
+o.bind("SUPER + ALT + SHIFT + W", "Recover window (jam.grace-window)", "omarchy-shell grace-window reopen '9'")
+```
+Since each hide target keeps its own buffer of hidden windows, any number of
+such workflows can coexist.
 
 ## Notes
 
-- Multiple windows can be closed gracefully in sequence. Each one keeps its
-  own grace period, and `reopen` restores the most recent one if not focused
-  on a gracefully closed window.
+- Multiple windows can be hidden in sequence, in any number of
+  workspaces. Each one keeps its own grace period in its workspace's buffer,
+  and `reopen <workspace>` restores the most recent one of that workspace
+  (or the focused window if it was hidden to this workspace).
 - `cancel` (or stopping the service) restores the grace look of every pending
   window in place. It does not move or close them.
+- Re-hiding a window always restarts its full grace period, so `status`
+  reports the fresh pending seconds. A pending window that is gone from
+  Hyprland for any other reason (closed on its own, crashed) is dropped by the
+  sweep's periodic probe, so `status` never counts a window that no longer
+  exists.
 - Uses Hyprland's Lua dispatcher syntax
   (e.g. `hl.dsp.window.close({ window = "address:..." })`),
   which needs Hyprland >= 0.55 (present in Omarchy 4.x).

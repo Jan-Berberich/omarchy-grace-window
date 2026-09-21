@@ -1,22 +1,27 @@
-// Grace Window — hide a window to workspace 10 with a one-minute reopen grace.
+// Grace Window — hide windows to a "grace" workspace with a reopen grace.
 //
 // IPC target: "grace-window"
-//   hide()     Move the focused window silently to workspace 10 and start its
-//              grace period: force it to plain tiling (no floating, no
-//              fullscreen, no pin) and capture its look, mode and geometry so
-//              reopen can restore them. In a tabbed group only the focused
-//              window is pulled out; the rest stays. The grace timer pauses
-//              while the hidden window keeps focus. Returns "requested" when
-//              the operation is handed off, "busy" while another is in flight.
-//   reopen()   Bring a hidden window back and focus it, cancel its auto-close
-//              and restore its captured state. It lands on the focused
-//              monitor's active special workspace (the scratchpad) when one is
-//              shown, and on the active workspace otherwise. The focused
-//              window is preferred when hidden; otherwise the most recently
-//              hidden is reopened. A tiled reopened window joins the tabbed
-//              group that currently has focus. Returns "none" when nothing is
-//              pending, "requested"/"busy" otherwise.
-//   status()   "idle", or "pending Ns" for the most recent hidden window.
+//   hide(workspace, period, rounding, roundingPower, opacityFactor)
+//              Move the focused window silently to `workspace` and start its
+//              `period`-seconds grace: force it to plain tiling (no floating,
+//              no fullscreen, no pin) and capture its look, mode and geometry
+//              so reopen can restore them, then apply the grace look — corners
+//              cut by `rounding` (at `roundingPower`) and opacity scaled by
+//              `opacityFactor`. In a tabbed group only the focused window is
+//              pulled out; the rest stays. The grace timer pauses while the
+//              hidden window keeps focus. Returns "requested" when the
+//              operation is handed off, "busy" while another is in flight.
+//   reopen(workspace)
+//              Bring a window hidden into `workspace` back and focus it,
+//              cancel its auto-close and restore its captured state. It lands
+//              on the focused monitor's active special workspace (the
+//              scratchpad) when one is shown, and on the active workspace
+//              otherwise. The focused window is preferred when hidden;
+//              otherwise the most recently hidden is reopened. A tiled
+//              reopened window joins the tabbed group that currently has
+//              focus. Returns "none" when nothing is pending, "requested"/
+//              "busy" otherwise.
+//   status()   "idle", or "pending <N>s" for the most recent hidden window.
 //   cancel()   Forget every pending window without closing it, restoring its
 //              grace look in place (the window stays on the grace workspace).
 //              Teardown also does this, so a stopped service never leaves
@@ -27,6 +32,12 @@
 //              IPC functions run synchronously, so a call can only report the
 //              handoff; the outcome is emitted on this signal, observable with
 //              `qs ipc wait grace-window result`.
+//
+// Every hide target keeps its own FIFO of hidden windows — the `workspace`
+// argument is both the destination and the buffer key, and hide()/reopen()
+// only touch the buffer of the workspace they are called with. The keybindings
+// therefore carry the whole configuration (workspace, grace period and grace
+// look); see the managed block in hypr/bindings.lua for the default workflow.
 //
 // Grace expiry closes the window through Hyprland's Lua dispatcher (>= 0.55).
 // A dispatch expression is evaluated in Hyprland's config Lua VM as
@@ -49,16 +60,9 @@ Item {
   id: root
 
   // ------------------------------------------------------------ configuration
-  // Grace period in milliseconds before a hidden window is closed for real.
-  readonly property int graceMs: 60000
-
-  // Workspace to hide the window into
-  readonly property string graceWorkspace: "10"
-  // Cut corners mark the window as being in its grace period.
-  readonly property double graceRounding: 30
-  readonly property double graceRoundingPower: 1
-  // Windows in grace period also fade to 90% of their normal opacity.
-  readonly property double graceOpacityFactor: 0.9
+  // The grace workspace, period and look travel as arguments of the hide()
+  // IPC call and live in the keybindings (see hypr/bindings.lua), so each
+  // workspace can have its own settings. Only the timing knobs stay here.
 
   // Some apps need a beat to refresh their graphics after (un)grouping.
   // set to 0.0 for faster animations (may glitch graphics after (un)grouping)
@@ -90,12 +94,17 @@ Item {
   readonly property string bashScript: root.scriptsDir + "/grace-window.sh"
   readonly property string luaScript: root.scriptsDir + "/grace-window.lua"
 
-  // Pending hidden windows, newest last. Each entry keeps its remaining
-  // grace time; the sweep pauses it while that window keeps focus. An entry
-  // whose time ran out stays here, flagged `expiring`, until its queued close
-  // actually succeeds — so a reopen can still cancel the close and bring the
-  // window back before it is too late. While the close is in flight the entry
-  // is `closing` and no longer reopenable.
+  // Pending hidden windows, newest last. Every entry names the workspace it
+  // was hidden into (`workspace`); the entries of one workspace form its
+  // private FIFO buffer, ordered by hide time, and hide()/reopen() only ever
+  // touch the buffer of the workspace they are called with. Each entry keeps
+  // its remaining grace time; the sweep pauses it while that window keeps
+  // focus. An entry whose time ran out stays here, flagged `expiring`, until
+  // its queued close actually succeeds — so a reopen can still cancel the
+  // close and bring the window back before it is too late. While the close is
+  // in flight the entry is `closing` and no longer reopenable. A pending window
+  // that is gone from Hyprland for any other reason is pruned by the sweep's
+  // clients probe, so status only ever counts grace windows that still exist.
   property var pending: []
 
   // Timestamp of the last sweep tick and address of the currently focused
@@ -115,12 +124,17 @@ Item {
     // `qs ipc wait grace-window result`) rather than being claimed up front.
     signal result(result: string)
 
-    function hide(): string {
-      return root.hide()
+    // Move the focused window to `workspace` with the given grace period (in
+    // seconds) and grace look. Returns "requested"/"busy" now; the truthful
+    // verdict is emitted on `result`.
+    function hide(workspace: string, period: real, rounding: real, roundingPower: real, opacityFactor: real): string {
+      return root.hide(workspace, period, rounding, roundingPower, opacityFactor)
     }
 
-    function reopen(): string {
-      return root.reopen()
+    // Bring the most recent window hidden into `workspace` back. Returns
+    // "none"/"requested"/"busy" now; the verdict is emitted on `result`.
+    function reopen(workspace: string): string {
+      return root.reopen(workspace)
     }
 
     function status(): string {
@@ -349,29 +363,44 @@ Item {
   // classifies every outcome and reportOperation surfaces it on the `result`
   // IPC signal (and as a warning when nothing was hidden). opBusy is released
   // at the same moment.
-  function hide() {
+  function hide(workspace, period, rounding, roundingPower, opacityFactor) {
     if (root.opBusy) return "busy"
     root.opBusy = true
-    root.runOpQuery(["bash", root.bashScript, "hide-query"]).then(root.finishHide, root.finishHide)
+    // The IPC period is given in seconds; the sweep counts in milliseconds.
+    const graceMs = period * 1000
+    root.runOpQuery(["bash", root.bashScript, "hide-query"]).then(
+      function(raw) { root.finishHide(raw, workspace, graceMs, rounding, roundingPower, opacityFactor) },
+      function(raw) { root.finishHide(raw, workspace, graceMs, rounding, roundingPower, opacityFactor) })
     return "requested"
   }
 
-  function finishHide(raw) {
+  function finishHide(raw, workspace, graceMs, rounding, roundingPower, opacityFactor) {
     if (root.opCancelPending) {
       root.opCancelPending = false
       root.opBusy = false
       root.reportOperation("hide", "none")
       return
     }
-    const verdict = root.classifyHide(raw)
+    const verdict = root.classifyHide(raw, workspace, graceMs, rounding, roundingPower, opacityFactor)
     root.opBusy = false
     root.reportOperation("hide", verdict)
   }
 
+  function graceState(addr, graceOpacity, graceOpacityInactive, rounding, roundingPower) {
+    root.setWindowFloat(addr, "off")
+    root.setWindowFullscreen(addr, 0, 0)
+    root.setWindowProp(addr, "opacity", graceOpacity)
+    root.setWindowProp(addr, "opacity_inactive", graceOpacityInactive)
+    root.setWindowProp(addr, "rounding", rounding)
+    root.setWindowProp(addr, "rounding_power", roundingPower)
+  }
+
   // Returns "ok" when a window was hidden, "none" when nothing was (no focused
   // window, a window already closing, or a window whose look could not be
-  // captured exactly).
-  function classifyHide(raw) {
+  // captured exactly). The window lands on `workspace` — which also names the
+  // FIFO buffer it is pushed onto — with the given grace period in
+  // milliseconds and the given grace look.
+  function classifyHide(raw, workspace, graceMs, rounding, roundingPower, opacityFactor) {
     const rec = root.parseJson(raw)
     if (!rec) return "none"
     const addr = rec.address || ""
@@ -379,19 +408,19 @@ Item {
     const existing = root.findPending(addr)
     if (existing && existing.closing) return "none"
     if (existing) {
-      // Re-hiding a window whose grace already expired cancels its close —
-      // whether already queued or not — and grants a fresh grace period.
-      // Otherwise just relocate the window, keeping its look and remaining
-      // grace time.
+      // Re-hiding restarts from a full grace period no matter the entry's
+      // state: it always grants this call's time (so the pending seconds
+      // status reports are this call's), cancels any queued auto-close,
+      // un-expires a window that already ran out and resets its close-failure
+      // count. The captured restore data is untouched.
       if (existing.closeTag) {
         root.cancelQueuedClose(existing.closeTag)
         existing.closeTag = ""
       }
-      if (existing.expiring) {
-        existing.expiring = false
-        existing.remaining = root.graceMs
-        existing.closeFails = 0
-      }
+      existing.expiring = false
+      existing.closeFails = 0
+      existing.remaining = graceMs
+      root.rebuffer(existing, workspace)
       // Pull the window out of any tabbed group first, just like a fresh
       // hide, so re-hiding a window that has been regrouped doesn't drag the
       // whole group to the grace workspace.
@@ -399,54 +428,59 @@ Item {
       if (grouped.length > 0) {
         root.dispatch(["bash", root.bashScript, "leave-group", addr, String(root.groupingDelay)])
       }
-      root.moveToGraceWorkspace(addr)
+      // The window may be re-hidden into a different workspace than before:
+      // move it — and its buffer entry — over to that workspace.
+      // Reapply the grace look so a re-hide reflects this call's arguments:
+      // the opacity is the captured (real) one scaled by the new
+      // opacityFactor, and the corners are cut by the new rounding/power.
+      const graceOpacity = existing.opacity * opacityFactor
+      const graceOpacityInactive = existing.opacityInactive * opacityFactor
+      if (existing.floating) root.setWindowPin(addr, "off")
+      root.moveToGraceWorkspace(addr, workspace)
+      root.graceState(addr, graceOpacity, graceOpacityInactive, rounding, roundingPower)
       return "ok"
     }
     // Refuse windows that report no opacity or rounding values: the look
     // could not be restored faithfully on reopen, so better not hide at all.
     const opacity = rec.opacity || ""
     const opacityInactive = rec.opacityInactive || ""
-    const rounding = rec.rounding || ""
-    const roundingPower = rec.roundingPower || ""
-    if (opacity === "" || opacityInactive === "" || rounding === "" || roundingPower === "") return "none"
-      // A non-numeric getprop value would otherwise turn into a "NaN" prop value.
-      const graceOpacity = Number(opacity) * root.graceOpacityFactor
-      const graceOpacityInactive = Number(opacityInactive) * root.graceOpacityFactor
-      if (isNaN(graceOpacity) || isNaN(graceOpacityInactive)) return "none"
-      // Capture look, mode and geometry so reopen can restore them exactly.
-      const entry = {
-        address: addr,
-        remaining: root.graceMs,
-        opacity: Number(opacity),
-        opacityInactive: Number(opacityInactive),
-        rounding: Number(rounding),
-        roundingPower: Number(roundingPower),
-        floating: rec.floating || false,
-        fullscreen: rec.fullscreen || 0,
-        fullscreenClient: rec.fullscreenClient || 0,
-        pinned: rec.pinned || false,
-        x: rec.x || 0,
-        y: rec.y || 0,
-        w: rec.w || 0,
-        h: rec.h || 0,
-        closing: false,
-        closeFails: 0,
-      }
-      root.pending.push(entry)
-      // Pull the window out of any tabbed group first, so only it is hidden.
-      const grouped = Array.isArray(rec.grouped) ? rec.grouped : []
-      if (grouped.length > 0) {
-        root.dispatch(["bash", root.bashScript, "leave-group", addr, String(root.groupingDelay)])
-      }
-      // Hide the window: force tiling and apply the grace look.
-      root.moveToGraceWorkspace(addr)
-      root.setWindowFloat(addr, "off")
-      root.setWindowFullscreen(addr, 0, 0)
-      root.setWindowPin(addr, "off")
-      root.setWindowProp(addr, "opacity", graceOpacity)
-      root.setWindowProp(addr, "opacity_inactive", graceOpacityInactive)
-      root.setWindowProp(addr, "rounding", root.graceRounding)
-      root.setWindowProp(addr, "rounding_power", root.graceRoundingPower)
+    const capturedRounding = rec.rounding || ""
+    const capturedRoundingPower = rec.roundingPower || ""
+    if (opacity === "" || opacityInactive === "" || capturedRounding === "" || capturedRoundingPower === "") return "none"
+    // A non-numeric getprop value would otherwise turn into a "NaN" prop value.
+    const graceOpacity = Number(opacity) * opacityFactor
+    const graceOpacityInactive = Number(opacityInactive) * opacityFactor
+    if (isNaN(graceOpacity) || isNaN(graceOpacityInactive)) return "none"
+    // Capture look, mode and geometry so reopen can restore them exactly.
+    const entry = {
+      address: addr,
+      workspace: workspace,
+      remaining: graceMs,
+      opacity: Number(opacity),
+      opacityInactive: Number(opacityInactive),
+      rounding: Number(capturedRounding),
+      roundingPower: Number(capturedRoundingPower),
+      floating: rec.floating || false,
+      fullscreen: rec.fullscreen || 0,
+      fullscreenClient: rec.fullscreenClient || 0,
+      pinned: rec.pinned || false,
+      x: rec.x || 0,
+      y: rec.y || 0,
+      w: rec.w || 0,
+      h: rec.h || 0,
+      closing: false,
+      closeFails: 0,
+    }
+    root.pending.push(entry)
+    // Pull the window out of any tabbed group first, so only it is hidden.
+    const grouped = Array.isArray(rec.grouped) ? rec.grouped : []
+    if (grouped.length > 0) {
+      root.dispatch(["bash", root.bashScript, "leave-group", addr, String(root.groupingDelay)])
+    }
+    // Hide the window: force tiling and apply the grace look.
+    if (entry.floating) root.setWindowPin(addr, "off")
+    root.moveToGraceWorkspace(addr, workspace)
+    root.graceState(addr, graceOpacity, graceOpacityInactive, rounding, roundingPower)
     return "ok"
   }
 
@@ -460,31 +494,35 @@ Item {
   }
 
   // --------------------------------------------------------- reopen path
-  function reopen() {
-    if (root.pending.length === 0) return "none"
+  // Reopen the most recent window hidden into `workspace` (its FIFO buffer).
+  function reopen(workspace) {
+    if (root.bufferLength(workspace) === 0) return "none"
     if (root.opBusy) return "busy"
     root.opBusy = true
-    root.runOpQuery(["bash", root.bashScript, "reopen-query"]).then(root.finishReopen, root.finishReopen)
+    root.runOpQuery(["bash", root.bashScript, "reopen-query"]).then(
+      function(raw) { root.finishReopen(raw, workspace) },
+      function(raw) { root.finishReopen(raw, workspace) })
     return "requested"
   }
 
-  function finishReopen(raw) {
+  function finishReopen(raw, workspace) {
     if (root.opCancelPending) {
       root.opCancelPending = false
       root.opBusy = false
       root.reportOperation("reopen", "none")
       return
     }
-    const verdict = root.classifyReopen(raw)
+    const verdict = root.classifyReopen(raw, workspace)
     root.opBusy = false
     root.reportOperation("reopen", verdict)
   }
 
   // Returns "ok" when a window was reopened and restored, "none" when nothing
-  // could be reopened (no reopenable entry, or a query answer too broken to
-  // act on). The focused window is preferred when it is in grace; otherwise
-  // the most recently hidden one is reopened.
-  function classifyReopen(raw) {
+  // could be reopened (no reopenable entry in `workspace`'s buffer, or a query
+  // answer too broken to act on). Applies to the FIFO buffer of the workspace
+  // the windows were hidden into: the focused window is preferred when it is
+  // in grace there; otherwise the most recently hidden one is reopened.
+  function classifyReopen(raw, workspace) {
     const data = root.parseJson(raw)
     if (!data) return "none"
     const win = data.aw || {}
@@ -505,29 +543,31 @@ Item {
     // hyprctl activeworkspace keeps reporting the regular workspace underneath
     // the overlay, and a bare numeric special id does not resolve reliably. A
     // regular workspace keeps using its plain string id.
-    const workspace = data.ws || {}
+    const ws = data.ws || {}
     const special = data.sp || {}
     const specialName = special.name || ""
     let target = ""
     if (specialName.indexOf("special:") === 0) {
       target = specialName
     } else {
-      const id = workspace.id !== undefined && workspace.id !== null ? workspace.id : ""
+      const id = ws.id !== undefined && ws.id !== null ? ws.id : ""
       if (id !== "" && id !== null) target = id
     }
     if (target === "") return "none"
-    // Prefer the focused window when it is in grace; otherwise reopen the
-    // most recently hidden one. Entries whose close is already running
-    // (`closing`) are not reopened — their window is lost either way.
+    // Prefer the focused window when it is in grace in `workspace`'s buffer;
+    // otherwise reopen the most recently hidden one from there. Entries whose
+    // close is already running (`closing`) are not reopened — their window is
+    // lost either way.
     let index = -1
     if (addr) {
       for (let i = 0; i < root.pending.length; i++) {
-        if (root.pending[i].address !== addr || root.pending[i].closing) continue
+        const entry = root.pending[i]
+        if (entry.address !== addr || entry.closing || entry.workspace !== workspace) continue
         index = i
         break
       }
     }
-    const entry = index !== -1 ? root.pending.splice(index, 1)[0] : root.popReopenable()
+    const entry = index !== -1 ? root.pending.splice(index, 1)[0] : root.popReopenable(workspace)
     if (!entry) return "none"
     // If the chosen window's grace expired and the sweep already queued its
     // close, cancel that close now — otherwise it would fire right after the
@@ -559,11 +599,10 @@ Item {
     root.setWindowProp(entry.address, "opacity_inactive", entry.opacityInactive)
     root.setWindowProp(entry.address, "rounding", entry.rounding)
     root.setWindowProp(entry.address, "rounding_power", entry.roundingPower)
-    if (entry.floating) root.setWindowFloat(entry.address, "on")
-    if (entry.pinned) root.setWindowPin(entry.address, "on")
     if (entry.fullscreen > 0 || entry.fullscreenClient > 0) {
       root.setWindowFullscreen(entry.address, entry.fullscreen, entry.fullscreenClient)
     }
+    if (entry.floating) root.setWindowFloat(entry.address, "on")
   }
 
   function restoreWindow(entry, workspaceId) {
@@ -574,6 +613,7 @@ Item {
       root.moveWindowTo(entry.address, entry.x, entry.y)
     }
     root.moveWindowToWorkspace(entry.address, workspaceId)
+    if (entry.pinned) root.setWindowPin(entry.address, "on")
   }
 
   // ------------------------------------------------------ dispatch helpers
@@ -607,8 +647,8 @@ Item {
     root.luaDispatch(`window_to_workspace('${addr}', '${workspace}')`)
   }
 
-  function moveToGraceWorkspace(addr) {
-    root.luaDispatch(`window_to_grace_workspace('${addr}', '${root.graceWorkspace}')`)
+  function moveToGraceWorkspace(addr, workspace) {
+    root.luaDispatch(`window_to_grace_workspace('${addr}', '${workspace}')`)
   }
 
   function moveWindowTo(addr, x, y) {
@@ -633,11 +673,37 @@ Item {
     return null
   }
 
-  // Removes and returns the newest pending entry that is not having its close
-  // run right now, or null when every pending window is closing.
-  function popReopenable() {
+  // Count of pending windows hidden into `workspace` — the length of its FIFO
+  // buffer. A reopen of a workspace with an empty buffer is a clean "none".
+  function bufferLength(workspace) {
+    let length = 0
+    for (let i = 0; i < root.pending.length; i++) {
+      if (root.pending[i].workspace === workspace) length++
+    }
+    return length
+  }
+
+  // Moves a pending entry into `workspace`'s FIFO buffer: it leaves its
+  // previous buffer and lands at the newest end of the new one. Used when a
+  // window is re-hidden into a different workspace than the one it was hiding
+  // in, so a later reopen finds it under the right key.
+  function rebuffer(entry, workspace) {
+    if (entry.workspace === workspace) return
+    for (let i = 0; i < root.pending.length; i++) {
+      if (root.pending[i] !== entry) continue
+      root.pending.splice(i, 1)
+      break
+    }
+    entry.workspace = workspace
+    root.pending.push(entry)
+  }
+
+  // Removes and returns the newest pending entry of `workspace`'s buffer that
+  // is not having its close run right now, or null when none is reopenable.
+  function popReopenable(workspace) {
     for (let i = root.pending.length - 1; i >= 0; i--) {
-      if (root.pending[i].closing) continue
+      const entry = root.pending[i]
+      if (entry.closing || entry.workspace !== workspace) continue
       return root.pending.splice(i, 1)[0]
     }
     return null
@@ -768,6 +834,12 @@ Item {
     }
     // Refresh the focused-window probe that decides the next tick's pauses.
     if (!focusProc.running) focusProc.running = true
+    // Probe whether the hidden windows still exist, so a window that closed for
+    // real by any means (not only through the sweep) leaves the pending list —
+    // and stops crowding status — without waiting for its grace to run out.
+    if (!livenessProc.running && root.pending.some(entry => !entry.closing && !entry.expiring)) {
+      livenessProc.running = true
+    }
   }
 
   Process {
@@ -817,7 +889,60 @@ Item {
     root.focusedAddress = addr === "0x0" ? "" : addr
   }
 
+  // Every sweep lists all clients to learn which pending windows still exist.
+  // A window that is gone (closed for real, crashed, closed elsewhere) can not
+  // be reopened or closed by the sweep anymore — undoing its grace look is
+  // meaningless since the window itself died with it — so its pending entry is
+  // dropped and status keeps reporting only live grace windows.
+  Process {
+    id: livenessProc
+    command: ["hyprctl", "-j", "clients"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.onClientsRead(text)
+    }
+    // Arm the watchdog on every probe start and disarm it on completion, like
+    // focusProc: a hung hyprctl must not wedge the probe so it never runs again.
+    onRunningChanged: {
+      if (livenessProc.running) {
+        livenessTimeout.interval = root.queryTimeoutMs
+        livenessTimeout.restart()
+      } else {
+        livenessTimeout.stop()
+      }
+    }
+  }
+
+  Timer {
+    id: livenessTimeout
+    interval: root.queryTimeoutMs
+    repeat: false
+    onTriggered: {
+      console.warn("grace-window: clients probe timed out; aborting it")
+      livenessProc.running = false
+    }
+  }
+
+  function onClientsRead(raw) {
+    const list = root.parseJson(raw)
+    // Never trust an empty list to prune: an empty clients answer is far more
+    // likely a transient query hiccup than a desktop with no windows at all.
+    if (!Array.isArray(list) || list.length === 0) return
+    const alive = new Set()
+    for (const win of list) {
+      if (win && win.address) alive.add(win.address)
+    }
+    for (let i = root.pending.length - 1; i >= 0; i--) {
+      const entry = root.pending[i]
+      if (entry.closing || entry.expiring) continue
+      if (alive.has(entry.address)) continue
+      console.warn(`grace-window: ${entry.address} no longer exists in Hyprland; dropping its pending entry`)
+      root.pending.splice(i, 1)
+    }
+  }
+
   // ---------------------------------------------------------------- misc
+  // Reports the most recent hidden window across every workspace's buffer.
   function status() {
     // An expired window still counts as pending: until its close actually
     // runs it can still be reopened (and cancel its own close).
@@ -828,10 +953,10 @@ Item {
   }
 
   function cancel() {
-    // Forget every pending window without closing it, restoring its grace
-    // look in place. The window stays on the grace workspace; only reopen
-    // moves it back. Queued auto-closes are cancelled so the windows really
-    // are left alone.
+    // Forget every pending window (of every workspace's buffer) without
+    // closing it, restoring its grace look in place. The windows stay on the
+    // grace workspace; only reopen moves them back. Queued auto-closes are
+    // cancelled so the windows really are left alone.
     root.cancelScheduledCloses()
     // A hide/reopen query already in flight would apply its effect after this
     // cancellation (classifyHide pushes a fresh pending entry, classifyReopen
