@@ -175,7 +175,11 @@ cmd_close() {
 cmd_wire() {
   local src="$1" target="$2" start="$3" end="$4" orig_mode l0 l1 target_dir
   if [[ ! -f "$src" ]]; then say "source bindings missing: $src"; return; fi
-  if grep -qFs -- "$start" "$target" 2>/dev/null; then
+  # Idempotence is per-marker, not just the start marker: a file that holds
+  # either marker is in a state this plugin has (partially or fully) written,
+  # and appending a second block would only corrupt it. unwire fail-closes on
+  # anything but exactly one intact block, so no state is left half-broken.
+  if grep -qFs -- "$start" "$target" 2>/dev/null || grep -qFs -- "$end" "$target" 2>/dev/null; then
     say "keybindings already wired; nothing to do"
     return
   fi

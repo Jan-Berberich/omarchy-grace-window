@@ -114,8 +114,13 @@ Item {
   // failed restore being re-checked).
   property var restoring: {}
 
-  // Addresses of entries whose restore was voided by cancel() — a late restore
-  // failure must never resurrect a post-cancel pending entry.
+  // Addresses of entries whose restore was voided — by cancel(), or by a hide
+  // superseding a window mid-reopen — so a late restore failure must never
+  // resurrect them into pending (or onto a saved state). Grown deliberately
+  // for the session: a few strings per event is nothing, pruning would only
+  // race with straggler dispatches, and a reused address is only affected if
+  // that new window also fails a restore while still covered (i.e. never in
+  // practice).
   property var cancelled: new Set()
 
   // Bumped by cancel(); hide()/reopen()/loadState finish handlers compare the
@@ -403,6 +408,18 @@ Item {
     if (!rec) return "none"
     const addr = rec.address || ""
     if (!addr) return "none"
+    // A window that is currently being reopened (mid-restore) is superseded by
+    // this hide: cancel its still-queued restore dispatches and drop the
+    // restoring entry — but only while it is still the same object, so a
+    // reopen that landed in between (re-keying the address to a fresh entry)
+    // is never torn down. The pending entry created below captures the state
+    // from here on; a restore dispatch already handed to the Process settles
+    // later against the removed entry and does nothing.
+    const wasRestoring = root.restoring[addr]
+    if (wasRestoring) {
+      root.cancelRestore(addr)
+      if (root.restoring[addr] === wasRestoring) delete root.restoring[addr]
+    }
     const existing = root.findPending(addr)
     if (existing && existing.state === "closing") return "none"
     if (existing) {
@@ -451,6 +468,11 @@ Item {
     const graceOpacity = Number(opacity) * opacityFactor
     const graceOpacityInactive = Number(opacityInactive) * opacityFactor
     if (isNaN(graceOpacity) || isNaN(graceOpacityInactive)) return "none"
+    // The captured originals get the same guard: a bogus rounding power would
+    // otherwise flow into restore dispatches as a bare "NaN" Lua token.
+    const capturedRoundingValue = Number(capturedRounding)
+    const capturedRoundingPowerValue = Number(capturedRoundingPower)
+    if (isNaN(capturedRoundingValue) || isNaN(capturedRoundingPowerValue)) return "none"
     // Capture look, mode and geometry so reopen can restore them exactly.
     const entry = {
       address: addr,
@@ -458,8 +480,8 @@ Item {
       remaining: graceMs,
       opacity: Number(opacity),
       opacityInactive: Number(opacityInactive),
-      rounding: Number(capturedRounding),
-      roundingPower: Number(capturedRoundingPower),
+      rounding: capturedRoundingValue,
+      roundingPower: capturedRoundingPowerValue,
       floating: rec.floating || false,
       fullscreen: rec.fullscreen || 0,
       fullscreenClient: rec.fullscreenClient || 0,
@@ -544,12 +566,12 @@ Item {
     const ws = data.ws || {}
     const special = data.sp || {}
     const specialName = special.name || ""
+    const id = ws.id !== undefined && ws.id !== null ? ws.id : ""
     let target = ""
     if (specialName.indexOf("special:") === 0) {
       target = specialName
-    } else {
-      const id = ws.id !== undefined && ws.id !== null ? ws.id : ""
-      if (id !== "" && id !== null) target = id
+    } else if (id !== "") {
+      target = id
     }
     if (target === "") return "none"
     // Prefer the focused window when it is in grace in `workspace`'s buffer;
@@ -970,6 +992,18 @@ Item {
     }
   }
 
+  // Cancels every queued "restore:<address>" command, used when the window a
+  // reopen is restoring gets re-hidden: its pending restore dispatches would
+  // otherwise still pull it back to the workspace it is being moved away from.
+  // A restore dispatch already handed to the Process cannot be undone, but it
+  // settles against the already-removed `restoring` entry and drops harmlessly.
+  function cancelRestore(address) {
+    const tag = "restore:" + address
+    for (let i = root.queue.length - 1; i >= 0; i--) {
+      if (root.queue[i].tag === tag) root.queue.splice(i, 1)
+    }
+  }
+
   // Cancels the scheduled close of every pending window. Used by cancel() and
   // teardown so a window whose grace look is restored in place really stays
   // open instead of still being killed by its already-queued close. Entries
@@ -1088,8 +1122,8 @@ Item {
   // Teardown cannot depend on the plugin's own files, which omarchy removes
   // when the plugin is disabled. So at startup the shell script and its awk
   // partner are copied to a stable per-user path (installUnwireScript);
-  // teardown runs that copy. A failed copy fails closed and leaves the
-  // bindings untouched.
+  // teardown runs that copy, falling back to the plugin's own script when the
+  // copy has not completed yet (see teardownScript).
   readonly property string unwireRuntimeDir:
     Quickshell.env("XDG_RUNTIME_DIR") || Quickshell.env("HOME") + "/.cache/grace-window"
   readonly property string unwireRuntimeScript: root.unwireRuntimeDir + "/grace-window.sh"
@@ -1113,13 +1147,23 @@ Item {
     }
   }
 
+  // The teardown commands (unwire, undo-grace, save-state, and the restart's
+  // own reload of the bindings) prefer this stable runtime copy of the scripts,
+  // which survives omarchy removing the plugin directory on disable. Before
+  // installUnwireScript ran to completion — the service can be torn down within
+  // a second of starting — the plugin's own script is used as a best-effort
+  // fallback instead of failing closed: better to clean up with the original
+  // than to leave the managed block and grace looks behind.
+  function teardownScript() {
+    return root.unwireInstalled ? root.unwireRuntimeScript : root.bashScript
+  }
+
   function unwireBindings() {
     const target = Quickshell.env("HOME") + "/.config/hypr/bindings.lua"
     if (!root.unwireInstalled) {
-      console.warn("grace-window: unwire script not installed; leaving bindings untouched")
-      return
+      console.warn("grace-window: unwire script not installed; using plugin script as fallback")
     }
-    Quickshell.execDetached(["bash", root.unwireRuntimeScript, "unwire",
+    Quickshell.execDetached(["bash", root.teardownScript(), "unwire",
       target,
       root.bindingsBlockBgn,
       root.bindingsBlockEnd])
@@ -1127,7 +1171,7 @@ Item {
 
   // Teardown variant of cancel(): restores the grace look of every pending and
   // half-restored (restoring) window in place (they stay where they are). Runs
-  // detached through the copied runtime script, for the same reason as
+  // detached through the cleaned-up teardown script, for the same reason as
   // unwireBindings: on Component.onDestruction a child Process could not outlive
   // the service objects being torn down, and the plugin directory may already
   // be gone.
@@ -1135,10 +1179,9 @@ Item {
     const all = root.teardownEntries()
     if (all.length === 0) return
     if (!root.unwireInstalled) {
-      console.warn("grace-window: unwire script not installed; leaving grace look in place")
-      return
+      console.warn("grace-window: unwire script not installed; using plugin script as fallback")
     }
-    Quickshell.execDetached(["bash", root.unwireRuntimeScript, "undo-grace",
+    Quickshell.execDetached(["bash", root.teardownScript(), "undo-grace",
       JSON.stringify(all)])
   }
 
@@ -1215,8 +1258,7 @@ Item {
   // windows or re-arm their auto-close on the next start.
   function saveStateDetached() {
     const saveable = root.saveableEntries()
-    const script = root.unwireInstalled ? root.unwireRuntimeScript : root.bashScript
-    Quickshell.execDetached(["bash", script, "save-state",
+    Quickshell.execDetached(["bash", root.teardownScript(), "save-state",
       root.unwireRuntimeDir, JSON.stringify(saveable)])
   }
 
