@@ -140,6 +140,14 @@ such workflows can coexist.
   (or the focused window if it was hidden to this workspace).
 - `cancel` (or stopping the service) restores the grace look of every pending
   window in place. It does not move or close them.
+- **State persistence**: shutting the service down (shell restart, plugin
+  hot-reload, logout) saves the pending state to the per-user runtime dir;
+  the next start loads it and restores every hidden window that still exists
+  on the workspace it was hidden into — its grace look, remaining grace time
+  and the ability to reopen it all carry over, as if the service never
+  stopped. Windows that moved or were closed while the service was down are
+  skipped, and nothing is ever saved once a window's close is already in
+  flight.
 - Re-hiding a window always restarts its full grace period, so `status`
   reports the fresh pending seconds. A pending window that is gone from
   Hyprland for any other reason (closed on its own, crashed) is dropped by the

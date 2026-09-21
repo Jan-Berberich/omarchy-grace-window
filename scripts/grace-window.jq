@@ -34,6 +34,19 @@ def reopenQuery($aw; $ws; $mn):
           | if $m != null and (($m.specialWorkspace.id // 0) != 0)
             then $m.specialWorkspace else null end) });
 
+# Restore-state probe: from every client, its address, the workspace it is on
+# (id as a string) and that workspace's name. A startup load keeps only saved
+# windows whose address still exists AND still sits on their saved grace
+# workspace, so stale state never resurrects a window that moved or died while
+# the service was down.
+def stateProbe:
+  map(
+    (.workspace.id? // .workspace // "") as $wid
+    | { address: (.address | tostring),
+        workspace: ($wid | tostring),
+        name: (.workspace.name? // "") }
+  );
+
 # Regroup direction: from the clients array and the focused ($f) and reopened
 # ($a) addresses, the direction ("l", "r", "u" or "d") in which the reopened
 # window should join the focused window's tabbed group. Nothing when the

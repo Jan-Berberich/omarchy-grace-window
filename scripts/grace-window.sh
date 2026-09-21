@@ -26,6 +26,14 @@
 #                             JSON in place (no workspace change). Runs at
 #                             teardown, after the plugin directory may be gone,
 #                             so it uses this runtime copy of the scripts.
+#   save-state DIR JSON       Persist the pending state as DIR/state.json
+#                             (atomically), so the next startup can restore the
+#                             pre-teardown buffers. Also runs at teardown from
+#                             this runtime copy.
+#   state-probe               List every client's address and the workspace it
+#                             sits on (id string plus name), so a startup load
+#                             can keep only windows still on their saved grace
+#                             workspace.
 #   install-unwire DIR        Copy this script and its awk and lua partners into
 #                             DIR (atomically), creating it first. Teardown later
 #                             runs the copy, when the plugin directory is already
@@ -229,9 +237,11 @@ cmd_install_unwire() {
     cp "$self/$f" "$tmp" || die "cannot copy $f to $dir"
     mv -f "$tmp" "$dir/$f" || { rm -f "$tmp"; die "cannot replace $f in $dir"; }
   done
-  # The teardown subcommand must exist in the installed copy — a stale script
-  # would silently strand the grace look on service stop.
+  # The teardown subcommands must exist in the installed copy — a stale script
+  # would silently strand the grace look on service stop and lose the pending
+  # state on restart.
   grep -q 'undo-grace' "$dir/grace-window.sh" || die "installed unwire script lacks undo-grace"
+  grep -q 'save-state' "$dir/grace-window.sh" || die "installed unwire script lacks save-state"
 }
 
 # Teardown variant of cancel(): restore the grace look of every pending window
@@ -277,6 +287,30 @@ cmd_undo_grace() {
   done < <(jq -c '.[]?' <<<"$data")
 }
 
+# Persist the pending state as $dir/state.json so teardown's state survives into
+# the next startup. Atomic (write next to it, then rename), so an interrupted
+# write can never leave a truncated state file that parses to garbage.
+cmd_save_state() {
+  local dir="$1" data="$2" tmp
+  [[ -n "$data" ]] || return 0
+  mkdir -p "$dir" || die "cannot create state dir: $dir"
+  check_target "$dir"
+  tmp="$dir/state.json.tmp.$$"
+  printf '%s\n' "$data" > "$tmp" || { rm -f "$tmp"; die "cannot write state file"; }
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$dir/state.json" || { rm -f "$tmp"; die "cannot replace state file"; }
+}
+
+# The startup load probe: one JSON document listing every client's address and
+# workspace, used to filter the saved state down to windows that still exist on
+# their saved grace workspace.
+cmd_state_probe() {
+  local clients
+  clients=$(hyprctl -j clients 2>/dev/null || true)
+  [[ -n "$clients" ]] || clients="[]"
+  jq -L "$self" -c 'include "grace-window"; stateProbe' <<<"$clients" || echo "[]"
+}
+
 case "${1:-}" in
   hide-query) shift; cmd_hide_query "$@" ;;
   reopen-query) shift; cmd_reopen_query "$@" ;;
@@ -286,6 +320,8 @@ case "${1:-}" in
   wire) shift; cmd_wire "$@" ;;
   unwire) shift; cmd_unwire "$@" ;;
   undo-grace) shift; cmd_undo_grace "$@" ;;
+  save-state) shift; cmd_save_state "$@" ;;
+  state-probe) shift; cmd_state_probe "$@" ;;
   install-unwire) shift; cmd_install_unwire "$@" ;;
   *) say "unknown subcommand: ${1:-}"; exit 1 ;;
 esac

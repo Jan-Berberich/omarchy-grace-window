@@ -26,6 +26,12 @@
 //              grace look in place (the window stays on the grace workspace).
 //              Teardown also does this, so a stopped service never leaves
 //              pending windows behind with the grace look.
+//
+// The pending state is persisted across service lifecycles: teardown saves the
+// pending buffers to the runtime dir, and startup restores them for the windows
+// that still exist on their saved grace workspace (with their grace look and
+// remaining time, so the pre-teardown state continues). Windows moved or closed
+// while the service was down are left alone (see "state persistence").
 //   result()   Signal (not a call): the truthful final verdict of each hide or
 //              reopen — "ok" when it did something, "none" when it could not
 //              (empty desktop, missing look properties, no reopenable entry).
@@ -436,6 +442,10 @@ Item {
       const graceOpacity = existing.opacity * opacityFactor
       const graceOpacityInactive = existing.opacityInactive * opacityFactor
       if (existing.floating) root.setWindowPin(addr, "off")
+      existing.graceOpacity = graceOpacity
+      existing.graceOpacityInactive = graceOpacityInactive
+      existing.graceRounding = rounding
+      existing.graceRoundingPower = roundingPower
       root.moveToGraceWorkspace(addr, workspace)
       root.graceState(addr, graceOpacity, graceOpacityInactive, rounding, roundingPower)
       return "ok"
@@ -468,6 +478,13 @@ Item {
       y: rec.y || 0,
       w: rec.w || 0,
       h: rec.h || 0,
+      // The grace look actually applied at hide (dimmed opacity, cut corners).
+      // Unlike the captured originals above — which reopen undoes — these are
+      // what a startup restore must re-apply to bring the grace look back.
+      graceOpacity: graceOpacity,
+      graceOpacityInactive: graceOpacityInactive,
+      graceRounding: rounding,
+      graceRoundingPower: roundingPower,
       closing: false,
       closeFails: 0,
     }
@@ -1011,6 +1028,12 @@ Item {
   readonly property string unwireRuntimeDir:
     Quickshell.env("XDG_RUNTIME_DIR") || Quickshell.env("HOME") + "/.cache/grace-window"
   readonly property string unwireRuntimeScript: root.unwireRuntimeDir + "/grace-window.sh"
+  // Where teardown saves the pending state and startup loads it again (see
+  // "state persistence"): the pre-teardown buffers survive a shell restart or
+  // hot-reload, restored for the windows that still exist on their saved grace
+  // workspace. Lives next to the runtime scripts, which persist for the whole
+  // user session.
+  readonly property string stateFile: root.unwireRuntimeDir + "/state.json"
   property bool unwireInstalled: false
 
   function installUnwireScript() {
@@ -1052,6 +1075,183 @@ Item {
       JSON.stringify(root.pending)])
   }
 
+  // ------------------------------------------------------- state persistence
+  // Teardown saves the pending state to the runtime dir; startup loads it to
+  // restore the pre-teardown buffers. A shell restart or hot-reload therefore
+  // keeps hidden windows in grace — their look, remaining time and the ability
+  // to reopen them — instead of forgetting them. Only entries whose window
+  // still exists AND still sits on the workspace it was hidden into are
+  // restored: anything a user moved or closed while the service was down is
+  // dropped by the startup probe. Entries already closing when teardown fires
+  // cannot be saved (their close is in flight), and cancelled scheduled closes
+  // are simply re-queued from the restored `remaining` (≤ 0 ⇒ `expiring`).
+
+  // The persistable subset of pending: every entry whose window is still
+  // reopenable (not closing). The transients that only mean something inside a
+  // running service (closeTag, closeFails, the expiring flag) are derived anew
+  // on load, so the file stays a stable snapshot of the captured state.
+  function saveableEntries() {
+    const out = []
+    for (let i = 0; i < root.pending.length; i++) {
+      const e = root.pending[i]
+      if (e.closing) continue
+      out.push({
+        address: e.address,
+        workspace: e.workspace,
+        remaining: e.remaining,
+        opacity: e.opacity,
+        opacityInactive: e.opacityInactive,
+        rounding: e.rounding,
+        roundingPower: e.roundingPower,
+        graceOpacity: e.graceOpacity,
+        graceOpacityInactive: e.graceOpacityInactive,
+        graceRounding: e.graceRounding,
+        graceRoundingPower: e.graceRoundingPower,
+        floating: e.floating,
+        fullscreen: e.fullscreen,
+        fullscreenClient: e.fullscreenClient,
+        pinned: e.pinned,
+        x: e.x,
+        y: e.y,
+        w: e.w,
+        h: e.h,
+      })
+    }
+    return out
+  }
+
+  // Saves the pending state for the next startup. Runs detached through the
+  // runtime script, mirroring cancelDetached: on Component.onDestruction a
+  // child Process could not outlive the service objects being torn down, and
+  // the plugin directory may already be gone. No state is saved when nothing
+  // is pending.
+  function saveStateDetached() {
+    const saveable = root.saveableEntries()
+    if (saveable.length === 0) return
+    const script = root.unwireInstalled ? root.unwireRuntimeScript : root.bashScript
+    Quickshell.execDetached(["bash", script, "save-state",
+      root.unwireRuntimeDir, JSON.stringify(saveable)])
+  }
+
+  // Startup: read the saved state and restore it for the windows that still
+  // exist on their saved grace workspace. Reuses the op query machinery (via
+  // opBusy) so the read, the clients probe and the restore dispatches cannot
+  // interleave with a hide/reopen, and runOpQuery's watchdog covers the load
+  // like any other query. A missing state file reads as empty and is a no-op.
+  function loadState() {
+    if (root.opBusy) {
+      // Another query is in flight (e.g. a hot-reload landed mid-operation);
+      // try again next turn instead of trampling it.
+      Qt.callLater(root.loadState)
+      return
+    }
+    root.opBusy = true
+    root.opCancelPending = false
+    root.runOpQuery(["cat", root.stateFile]).then(
+      function(raw) { root.finishLoad(raw) },
+      function(raw) { root.finishLoad(raw) })
+  }
+
+  // Parsed entries of the state file, held between the read query and the
+  // deferred workspace probe so the latter can filter them.
+  property var pendingSaved: []
+
+  function finishLoad(raw) {
+    root.pendingSaved = root.parseJson(raw)
+    if (!Array.isArray(root.pendingSaved) || root.pendingSaved.length === 0) {
+      // Nothing saved (or only with a close already running): stay empty.
+      root.pendingSaved = []
+      root.opCancelPending = false
+      root.opBusy = false
+      return
+    }
+    // Start the workspace probe on a fresh event-loop turn, so it never races
+    // the just-finished read for the op process.
+    Qt.callLater(root.loadStateProbe)
+  }
+
+  function loadStateProbe() {
+    root.runOpQuery(["bash", root.bashScript, "state-probe"]).then(
+      function(probeRaw) { root.restorePending(root.pendingSaved, probeRaw) },
+      function(probeRaw) { root.restorePending(root.pendingSaved, probeRaw) })
+  }
+
+  // Rebuilds the pending list from the saved entries, keeping only windows the
+  // probe reports as still alive on the workspace they were hidden into, then
+  // re-applies their grace state (look, tiling, float/pin mode) so the desktop
+  // matches the pre-teardown state. The grace countdown resumes where it left
+  // off: the service's downtime is not charged to the windows.
+  function restorePending(saved, probeRaw) {
+    root.opCancelPending = false
+    root.opBusy = false
+    root.pendingSaved = []
+    const probe = root.parseJson(probeRaw)
+    if (!Array.isArray(probe)) return
+    const whereabouts = new Map()
+    for (let i = 0; i < probe.length; i++) {
+      const p = probe[i]
+      if (!p || !p.address) continue
+      whereabouts.set(p.address, { id: p.workspace, name: p.name || "" })
+    }
+    const restored = []
+    for (let i = 0; i < saved.length; i++) {
+      const e = saved[i]
+      if (!e || !e.address || !whereabouts.has(e.address)) continue
+      const ws = String(e.workspace)
+      const loc = whereabouts.get(e.address)
+      if (ws !== String(loc.id) && ws !== loc.name) continue
+      restored.push(e)
+    }
+    if (restored.length === 0) return
+    console.log(`grace-window: restoring ${restored.length} pending window(s) in place from ${root.stateFile}`)
+    for (let i = 0; i < restored.length; i++) {
+      const e = restored[i]
+      const remaining = Number(e.remaining) || 0
+      const entry = {
+        address: e.address,
+        workspace: String(e.workspace),
+        remaining: remaining,
+        opacity: Number(e.opacity) || 0,
+        opacityInactive: Number(e.opacityInactive) || 0,
+        rounding: Number(e.rounding) || 0,
+        roundingPower: Number(e.roundingPower) || 0,
+        floating: !!e.floating,
+        fullscreen: Number(e.fullscreen) || 0,
+        fullscreenClient: Number(e.fullscreenClient) || 0,
+        pinned: !!e.pinned,
+        x: Number(e.x) || 0,
+        y: Number(e.y) || 0,
+        w: Number(e.w) || 0,
+        h: Number(e.h) || 0,
+        // The applied grace look, if the saved entry carries it; fall back to
+        // the (un-dimmed) original so a stale file never injects NaN props.
+        graceOpacity: root.savedLook(e, "graceOpacity", "opacity"),
+        graceOpacityInactive: root.savedLook(e, "graceOpacityInactive", "opacityInactive"),
+        graceRounding: root.savedLook(e, "graceRounding", "rounding"),
+        graceRoundingPower: root.savedLook(e, "graceRoundingPower", "roundingPower"),
+        closing: false,
+        closeFails: 0,
+        closeTag: "",
+        expiring: remaining <= 0,
+      }
+      root.pending.push(entry)
+      // Re-hide the window in place: it already sits on the grace workspace, so
+      // only its look and mode need restoring, exactly like a fresh hide.
+      if (entry.floating) root.setWindowPin(entry.address, "off")
+      root.graceState(entry.address, entry.graceOpacity, entry.graceOpacityInactive,
+        entry.graceRounding, entry.graceRoundingPower)
+    }
+  }
+
+  // The saved applied grace value, or the fallback property when the state file
+  // predates grace-look persistence (a number is always returned; NaN never
+  // reaches the dispatching code).
+  function savedLook(entry, prop, fallback) {
+    const value = Number(entry[prop])
+    if (!isNaN(value) && entry[prop] !== undefined && entry[prop] !== null) return value
+    return Number(entry[fallback]) || 0
+  }
+
   // Runs one harmless dispatch through grace-window.lua at startup, so an
   // unreadable or broken file is reported right away instead of at the first
   // keybinding press.
@@ -1062,23 +1262,27 @@ Item {
   // ---------------------------------------------------------------- startup
   Component.onCompleted: {
     // The shell assigns root.manifest right after creating this service, so
-    // defer the wiring, the unwire-script copy and the dispatcher self-check
-    // until that property is set.
+    // defer the wiring, the unwire-script copy, the state restore and the
+    // dispatcher self-check until that property is set.
     root.lastTick = Date.now()
     Qt.callLater(root.wireBindings)
     Qt.callLater(root.installUnwireScript)
+    Qt.callLater(root.loadState)
     Qt.callLater(root.selfCheck)
   }
 
   // The shell destroys this service when the plugin is disabled or removed,
-  // so teardown cancels pending windows in place (restores their grace look)
-  // and unwires the managed block — omarchy's plugin remove then leaves nothing
-  // behind. It also fires on shell shutdown; the next start re-wires the block
-  // (a no-op when already present).
+  // so teardown cancels pending windows in place (restores their grace look),
+  // saves the pending state for the next startup to restore, and unwires the
+  // managed block — omarchy's plugin remove then leaves nothing behind. It also
+  // fires on shell shutdown; the next start re-wires the block (a no-op when
+  // already present) and restores the saved state.
   Component.onDestruction: {
     // Drop queued auto-closes first, so the detached grace-look undo below is
-    // not immediately followed by the windows being closed for real.
+    // not immediately followed by the windows being closed for real. The saved
+    // entries re-derive their expiry (remaining ≤ 0 ⇒ expiring) on load.
     root.cancelScheduledCloses()
+    root.saveStateDetached()
     root.cancelDetached()
     root.unwireBindings()
   }
