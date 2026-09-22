@@ -112,7 +112,7 @@ Item {
   // classifyReopen splices an entry out of `pending`, cleared by settleRestore
   // once its last restore dispatch reported (or by finishRestoreVerify for a
   // failed restore being re-checked).
-  property var restoring: {}
+  property var restoring: ({})
 
   // Addresses of entries whose restore was voided — by cancel(), or by a hide
   // superseding a window mid-reopen — so a late restore failure must never
@@ -189,7 +189,7 @@ Item {
   property bool abortPending: false
   // Sweep probes never stack: only one queued/running probe per key, so a
   // slow hyprctl cannot pile up probes behind the queue.
-  property var probeInFlight: {}
+  property var probeInFlight: ({})
 
   function run(args, opts) {
     const tag = (opts && opts.tag) || ""
