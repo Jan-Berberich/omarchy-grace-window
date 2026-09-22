@@ -4,6 +4,12 @@ module { "name": "grace-window" };
 #
 # Invoked as  jq -L <scripts dir> <filters> 'include "grace-window"; <entry>(<args>)'.
 
+# The first element of a filter's output, or null when it produced nothing.
+# Note that `first // null` does NOT do this: for an empty stream the whole
+# expression also stays empty, so a "null fallback" call site would lose its
+# input. `firstOrNull` genuinely materializes the null fallback.
+def firstOrNull: if length == 0 then null else .[0] end;
+
 # The hide-path capture from an activewindow JSON, with the per-window look
 # values passed in as arguments.
 def hideQuery($opacity; $opacityInactive; $rounding; $roundingPower):
@@ -30,7 +36,7 @@ def hideQuery($opacity; $opacityInactive; $rounding; $roundingPower):
 # on an active scratchpad instead of the regular workspace under its overlay.
 def reopenQuery($aw; $ws; $mn):
   ({ aw: $aw, ws: $ws,
-     sp: (( $mn | map(select(.focused)) | first // null ) as $m
+     sp: (( $mn | map(select(.focused)) | firstOrNull ) as $m
           | if $m != null and (($m.specialWorkspace.id // 0) != 0)
             then $m.specialWorkspace else null end) });
 
@@ -54,9 +60,9 @@ def stateProbe:
 def regroupDirection($a; $f):
   def cx: .at[0] + (.size[0] / 2);
   def cy: .at[1] + (.size[1] / 2);
-  (map(select(.address == $f)) | first // null) as $fwin
+  (map(select(.address == $f)) | firstOrNull) as $fwin
   | select($fwin != null and ($fwin.grouped | length) > 0)
-  | (map(select(.address == $a)) | first // null) as $tgt
+  | (map(select(.address == $a)) | firstOrNull) as $tgt
   | select($tgt != null and ($tgt.grouped | length) == 0 and $fwin.workspace.id == $tgt.workspace.id)
   | (($fwin | cx) - ($tgt | cx)) as $dx
   | (($fwin | cy) - ($tgt | cy)) as $dy

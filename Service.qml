@@ -181,8 +181,9 @@ Item {
   // process's own onExited, or by runnerAbortFallback (a safety net for the
   // case the killed process lingers without ever reporting). Only then does
   // the queue drain, so the newly started command can never inherit a stale
-  // exit of the aborted one. A hung hyprctl therefore can never block the
-  // queue forever.
+  // exit of the aborted one. A hung hyprctl can therefore never block the
+  // queue forever — modulo the one case no watchdog can fix: an OS that never
+  // reaps the SIGKILLed process holds the FIFO until it (eventually) does.
   property var queue: []
   property var runningItem: null
   property bool abortPending: false
@@ -248,6 +249,13 @@ Item {
         runnerTimeout.restart()
       } else {
         runnerTimeout.stop()
+        // Self-heal the drain: this transition runs after the command's
+        // process was reaped. In the normal flow onExited already queued a
+        // pump; in the late-ghost flow (the fallback attributed the aborted
+        // item, a long-delayed onExited early-returns before queueing one)
+        // this is the only pump that resumes the FIFO, so a subsequent
+        // command must not wait for the next enqueue to start.
+        Qt.callLater(root.pump)
       }
     }
     onExited: function(exitCode, exitStatus) {
@@ -276,7 +284,10 @@ Item {
   // term for longer than the fallback window below, and its delayed onExited
   // would then attribute the next command that already started. SIGKILL dies
   // promptly and its onExited lands well inside the fallback window, so a
-  // stale exit can no longer be mistaken for a later command's.
+  // stale exit can no longer be mistaken for a later command's. The only
+  // lasting wedge left is the OS never reaping the killed process at all:
+  // `running` stays true until then (it reflects the process handle, which
+  // only clears on its finish), so no userland watchdog can drain past it.
   Timer {
     id: runnerTimeout
     repeat: false
@@ -292,12 +303,19 @@ Item {
   }
 
   // Last-resort safety net for an aborted command whose onExited still never
-  // arrives: attribute the running item as failed and drain the queue, so a
-  // stuck dispatch can never block the FIFO forever. The onExited handler
-  // clears abortPending when it does fire, so this only acts while the abort is
-  // still unattributed. Keeping this fence as long as the command timeout gives
-  // the SIGKILLed process (which exits in milliseconds) ample slack, making a
-  // late ghost exit effectively impossible. The watchdog is not stopped here:
+  // arrives: attribute the running item as failed, so the aborted operation
+  // resolves (its promise gets "null" and the epoch check reports "none")
+  // instead of leaving opInFlight raised forever. This cannot drain the queue
+  // on its own — `running` stays true while the reaped process handle lingers,
+  // so pump() holds — but once the process is finally reaped the drain resumes
+  // via onRunningChanged (or the next enqueue), so an aborted command at worst
+  // stalls the FIFO until the kernel reaps the killed process; in return the
+  // hold is what keeps a stale exit from ever being attributed to a command
+  // that already started. The onExited handler clears abortPending when it
+  // does fire, so this only acts while the abort is still unattributed.
+  // Keeping this fence as long as the command timeout gives the SIGKILLed
+  // process (which exits in milliseconds) ample slack, making a late ghost
+  // exit effectively impossible. The watchdog is not stopped here:
   // onRunningChanged already disarmed it when the abort flipped running back to
   // false, and it arms itself fresh for whichever command this drain starts.
   Timer {
@@ -357,7 +375,10 @@ Item {
     if (root.opInFlight > 0) return "busy"
     const args = [period, rounding, roundingPower, opacityFactor]
     for (let i = 0; i < args.length; i++) {
-      if (!isFinite(args[i])) {
+      // The loose equality catches null/undefined before isFinite() can coerce
+      // them — isFinite(null) is true (it coerces to 0) and would otherwise
+      // let a null period slip past as an instant-expiry hide.
+      if (args[i] == null || !isFinite(args[i])) {
         console.warn("grace-window: hide rejected: non-finite argument")
         return "none"
       }

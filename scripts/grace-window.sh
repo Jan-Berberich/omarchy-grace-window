@@ -19,7 +19,9 @@
 #                             outage never looks like a successful close.
 #   wire SRC TARGET S E       Append the managed keybinding block from SRC to
 #                             TARGET between markers S and E (owner-checked,
-#                             atomic, no-op when already present).
+#                             atomic, no-op when exactly one intact block is
+#                             already present, and fails loudly instead of
+#                             touching a partially-marked file).
 #   unwire TARGET S E         Remove exactly the managed block again (fails
 #                             closed when the markers are not intact).
 #   undo-grace JSON           Restore the grace look of the pending windows in
@@ -173,20 +175,29 @@ cmd_close() {
 }
 
 cmd_wire() {
-  local src="$1" target="$2" start="$3" end="$4" orig_mode l0 l1 target_dir
+  local src="$1" target="$2" start="$3" end="$4" orig_mode l0 l1 target_dir starts ends
   if [[ ! -f "$src" ]]; then say "source bindings missing: $src"; return; fi
-  # Idempotence is per-marker, not just the start marker: a file that holds
-  # either marker is in a state this plugin has (partially or fully) written,
-  # and appending a second block would only corrupt it. unwire fail-closes on
-  # anything but exactly one intact block, so no state is left half-broken.
-  if grep -qFs -- "$start" "$target" 2>/dev/null || grep -qFs -- "$end" "$target" 2>/dev/null; then
-    say "keybindings already wired; nothing to do"
-    return
-  fi
   l0=$(grep -nFs -- "$start" "$src" | head -n 1 | cut -d: -f1)
   l1=$(grep -nFs -- "$end" "$src" | head -n 1 | cut -d: -f1)
   if [[ -z "$l0" || -z "$l1" ]]; then die "managed block not found in $src"; fi
   if (( l0 > l1 )); then die "managed block markers out of order in $src"; fi
+  # The target must be either fully wired (exactly one intact start/end pair)
+  # or free of the markers. Anything else is a state this plugin did not write
+  # intact — a manual edit, or a legacy partial wire — and appending a second
+  # block would only corrupt it further. unwire fail-closes on the same test,
+  # so such a target used to wedge silently between the two; surfacing it here
+  # (instead of guessing) makes it recoverable. The partial block is never
+  # stripped automatically: content sitting between a stray marker and EOF may
+  # be the user's, and deleting it would be worse than the wedge.
+  starts=$(grep -cFs -- "$start" "$target" 2>/dev/null || true)
+  ends=$(grep -cFs -- "$end" "$target" 2>/dev/null || true)
+  if (( starts == 1 && ends == 1 )); then
+    say "keybindings already wired; nothing to do"
+    return
+  fi
+  if (( starts != 0 || ends != 0 )); then
+    die "managed block markers in $target are not intact ($starts start, $ends end); remove them by hand, then restart the service to re-wire a clean block"
+  fi
   target_dir="$(dirname "$target")"
   if [[ ! -d "$target_dir" ]]; then die "target directory missing: $target_dir"; fi
   if [[ -f "$target" ]]; then
