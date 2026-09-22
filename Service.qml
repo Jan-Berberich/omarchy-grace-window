@@ -737,6 +737,14 @@ Item {
       entry.state = entry.remaining <= 0 ? "expiring" : "counting"
       entry.closeTag = ""
       entry.closeFails = 0
+      // The restore already undid the grace look (undoGraceState ran first), so
+      // re-apply it — otherwise a pending window looks normal while its
+      // auto-close is armed and may close visually unannounced. Mirrors the
+      // hide / startup-restore path: force tiling, drop the pin, dim and cut
+      // corners. The window already sits on its grace workspace.
+      if (entry.floating) root.setWindowPin(entry.address, "off")
+      root.graceState(entry.address, entry.graceOpacity, entry.graceOpacityInactive,
+        entry.graceRounding, entry.graceRoundingPower)
     } else {
       // Someone still in grace or not on it anymore — untracked either way,
       // so no pending close is armed for it.
