@@ -87,7 +87,7 @@ omarchy-shell grace-window status                # returns "idle" or "pending <N
 omarchy-shell grace-window cancel                # forget pendings, restore grace look
 ```
 
-The arguments for `hide` command are:
+The arguments for the `hide` command are:
 - `<workspace>`: where the window silently goes
   (and the key of its grace buffer).
 - `<period>`: the grace period in seconds.
@@ -110,7 +110,7 @@ omarchy restart shell
 - **Keybindings**: should be edited in the plugins `hypr/bindings.lua` for
   them to persist `Service.qml` restarts. In here you can also change the
   following command arguments:
-- **Grace Workspace**: 1st argument of the `hide` / `reopen` commands.
+- **Grace workspace**: 1st argument of the `hide` / `reopen` commands.
 - **Grace period**: 2nd argument of the `hide` command in seconds.
 - **Grace look**: 3rd … 5th arguments are: rounding, rounding power,
   opacity factor.
