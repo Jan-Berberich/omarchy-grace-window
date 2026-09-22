@@ -567,10 +567,12 @@ Item {
     if (entry.pinned) root.setWindowPin(entry.address, "on", tag)
   }
 
-  // In-place restore for cancel / give-up close: no moves, pin ends the restore.
+  // In-place restore for cancel / give-up close: no moves, no pin. Re-pinning
+  // is only ever paired with a reopen's move back to the original workspace —
+  // a pinned window stays on the focused workspace, so pinning one left on the
+  // grace workspace would silently yank it to the workspace in focus.
   function restoreInPlace(entry) {
     root.undoGraceState(entry)
-    if (entry.pinned) root.setWindowPin(entry.address, "on")
   }
 
   // Settles the in-flight reopen of the entry in `restoring[address]`. Success

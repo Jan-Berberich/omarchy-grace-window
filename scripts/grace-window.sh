@@ -250,13 +250,14 @@ cmd_install_unwire() {
   grep -q 'save-state' "$dir/grace-window.sh" || die "installed unwire script lacks save-state"
 }
 
-# Teardown variant of cancel(): restore the grace look (and pin) of every
-# pending window in place, from this runtime copy after the plugin directory may
-# be gone. Best-effort per window — a vanished window or failed dispatch must
-# not abort the rest.
+# Teardown variant of cancel(): restore the grace look of every pending window
+# in place, from this runtime copy after the plugin directory may be gone.
+# Windows stay on the grace workspace, so no pin is applied — a pinned window
+# would silently move to the focused workspace. Best-effort per window — a
+# vanished window or failed dispatch must not abort the rest.
 cmd_undo_grace() {
   local data="$1" rec addr opacity opacity_inactive \
-    floating fullscreen fullscreen_client pinned
+    floating fullscreen fullscreen_client
   [[ -n "$data" ]] || return 0
   while read -r rec; do
     addr=$(jq -r '.address // empty' <<<"$rec")
@@ -272,7 +273,6 @@ cmd_undo_grace() {
       continue
     fi
     floating=$(jq -r '.floating // "false"' <<<"$rec")
-    pinned=$(jq -r '.pinned // "false"' <<<"$rec")
     fullscreen=$(jq -r '.fullscreen // 0' <<<"$rec")
     fullscreen_client=$(jq -r '.fullscreenClient // 0' <<<"$rec")
     lua_call "window_set_prop('$addr', 'opacity', $opacity)" || continue
@@ -291,10 +291,8 @@ cmd_undo_grace() {
     if (( fullscreen > 0 || fullscreen_client > 0 )); then
       lua_call "window_fullscreen('$addr', $fullscreen, $fullscreen_client)" || continue
     fi
-    # Pin ends the restore, mirroring Service.qml restoreInPlace.
-    if [[ "$pinned" == "true" ]]; then
-      lua_call "window_pin('$addr', true)" || continue
-    fi
+    # No pin: the window stays on the grace workspace, and a pinned window
+    # would silently move to the focused workspace instead.
   done < <(jq -c '.[]?' <<<"$data")
 }
 
