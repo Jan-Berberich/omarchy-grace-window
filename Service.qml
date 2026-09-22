@@ -1,52 +1,26 @@
 // Grace Window — hide windows to a "grace" workspace with a reopen grace.
 //
-// IPC target: "grace-window"
+// IPC target "grace-window":
 //   hide(workspace, period, rounding, roundingPower, opacityFactor)
-//              Move the focused window silently to `workspace` and start its
-//              `period`-seconds grace: force it to plain tiling (no floating,
-//              no fullscreen, no pin) and capture its look, mode and geometry
-//              so reopen can restore them, then apply the grace look. In a
-//              tabbed group only the focused window is pulled out. The grace
-//              timer pauses while the hidden window keeps focus. Returns
-//              "requested" when the operation is handed off, "busy" while
-//              another hide/reopen/load is in flight, "none" when the
-//              arguments are unusable (non-finite or negative period / grace
-//              look values).
-//   reopen(workspace)
-//              Bring a window hidden into `workspace` back and focus it,
-//              cancel its auto-close and restore its captured state. It lands
-//              on the focused monitor's active special workspace (the
-//              scratchpad) when one is shown, and on the active workspace
-//              otherwise. The focused window is preferred when hidden;
-//              otherwise the most recently hidden is reopened. A tiled
-//              reopened window joins the group that currently has focus.
-//              Returns "none" when nothing is pending, "requested"/"busy"
-//              otherwise.
-//   status()   "idle", or "pending <N>s" for the most recent live hidden
-//              window.
-//   cancel()   Forget every pending window without closing it, restoring its
-//              grace look in place (the window stays on the grace workspace).
-//              Teardown also does this, so a stopped service never leaves
-//              pending windows behind with the grace look.
-//   result()   Signal (not a call): the truthful final verdict of each hide or
-//              reopen — "ok" when it did something, "none" when it could not.
-//              IPC functions run synchronously, so a call can only report the
-//              handoff; the outcome is emitted on this signal.
+//     Move the focused window silently to `workspace` and start its grace:
+//     force plain tiling, capture look/mode/geometry, apply the grace look.
+//     Returns "requested" while in flight, "busy" while another op runs,
+//     "none" for unusable arguments.
+//   reopen(workspace)  Bring the window back, cancel its auto-close and
+//     restore its captured state, rejoining the focused tabbed group. It lands
+//     on the active workspace (or an open scratchpad on the focused monitor).
+//   cancel()  Forget every pending window, restoring its grace look in place.
+//   status()  "idle", or "pending <N>s" for the most recent live hidden window.
+//   result()  Signal with the real verdict of each hide/reopen — "ok" or
+//     "none" — since the calls themselves only report the handoff.
 //
-// Every hide target keeps its own FIFO of hidden windows — the `workspace`
-// argument is both the destination and the buffer key. The keybindings carry
-// the whole configuration (workspace, grace period and grace look); see the
-// managed block in hypr/bindings.lua.
-//
-// Grace expiry closes the window through Hyprland's Lua dispatcher (>= 0.55)
-// via scripts/grace-window.lua — the single file holding every hl.dsp call.
-// The pending state is persisted across service lifecycles (teardown saves it
-// to the runtime dir, startup restores the windows that still exist on their
-// saved grace workspace). On start the managed keybinding block from
-// hypr/bindings.lua is appended to ~/.config/hypr/bindings.lua (when missing);
-// on teardown it is removed and the grace look of every pending window is
-// restored in place. Scripts also answer hide()/reopen() queries with
-// ready-to-use JSON and move windows in/out of tabbed groups.
+// The `workspace` argument is both the destination and the key of a window's
+// private FIFO buffer; the keybindings carry the whole configuration (see the
+// managed block in hypr/bindings.lua). Expiry closes windows through
+// scripts/grace-window.lua, the single file holding every hl.dsp call. Pending
+// state survives service lifecycles (saved on teardown, restored on start);
+// the managed keybinding block is wired into ~/.config/hypr/bindings.lua on
+// start and removed on teardown.
 
 import QtQuick
 import Quickshell
@@ -56,26 +30,21 @@ Item {
   id: root
 
   // ------------------------------------------------------------ configuration
-  // Some apps need a beat to refresh their graphics after (un)grouping.
-  // set to 0.0 for faster animations (may glitch graphics after (un)grouping)
-  // set to 0.1 or higher for slower animations (prevent graphical glitches)
+  // Delay after (un)grouping so apps refresh their graphics; 0.0 is snappier,
+  // higher values prevent glitches after (un)grouping.
   readonly property double groupingDelay: 0.1
 
-  // Auto-close attempts before giving up on a window whose close keeps failing
-  // while it is still alive. Its grace look is then restored in place so it is
-  // not left stranded looking pending.
+  // Failed close attempts before giving up; the look is then restored in place
+  // so the window is not left stranded looking pending.
   readonly property int closeRetryMax: 3
 
-  // Time a runner command (hyprctl query, dispatch, probe) may take before it
-  // is aborted. Without a watchdog a hung hyprctl would wedge the single
-  // executor queue and lock the plugin into "busy" forever.
+  // A runner command is aborted after this; a hung hyprctl must not wedge the
+  // single executor queue and lock the plugin into "busy" forever.
   readonly property int queryTimeoutMs: 10000
 
   // ------------------------------------------------------------ the plugin dir
-  // The shell wires the plugin manifest (with __sourceDir) onto services that
-  // declare `manifest`, locating this plugin's hypr/ and scripts/ without an
-  // install script. Falls back to the well-known install location if the
-  // shell ever stops wiring it.
+  // Source path wired by the shell via `manifest`; falls back to the standard
+  // install location.
   property var manifest: null
   readonly property string sourceDir:
     root.manifest && root.manifest.__sourceDir
@@ -87,49 +56,31 @@ Item {
   readonly property string luaScript: root.scriptsDir + "/grace-window.lua"
 
   // ------------------------------------------------------------ pending state
-  // Pending hidden windows, newest last. Every entry names the workspace it
-  // was hidden into (`workspace`); the entries of one workspace form its
-  // private FIFO buffer, and hide()/reopen() only ever touch the buffer of the
-  // workspace they are called with. A window's lifecycle is a small state
-  // machine; `state` is one of:
-  //   counting  grace counting down (paused while focused),
-  //   expiring  grace ran out; its close is queued (or will be on the next
-  //             sweep tick) and can still be cancelled by a reopen,
-  //   closing   the close dispatch was handed to the executor; the window is
-  //             no longer reopenable and leaves the list when the close
-  //             reports success,
-  //   restoring the entry is spliced out and held in `restoring` while its
-  //             reopen dispatches run — the sweep cannot expire it and reopen
-  //             cannot pick it again.
-  // A pending window that is gone from Hyprland for any other reason is pruned
-  // by the liveness probe, so status only ever counts grace windows that still
-  // exist. `closeFails` counts consecutive failed close dispatches; after
-  // closeRetryMax the graceful look is restored in place and the entry is
-  // dropped instead of being stranded.
+  // Pending hidden windows, newest last. `workspace` groups them into private
+  // FIFO buffers that hide()/reopen() touch. `state` is one of:
+  //   counting   grace counting down (paused while focused),
+  //   expiring   grace ran out; the close is queued but a reopen can still win,
+  //   closing    the close dispatch runs; the entry leaves on success,
+  //   restoring  held in `restoring` while its reopen dispatches run.
+  // Windows gone from Hyprland are pruned by the liveness probe. `closeFails`
+  // counts consecutive failed closes; past closeRetryMax the look is restored
+  // in place and the entry is dropped instead of stranded.
   property var pending: []
 
-  // Entries currently being reopened, keyed by window address. Set when
-  // classifyReopen splices an entry out of `pending`, cleared by settleRestore
-  // once its last restore dispatch reported (or by finishRestoreVerify for a
-  // failed restore being re-checked).
+  // Entries being reopened, keyed by address: set when a reopen splices one
+  // out of `pending`, cleared once its last restore dispatch settles.
   property var restoring: ({})
 
-  // Addresses of entries whose restore was voided — by cancel(), or by a hide
-  // superseding a window mid-reopen — so a late restore failure must never
-  // resurrect them into pending (or onto a saved state). Grown deliberately
-  // for the session: a few strings per event is nothing, pruning would only
-  // race with straggler dispatches, and a reused address is only affected if
-  // that new window also fails a restore while still covered (i.e. never in
-  // practice).
+  // Addresses whose restore was voided (cancel(), or a re-hide mid-reopen), so
+  // a late restore failure never resurrects them into pending or a saved state.
   property var cancelled: new Set()
 
-  // Bumped by cancel(); hide()/reopen()/loadState finish handlers compare the
-  // epoch they captured at start so a cancellation landing mid-operation
-  // aborts the operation instead of applying its effect afterwards.
+  // Bumped by cancel() so in-flight ops see the bump and abort instead of
+  // applying their effect afterwards.
   property int epoch: 0
 
-  // Timestamp of the last sweep tick and address of the currently focused
-  // window, used to pause a window's grace timer while it is focused.
+  // Last sweep tick and focused window's address; the grace timer pauses while
+  // a hidden window holds focus.
   property double lastTick: 0
   property string focusedAddress: ""
 
@@ -238,23 +189,19 @@ Item {
       id: runnerOut
       waitForEnd: true
     }
-    // The queue is drained here, not via onRunningChanged: the outcome must be
-    // attributed before the next command starts, and this signal is the one
-    // place guaranteed to see each command's outcome exactly once. The drain is
-    // deferred one event-loop turn so it never depends on the order in which
-    // Quickshell flips `running` back to false around this signal.
+    // Drain here — the one signal guaranteed to fire for every command exactly
+    // once — so the outcome is attributed before the next command starts.
+    // Deferred one loop turn so it never depends on the order in which
+    // Quickshell flips `running` around this signal.
     onRunningChanged: {
       if (runnerProc.running) {
         runnerTimeout.interval = root.queryTimeoutMs
         runnerTimeout.restart()
       } else {
         runnerTimeout.stop()
-        // Self-heal the drain: this transition runs after the command's
-        // process was reaped. In the normal flow onExited already queued a
-        // pump; in the late-ghost flow (the fallback attributed the aborted
-        // item, a long-delayed onExited early-returns before queueing one)
-        // this is the only pump that resumes the FIFO, so a subsequent
-        // command must not wait for the next enqueue to start.
+        // onExited normally pumps; this self-heals the late-ghost abort case,
+        // where the fallback already attributed the item and the delayed
+        // onExited early-returns without queueing a pump.
         Qt.callLater(root.pump)
       }
     }
@@ -272,22 +219,12 @@ Item {
     }
   }
 
-  // Watchdog for a hung command: the process is killed and the outcome is
-  // attributed as a failure, so a close gets retried and the queue drains
-  // again. Without this a stuck hyprctl would leave runnerProc.running true,
-  // stranding the FIFO and every later dispatch, probe and regroup behind it.
-  // pump() holds the queue while the outcome is unattributed (abortPending),
-  // so runningItem stays the stalled command until attribute time.
-  //
-  // The kill is SIGKILL (signal 9), not just flipping `running` (which only
-  // sends a catchable SIGTERM): an in-D-state hyprctl can otherwise hold off a
-  // term for longer than the fallback window below, and its delayed onExited
-  // would then attribute the next command that already started. SIGKILL dies
-  // promptly and its onExited lands well inside the fallback window, so a
-  // stale exit can no longer be mistaken for a later command's. The only
-  // lasting wedge left is the OS never reaping the killed process at all:
-  // `running` stays true until then (it reflects the process handle, which
-  // only clears on its finish), so no userland watchdog can drain past it.
+  // Watchdog for a hung command: SIGKILL the process and attribute the item as
+  // a failure so the queue drains. A catchable SIGTERM can be held off by an
+  // in-D-state hyprctl, and its delayed onExited could be attributed to the
+  // next command that already started. The one lasting wedge left is the OS
+  // never reaping the killed process: `running` tracks the process handle and
+  // only clears on its finish, so no userland watchdog can drain past it.
   Timer {
     id: runnerTimeout
     repeat: false
@@ -302,22 +239,12 @@ Item {
     }
   }
 
-  // Last-resort safety net for an aborted command whose onExited still never
-  // arrives: attribute the running item as failed, so the aborted operation
-  // resolves (its promise gets "null" and the epoch check reports "none")
-  // instead of leaving opInFlight raised forever. This cannot drain the queue
-  // on its own — `running` stays true while the reaped process handle lingers,
-  // so pump() holds — but once the process is finally reaped the drain resumes
-  // via onRunningChanged (or the next enqueue), so an aborted command at worst
-  // stalls the FIFO until the kernel reaps the killed process; in return the
-  // hold is what keeps a stale exit from ever being attributed to a command
-  // that already started. The onExited handler clears abortPending when it
-  // does fire, so this only acts while the abort is still unattributed.
-  // Keeping this fence as long as the command timeout gives the SIGKILLed
-  // process (which exits in milliseconds) ample slack, making a late ghost
-  // exit effectively impossible. The watchdog is not stopped here:
-  // onRunningChanged already disarmed it when the abort flipped running back to
-  // false, and it arms itself fresh for whichever command this drain starts.
+  // Safety net if a SIGKILLed process's onExited never arrives: attribute the
+  // item as failed so its promise resolves and opInFlight clears, instead of
+  // leaving it raised forever. Only acts while the abort is unattributed,
+  // since onExited clears abortPending. Not stopped here: onRunningChanged
+  // already disarmed it when the abort flipped `running` back to false, and it
+  // re-arms for whichever command the drain starts.
   Timer {
     id: runnerAbortFallback
     repeat: false
@@ -332,13 +259,9 @@ Item {
     }
   }
 
-  // Runs one command and resolves its stdout when it finishes. The promise is
-  // settled from the item's onDone — never from the watchdog alone: on abort
-  // the item resolves the JSON literal "null", which the defensive parsers in
-  // the finish handlers bail out on exactly like an empty answer. Because the
-  // queue is held until the abort is attributed, a query issued in the
-  // meantime reports "busy" instead of silently receiving the aborted run's
-  // stale output.
+  // Runs one command, resolving its stdout from the item's onDone. On abort it
+  // resolves "null", which the defensive parsers bail out on like any empty
+  // answer.
   function runOpQuery(args) {
     return new Promise(function (resolve) {
       root.run(args, {
@@ -347,9 +270,8 @@ Item {
     })
   }
 
-  // A one-shot probe, keyed so only one instance is queued at a time. The
-  // parser runs on success; failure (or abort) is a silent no-op that keeps
-  // whatever state the last successful probe produced.
+  // One-shot probe, keyed so it never stacks; failures keep the last good
+  // state.
   function enqueueProbe(key, args, parser) {
     if (root.probeInFlight[key]) return
     root.probeInFlight[key] = true
@@ -363,21 +285,15 @@ Item {
   }
 
   // ----------------------------------------------------------- hide path
-  // The IPC call hands off synchronously ("requested"), so the operation's
-  // actual verdict is reported when the async query settles: classifyHide
-  // classifies every outcome and reportOperation surfaces it on the `result`
-  // IPC signal (and as a warning when nothing was hidden). An unusable call is
-  // rejected up front with "none": a non-finite period (an NaN grace interval
-  // would count down forever) or grace-look argument (a "NaN" prop value), or
-  // a negative period, can only produce a window that never expires or a
-  // malformed dispatch, so nothing is handed off for those.
+  // The call hands off synchronously; the real verdict surfaces on the `result`
+  // signal. Unusable arguments are rejected up front: a NaN or negative period
+  // would count down forever, a NaN look argument would dispatch a "NaN" prop.
   function hide(workspace, period, rounding, roundingPower, opacityFactor) {
     if (root.opInFlight > 0) return "busy"
     const args = [period, rounding, roundingPower, opacityFactor]
     for (let i = 0; i < args.length; i++) {
-      // The loose equality catches null/undefined before isFinite() can coerce
-      // them — isFinite(null) is true (it coerces to 0) and would otherwise
-      // let a null period slip past as an instant-expiry hide.
+      // == first: isFinite(null) coerces to 0 and would let it slip through as
+      // an instant-expiry hide.
       if (args[i] == null || !isFinite(args[i])) {
         console.warn("grace-window: hide rejected: non-finite argument")
         return "none"
@@ -389,7 +305,6 @@ Item {
     }
     root.opInFlight++
     const myEpoch = root.epoch
-    // The IPC period is given in seconds; the sweep counts in milliseconds.
     const graceMs = period * 1000
     root.runOpQuery(["bash", root.bashScript, "hide-query"]).then(
       function (raw) {
@@ -404,10 +319,8 @@ Item {
     return "requested"
   }
 
-  // Number of hide/reopen/state-load operations currently in flight, counting
-  // only their query phases (both the read and its dependent restore phase for
-  // a load). Their restore dispatches queue behind them in the same FIFO, so
-  // nothing can interleave.
+  // Hide/reopen/load operations in flight (query phases only). Their restore
+  // dispatches queue behind them in the same FIFO, so nothing interleaves.
   property int opInFlight: 0
 
   function graceState(addr, graceOpacity, graceOpacityInactive, rounding, roundingPower) {
@@ -419,23 +332,17 @@ Item {
     root.setWindowProp(addr, "rounding_power", roundingPower)
   }
 
-  // Returns "ok" when a window was hidden, "none" when nothing was (no focused
-  // window, a window already closing, or a window whose look could not be
-  // captured exactly). The window lands on `workspace` — which also names the
-  // FIFO buffer it is pushed onto — with the given grace period in
-  // milliseconds and the given grace look.
+  // Verdict: "ok" when a window was hidden, "none" when there was no focused
+  // window, one already closing, or a look that could not be captured exactly.
   function classifyHide(raw, workspace, graceMs, rounding, roundingPower, opacityFactor) {
     const rec = root.parseJson(raw)
     if (!rec) return "none"
     const addr = rec.address || ""
     if (!addr) return "none"
-    // A window that is currently being reopened (mid-restore) is superseded by
-    // this hide: cancel its still-queued restore dispatches and drop the
-    // restoring entry — but only while it is still the same object, so a
-    // reopen that landed in between (re-keying the address to a fresh entry)
-    // is never torn down. The pending entry created below captures the state
-    // from here on; a restore dispatch already handed to the Process settles
-    // later against the removed entry and does nothing.
+    // Re-hiding a window mid-reopen supersedes that restore: cancel its
+    // queued restore dispatches and drop the restoring entry — unless a reopen
+    // re-keyed the address meanwhile (identity check). A dispatch already
+    // handed to the Process settles against the removed entry and does nothing.
     const wasRestoring = root.restoring[addr]
     if (wasRestoring) {
       root.cancelRestore(addr)
@@ -444,11 +351,9 @@ Item {
     const existing = root.findPending(addr)
     if (existing && existing.state === "closing") return "none"
     if (existing) {
-      // Re-hiding restarts from a full grace period no matter the entry's
-      // state: it always grants this call's time (so the pending seconds
-      // status reports are this call's), cancels any queued auto-close,
-      // un-expires a window that already ran out and resets its close-failure
-      // count. The captured restore data is untouched.
+      // Re-hide restarts a full grace period: grants this call's time, cancels
+      // any queued auto-close, un-expires an already-expired window and resets
+      // its close-failure count. The captured restore data is untouched.
       if (existing.closeTag) {
         root.cancelQueuedClose(existing.closeTag)
         existing.closeTag = ""
@@ -457,16 +362,14 @@ Item {
       existing.closeFails = 0
       existing.remaining = graceMs
       root.rebuffer(existing, workspace)
-      // Pull the window out of any tabbed group first, just like a fresh
-      // hide, so re-hiding a window that has been regrouped doesn't drag the
-      // whole group to the grace workspace.
+      // As in a fresh hide: pull it out of any tabbed group so the whole group
+      // is not dragged to the grace workspace.
       const grouped = Array.isArray(rec.grouped) ? rec.grouped : []
       if (grouped.length > 0) {
         root.dispatchOps(["bash", root.bashScript, "leave-group", addr, String(root.groupingDelay)])
       }
-      // Reapply the grace look so a re-hide reflects this call's arguments:
-      // the opacity is the captured (real) one scaled by the new
-      // opacityFactor, and the corners are cut by the new rounding/power.
+      // Reapply the look from this call's args (real opacity scaled by the new
+      // opacityFactor, corners cut by the new rounding/power).
       const graceOpacity = existing.opacity * opacityFactor
       const graceOpacityInactive = existing.opacityInactive * opacityFactor
       if (existing.floating) root.setWindowPin(addr, "off")
@@ -478,23 +381,21 @@ Item {
       root.graceState(addr, graceOpacity, graceOpacityInactive, rounding, roundingPower)
       return "ok"
     }
-    // Refuse windows that report no opacity or rounding values: the look
-    // could not be restored faithfully on reopen, so better not hide at all.
+    // Never hide a window whose look cannot be restored faithfully on reopen.
     const opacity = rec.opacity || ""
     const opacityInactive = rec.opacityInactive || ""
     const capturedRounding = rec.rounding || ""
     const capturedRoundingPower = rec.roundingPower || ""
     if (opacity === "" || opacityInactive === "" || capturedRounding === "" || capturedRoundingPower === "") return "none"
-    // A non-numeric getprop value would otherwise turn into a "NaN" prop value.
+    // A non-numeric getprop value would otherwise dispatch a bare "NaN" prop.
     const graceOpacity = Number(opacity) * opacityFactor
     const graceOpacityInactive = Number(opacityInactive) * opacityFactor
     if (isNaN(graceOpacity) || isNaN(graceOpacityInactive)) return "none"
-    // The captured originals get the same guard: a bogus rounding power would
-    // otherwise flow into restore dispatches as a bare "NaN" Lua token.
+    // Same guard for the originals, or a bogus power flows into restore
+    // dispatches as a bare "NaN" Lua token.
     const capturedRoundingValue = Number(capturedRounding)
     const capturedRoundingPowerValue = Number(capturedRoundingPower)
     if (isNaN(capturedRoundingValue) || isNaN(capturedRoundingPowerValue)) return "none"
-    // Capture look, mode and geometry so reopen can restore them exactly.
     const entry = {
       address: addr,
       workspace: workspace,
@@ -511,9 +412,8 @@ Item {
       y: rec.y || 0,
       w: rec.w || 0,
       h: rec.h || 0,
-      // The grace look actually applied at hide (dimmed opacity, cut corners).
-      // Unlike the captured originals above — which reopen undoes — these are
-      // what a startup restore must re-apply to bring the grace look back.
+      // The applied grace look (dimmed, corners cut) — what a startup restore
+      // must re-apply, unlike the captured originals above, which reopen undoes.
       graceOpacity: graceOpacity,
       graceOpacityInactive: graceOpacityInactive,
       graceRounding: rounding,
@@ -523,20 +423,18 @@ Item {
       closeTag: "",
     }
     root.pending.push(entry)
-    // Pull the window out of any tabbed group first, so only it is hidden.
     const grouped = Array.isArray(rec.grouped) ? rec.grouped : []
     if (grouped.length > 0) {
       root.dispatchOps(["bash", root.bashScript, "leave-group", addr, String(root.groupingDelay)])
     }
-    // Hide the window: force tiling and apply the grace look.
     if (entry.floating) root.setWindowPin(addr, "off")
     root.moveToGraceWorkspace(addr, workspace)
     root.graceState(addr, graceOpacity, graceOpacityInactive, rounding, roundingPower)
     return "ok"
   }
 
-  // Reports the final verdict of an asynchronous hide or reopen. No-ops are
-  // the interesting ones: a "requested" handoff must not silently be a nothing.
+  // Verdict of an async hide/reopen; no-ops warn so "requested" never silently
+  // means nothing.
   function reportOperation(op, verdict) {
     if (verdict !== "ok") {
       console.warn(`grace-window: ${op} finished with no effect (${verdict})`)
@@ -545,7 +443,6 @@ Item {
   }
 
   // --------------------------------------------------------- reopen path
-  // Reopen the most recent window hidden into `workspace` (its FIFO buffer).
   function reopen(workspace) {
     if (root.bufferLength(workspace) === 0) return "none"
     if (root.opInFlight > 0) return "busy"
@@ -563,27 +460,20 @@ Item {
     return "requested"
   }
 
-  // Returns "ok" when a window was reopened and restored, "none" when nothing
-  // could be reopened (no reopenable entry in `workspace`'s buffer, or a query
-  // answer too broken to act on). Applies to the FIFO buffer of the workspace
-  // the windows were hidden into: the focused window is preferred when it is
-  // in grace there; otherwise the most recently hidden one is reopened.
+  // Verdict: "ok" when a window was restored, "none" when the buffer held no
+  // reopenable entry or the query answer was too broken to act on. The focused
+  // window wins when it is in grace in `workspace`'s buffer, else the newest
+  // entry.
   function classifyReopen(raw, workspace) {
     const data = root.parseJson(raw)
     if (!data) return "none"
     const win = data.aw || {}
     const addr = win.address || ""
-    // The focused window is only used below to prefer reopening it when it is
-    // in grace and to pick the group to join on landing. Its absence (an
-    // empty desktop, where hyprctl reports no window at all) is a normal case.
-    // The reopen target must be resolvable before any pending entry is
-    // disturbed: an unparseable answer must not drop the chosen entry, whose
-    // queued close would then be cancelled while the window stays hidden and
-    // untracked forever.
-    //
-    // Target workspace: an active special workspace (the scratchpad, shown on
-    // the focused monitor) is addressed by its "special:<name>" reference; a
-    // regular workspace keeps using its plain string id.
+    // Resolve the reopen target (an open special workspace — the scratchpad,
+    // addressed as "special:<name>" — or the plain active-workspace id) before
+    // touching any entry: a broken answer must not drop the chosen one, whose
+    // queued close would be cancelled while the window stays hidden and
+    // untracked forever. A missing focused window (empty desktop) is normal.
     const ws = data.ws || {}
     const special = data.sp || {}
     const specialName = special.name || ""
@@ -595,10 +485,8 @@ Item {
       target = id
     }
     if (target === "") return "none"
-    // Prefer the focused window when it is in grace in `workspace`'s buffer;
-    // otherwise reopen the most recently hidden one from there. Entries whose
-    // close is already running (`closing`) are not reopened — their window is
-    // lost either way.
+    // Prefer the focused window when it is in grace here; else take the newest
+    // reopenable entry. Windows already `closing` are lost either way.
     let index = -1
     if (addr) {
       for (let i = 0; i < root.pending.length; i++) {
@@ -610,20 +498,17 @@ Item {
     }
     const entry = index !== -1 ? root.pending.splice(index, 1)[0] : root.popReopenable(workspace)
     if (!entry) return "none"
-    // If the chosen window's grace expired and the sweep already queued its
-    // close, cancel that close now — otherwise it would fire right after the
-    // restore dispatches and close the window just brought back. A close that
-    // is already running cannot be undone (inherent). On a failed restore the
-    // re-queued entry re-derives its state from `remaining` (≤ 0 ⇒ expiring).
+    // If the sweep already queued its close, cancel it now — it would otherwise
+    // fire right after the restore. A close already running cannot be undone.
+    // On a failed restore the state re-derives from `remaining` (≤ 0 ⇒
+    // expiring).
     if (entry.closeTag) {
       root.cancelQueuedClose(entry.closeTag)
       entry.closeTag = ""
     }
-    // Hold the entry out of the pending list while the restore runs, tagging
-    // every restore dispatch "restore:<address>" so settleRestore can settle
-    // once the queue holds no further command with the tag. While held, the
-    // sweep cannot expire it, the liveness probe cannot prune it and reopen
-    // cannot pick it again.
+    // Hold the entry in `restoring` while its tagged dispatches run: the sweep
+    // cannot expire it, the liveness probe cannot prune it and reopen cannot
+    // pick it again until the last tagged dispatch settles.
     const restoreTag = "restore:" + entry.address
     entry.state = "restoring"
     root.restoring[entry.address] = entry
@@ -633,16 +518,14 @@ Item {
       "bash", root.bashScript, "regroup",
       entry.address, win.address || "", String(root.groupingDelay),
     ], restoreTag)
-    // Landed, regrouped (with its delay), look restored — end on the window
-    // being focused, so the reopen lands the user where they left off.
+    // End with the window focused, so the reopen lands the user where they left
+    // off.
     root.focusWindow(entry.address, restoreTag)
     return "ok"
   }
 
-  // Queues one dispatch that is part of a reopen's restore: every such
-  // dispatch carries the same "restore:<address>" tag and settles the reopen
-  // when it completes. settleRestore runs for each of them, but only settles
-  // once the queue holds no remaining command with the tag.
+  // A restore dispatch carries the reopen's "restore:<address>" tag; settle
+  // only once no tagged command stays queued.
   function dispatchRestore(args, tag) {
     root.run(args, {
       tag: tag,
@@ -654,11 +537,9 @@ Item {
   }
 
   function undoGraceState(entry, tag) {
-    // Undo what hide() did to the window's look — the lower opacity and the
-    // cut corners — and the forced tiling/fullscreen/float mode changes. Never
-    // restores the pin: hide() may have dropped it, but pinning is the last
-    // step of a restore and must follow the move, so the callers handle it.
-    // Never touches the workspace, so the window stays where it is.
+    // Undo the grace look and the forced tiling/fullscreen/float modes. Never
+    // restores the pin (the callers handle it as the last step, after any
+    // move) and never touches the workspace, so the window stays where it is.
     root.setWindowProp(entry.address, "opacity", entry.opacity, tag)
     root.setWindowProp(entry.address, "opacity_inactive", entry.opacityInactive, tag)
     root.setWindowProp(entry.address, "rounding", entry.rounding, tag)
@@ -670,9 +551,8 @@ Item {
   }
 
   function restoreWindow(entry, workspaceId, tag) {
-    // Undo the grace look, then restore the captured mode and geometry. The
-    // pin is restored last, only after the window sits on its target
-    // workspace: a moved window must never be pinned mid-flight.
+    // Undo the grace look, restore mode and geometry, then pin — nothing gets
+    // pinned mid-flight while a moved window is still on its way.
     root.undoGraceState(entry, tag)
     if (entry.floating) {
       if (entry.w > 0 && entry.h > 0) root.resizeWindow(entry.address, entry.w, entry.h, tag)
@@ -682,20 +562,16 @@ Item {
     if (entry.pinned) root.setWindowPin(entry.address, "on", tag)
   }
 
-  // In-place restore for a window that stays where it is (cancel, give-up
-  // close): undo the grace look and re-pin it, mirroring restoreWindow where
-  // the pin always ends the restore. Untagged dispatches; the operations all
-  // share the executor FIFO.
+  // In-place restore for cancel / give-up close: no moves, pin ends the restore.
   function restoreInPlace(entry) {
     root.undoGraceState(entry)
     if (entry.pinned) root.setWindowPin(entry.address, "on")
   }
 
-  // Settles the in-flight reopen of the entry in `restoring[address]`. A
-  // success keeps the entry out for good (the window is back); a failure
-  // verifies where the window actually is before the entry is re-queued, so a
-  // window that did land (only a trailing dispatch failed) is never closed by
-  // a stale expiry.
+  // Settles the in-flight reopen of the entry in `restoring[address]`. Success
+  // keeps the entry out for good (the window is back); a failure verifies
+  // where the window actually is before re-queuing, so one that did land (only
+  // a trailing dispatch failed) is never closed by a stale expiry.
   function settleRestore(tag, success) {
     if (tag.indexOf("restore:") !== 0) return
     const address = tag.slice("restore:".length)
@@ -719,13 +595,11 @@ Item {
     root.startRestoreVerify(entry)
   }
 
-  // A failed reopen is re-checked with a clients probe before the entry is
-  // re-queued: only a window that is still on its saved grace workspace counts
-  // as still pending (its close is re-armed). A window that made it back
-  // somewhere else — or is gone — drops the entry, so a near-successful reopen
-  // is never followed by the sweep closing the very window the user just saw
-  // land. The entry is held in `restoring` (keyed by address, checked by
-  // identity) until the probe answers.
+  // A failed reopen is re-checked with a clients probe before re-queuing: only
+  // a window still on its saved grace workspace counts as pending again (its
+  // close is re-armed); one that made it back elsewhere — or is gone — drops
+  // the entry, so a near-successful reopen is never followed by closing the
+  // window the user just saw land. Held in `restoring` until the probe answers.
   function startRestoreVerify(entry) {
     root.restoring[entry.address] = entry
     root.run(["hyprctl", "-j", "clients"], {
@@ -758,25 +632,21 @@ Item {
       entry.state = entry.remaining <= 0 ? "expiring" : "counting"
       entry.closeTag = ""
       entry.closeFails = 0
-      // The restore already undid the grace look (undoGraceState ran first), so
-      // re-apply it — otherwise a pending window looks normal while its
-      // auto-close is armed and may close visually unannounced. Mirrors the
-      // hide / startup-restore path: force tiling, drop the pin, dim and cut
-      // corners. The window already sits on its grace workspace.
+      // The restore already undid the grace look, so re-apply it — a pending
+      // window must not look normal while its auto-close is armed.
       if (entry.floating) root.setWindowPin(entry.address, "off")
       root.graceState(entry.address, entry.graceOpacity, entry.graceOpacityInactive,
         entry.graceRounding, entry.graceRoundingPower)
     } else {
-      // Someone still in grace or not on it anymore — untracked either way,
-      // so no pending close is armed for it.
+      // Not on its grace workspace anymore — untracked, so no close is armed.
       console.warn(`grace-window: reopen of ${entry.address} failed but it is not on its grace workspace; dropping its pending entry`)
     }
   }
 
   // ------------------------------------------------------ dispatch helpers
-  // Thin dispatches into grace-window.lua, the single file holding every
-  // hl.dsp call. A dispatch expression must evaluate to a dispatcher, so the
-  // lua functions return their hl.dsp call.
+  // Thin dispatches into grace-window.lua, the single file holding every hl.dsp
+  // call. A dispatch expression must evaluate to a dispatcher, so each lua
+  // function returns its hl.dsp call.
   function dispatchOps(args) {
     root.run(args)
   }
@@ -789,11 +659,9 @@ Item {
     }
   }
 
-  // Quotes a value for interpolation into a Lua single-quoted string literal,
-  // so a workspace name (or any other string) containing a quote or backslash
-  // can never break the dispatch expression into a syntax error that silently
-  // no-ops the operation. Only string values need this; the numeric prop values
-  // are validated to be finite before they reach a dispatch.
+  // Escapes a value for a Lua single-quoted literal so a quote or backslash in
+  // a workspace name can never break the dispatch into a silent no-op. Only
+  // strings need this; numeric props were validated finite up front.
   function luaString(value) {
     return String(value).replace(/\\/g, "\\\\").replace(/'/g, "\\'")
   }
@@ -835,26 +703,23 @@ Item {
   }
 
   // ------------------------------------------------------------- close path
-  // The sweep queues a window_close when a window's grace ran out. The tagged
-  // command can be cancelled by a reopen (or re-hide) while it still waits in
-  // the queue; once handed to the process the entry becomes `closing` and the
-  // outcome is attributed by tag when the command reports.
+  // The sweep queues a window_close when a window's grace ran out. A reopen or
+  // re-hide cancels it while it still waits in the queue; once handed to the
+  // process the entry becomes `closing` and the outcome is attributed by tag.
   function queueClose(entry, tag) {
     root.run(["bash", root.bashScript, "close", entry.address], {
       tag: tag,
       onDone: function (ok, text) {
         if (!ok) console.warn(`grace-window: close dispatch failed: ${(text || "").trim() || "non-zero exit"}`)
-        // The entry may have been replaced by a re-hide since (a fresh entry
-        // carries a fresh closeTag), so re-find it by tag.
+        // A re-hide may have replaced the entry since; re-find it by tag.
         if (ok) root.closeStarted(tag)
         else root.closeAborted(tag)
       },
     })
   }
 
-  // A tagged window_close has just been handed to the Process. The window can
-  // not be reopened anymore from here on (the cancel race is only the few
-  // milliseconds the dispatch itself takes), so flag the entry `closing`.
+  // A tagged window_close just got handed to the Process — the window can no
+  // longer be reopened from here on — so flag the entry `closing`.
   function markClosing(tag) {
     for (let i = 0; i < root.pending.length; i++) {
       if (root.pending[i].closeTag !== tag) continue
@@ -863,8 +728,7 @@ Item {
     }
   }
 
-  // A tagged window_close reported success: the window is gone for real, so
-  // drop its pending entry.
+  // A tagged window_close reported success: the window is gone — drop its entry.
   function closeStarted(tag) {
     for (let i = 0; i < root.pending.length; i++) {
       if (root.pending[i].closeTag !== tag) continue
@@ -873,11 +737,10 @@ Item {
     }
   }
 
-  // A tagged window_close reported failure. The close command reports failure
-  // only when the window is still alive (its address still exists in Hyprland),
-  // so hand it back to the sweep for a retry. After closeRetryMax failed
-  // attempts the window is left alone: its grace look is restored in place so
-  // it is not stranded styled as pending, and its entry is dropped.
+  // A tagged window_close failed while the window is still alive (the close
+  // command only reports failure for a live address), so hand it back to the
+  // sweep for a retry. Past closeRetryMax the window is left alone: its look
+  // is restored in place and the entry dropped.
   function closeAborted(tag) {
     for (let i = 0; i < root.pending.length; i++) {
       const entry = root.pending[i]
@@ -906,23 +769,20 @@ Item {
   function sweep() {
     const now = Date.now()
     if (root.pending.length === 0) {
-      // Keep the tick anchor fresh so the first countdown after a new hide
-      // starts from a full grace period.
+      // Keep the anchor fresh so the first countdown after a new hide starts
+      // from a full grace period.
       root.lastTick = now
       return
     }
     const delta = now - root.lastTick
     root.lastTick = now
-    // Iterate over a snapshot: queueing a close inside the loop hands the
-    // command to the executor, which marks live entries and a completing
-    // dispatch splices them, shifting the live array's indices.
+    // Snapshot: a completing close splices the live array while this runs.
     const snapshot = root.pending.slice()
     for (let i = 0; i < snapshot.length; i++) {
       const entry = snapshot[i]
-      // An expired window is closed for real regardless of focus. If its close
-      // is not queued yet, queue it now — the extra sweep interval between
-      // flagging it and this dispatch is the window in which a reopen can
-      // cancel before the close is ever submitted.
+      // Expired windows close for real, regardless of focus. Queue the close
+      // now; the extra sweep interval is the window in which a reopen can
+      // cancel before the dispatch is ever submitted.
       if (entry.state === "expiring") {
         if (!entry.closeTag) {
           entry.closeTag = `close:${entry.address}`
@@ -930,19 +790,16 @@ Item {
         }
         continue
       }
-      // While the hidden window keeps focus its grace timer is paused.
+      // The timer pauses while the hidden window holds focus.
       if (entry.address === root.focusedAddress) continue
       entry.remaining -= delta
       if (entry.remaining > 0) continue
-      // Grace ran out: flag the window for real closing. A reopen that lands
-      // within the next sweep interval still wins — the close is only
-      // submitted on a later tick, and once submitted it starts promptly.
+      // Grace ran out: flag for closing. A reopen landing within a sweep
+      // interval still wins — the close is only submitted on a later tick.
       entry.state = "expiring"
     }
-    // Sample the focused window for the next tick's pause decisions, and probe
-    // whether the hidden windows still exist, so a window that closed for real
-    // by any means leaves the pending list without waiting for its grace to
-    // run out. Both are fire-and-forget; they never stack.
+    // Sample the focused window and whether hidden windows still exist, so one
+    // closed by other means leaves pending without waiting out its grace.
     root.enqueueProbe("focus", ["hyprctl", "-j", "activewindow"], function (text) {
       root.onFocusRead(text)
     })
@@ -965,8 +822,8 @@ Item {
 
   function onClientsRead(raw) {
     const list = root.parseJson(raw)
-    // Never trust an empty list to prune: an empty clients answer is far more
-    // likely a transient query hiccup than a desktop with no windows at all.
+    // An empty clients answer is far more likely a query hiccup than a desktop
+    // with no windows at all; never prune on it.
     if (!Array.isArray(list) || list.length === 0) return
     const alive = new Set()
     for (const win of list) {
@@ -985,36 +842,32 @@ Item {
   // Forget every pending window (of every workspace's buffer) without closing
   // it, restoring its grace look (and pin) in place. The windows stay on the
   // grace workspace; only reopen moves them back. Queued auto-closes are
-  // cancelled so the windows really are left alone. The now-empty pending
-  // state is persisted too, so a later restart cannot resurrect a cancelled
-  // (or close-given-up) window from a stale state file and re-arm its close.
+  // cancelled; the now-empty pending state is persisted too, so a restart can
+  // never resurrect a cancelled (or given-up) window and re-arm its close.
   function cancel() {
-    // Invalidate every operation that is still in flight so its finish
-    // handler reports "none" instead of applying after the cancellation.
+    // Bump the epoch so in-flight ops report "none" instead of applying after
+    // the cancellation.
     root.epoch++
     root.cancelScheduledCloses()
     for (let i = 0; i < root.pending.length; i++) {
       root.restoreInPlace(root.pending[i])
     }
-    // A restore already in flight would otherwise settle back into pending
-    // after the cancellation — record its address so settleRestore and the
-    // verify probe drop it instead of resurrecting it with an auto-close.
+    // Record in-flight restores: their settle must not re-queue them after
+    // the cancellation.
     for (const address of Object.keys(root.restoring)) {
       root.cancelled.add(address)
     }
-    // The windows currently being reopened are left to their restores; the
-    // service simply forgets them.
+    // Windows being reopened are left to their restores; the service simply
+    // forgets them.
     root.pending = []
-    // Persist the (now empty) pending state, clearing any stale state.json,
-    // while the restoring entries are recorded in `cancelled`.
+    // Persist the now-empty pending state (clears a stale state.json).
     root.saveStateDetached()
     return "ok"
   }
 
-  // Removes every queued command carrying tag, used to drop a window_close the
-  // sweep already queued but that has not been handed to the Process yet. A
-  // close that is already running can not be undone — that unavoidable race is
-  // only the few milliseconds the dispatch command itself takes.
+  // Removes every queued command carrying tag. Used to drop a window_close the
+  // sweep queued but the Process has not picked up yet; one already running
+  // cannot be undone (an avoidable race only a few milliseconds wide).
   function cancelQueuedClose(tag) {
     for (let i = root.queue.length - 1; i >= 0; i--) {
       if (root.queue[i].tag === tag) root.queue.splice(i, 1)
@@ -1024,8 +877,6 @@ Item {
   // Cancels every queued "restore:<address>" command, used when the window a
   // reopen is restoring gets re-hidden: its pending restore dispatches would
   // otherwise still pull it back to the workspace it is being moved away from.
-  // A restore dispatch already handed to the Process cannot be undone, but it
-  // settles against the already-removed `restoring` entry and drops harmlessly.
   function cancelRestore(address) {
     const tag = "restore:" + address
     for (let i = root.queue.length - 1; i >= 0; i--) {
@@ -1033,11 +884,9 @@ Item {
     }
   }
 
-  // Cancels the scheduled close of every pending window. Used by cancel() and
-  // teardown so a window whose grace look is restored in place really stays
-  // open instead of still being killed by its already-queued close. Entries
-  // whose close is already running are left alone: only the dispatch outcome
-  // can resolve them now.
+  // Used by cancel() and teardown so a window whose look is restored in place
+  // really stays open instead of still being killed by its queued close.
+  // Entries whose close is already running are left to the dispatch outcome.
   function cancelScheduledCloses() {
     for (let i = 0; i < root.pending.length; i++) {
       const entry = root.pending[i]
@@ -1048,8 +897,8 @@ Item {
   }
 
   // ------------------------------------------------------------- helpers
-  // Returns the pending entry for addr, or null. Defensive JSON parsing so a
-  // malformed query answer never leaves an operation stuck or crashes.
+  // The pending entry for addr, or null. Defensive JSON parsing keeps a
+  // malformed query answer from leaving an operation stuck or crashing.
   function findPending(addr) {
     for (let i = 0; i < root.pending.length; i++) {
       if (root.pending[i].address === addr) return root.pending[i]
@@ -1057,8 +906,7 @@ Item {
     return null
   }
 
-  // Count of pending windows hidden into `workspace` — the length of its FIFO
-  // buffer. A reopen of a workspace with an empty buffer is a clean "none".
+  // Count of pending windows hidden into `workspace` — its FIFO buffer length.
   function bufferLength(workspace) {
     let length = 0
     for (let i = 0; i < root.pending.length; i++) {
@@ -1067,10 +915,9 @@ Item {
     return length
   }
 
-  // Moves a pending entry into `workspace`'s FIFO buffer: it leaves its
-  // previous buffer and lands at the newest end of the new one. Used when a
-  // window is re-hidden into a different workspace than the one it was hiding
-  // in, so a later reopen finds it under the right key.
+  // Moves a pending entry into `workspace`'s FIFO buffer — used when a re-hide
+  // targets a different workspace than the window was hiding in, so a reopen
+  // finds it under the right key.
   function rebuffer(entry, workspace) {
     if (entry.workspace === workspace) return
     for (let i = 0; i < root.pending.length; i++) {
@@ -1082,8 +929,8 @@ Item {
     root.pending.push(entry)
   }
 
-  // Removes and returns the newest pending entry of `workspace`'s buffer that
-  // is not having its close run right now, or null when none is reopenable.
+  // Removes and returns the newest reopenable entry of `workspace`'s buffer
+  // (not one whose close is running), or null.
   function popReopenable(workspace) {
     for (let i = root.pending.length - 1; i >= 0; i--) {
       const entry = root.pending[i]
@@ -1101,9 +948,8 @@ Item {
     }
   }
 
-  // Reports the most recent live hidden window across every workspace's
-  // buffer. An expired window still counts as pending: until its close
-  // actually runs it can still be reopened (and cancel its own close).
+  // The status string: most recent live hidden window across all buffers. An
+  // expired window still counts — until its close runs it can be reopened.
   function status() {
     for (let i = root.pending.length - 1; i >= 0; i--) {
       const entry = root.pending[i]
@@ -1115,11 +961,9 @@ Item {
   }
 
   // --------------------------------------------------------- keybinding wiring
-  // On start the managed keybinding block from hypr/bindings.lua is appended
-  // to ~/.config/hypr/bindings.lua when not already present, then Hyprland is
-  // reloaded — idempotent across shell restarts and hot-reloads. On teardown
-  // the block is removed again, so disabling the plugin restores the previous
-  // bindings.
+  // On start the managed block from hypr/bindings.lua is appended to
+  // ~/.config/hypr/bindings.lua when not already present, then Hyprland is
+  // reloaded — idempotent across restarts and hot-reloads. Teardown removes it.
   readonly property string bindingsBlockBgn:
     "-- BEGIN Grace Window (jam.grace-window) managed block - do not edit this comment"
   readonly property string bindingsBlockEnd:
@@ -1143,16 +987,13 @@ Item {
   }
 
   // Reverses wireBindings: removes exactly the managed block (plus the blank
-  // line before it) from ~/.config/hypr/bindings.lua. Runs detached
-  // (Quickshell.execDetached): it is triggered from Component.onDestruction,
-  // where a child Process could not outlive the service objects being torn
-  // down.
+  // line before it). Runs detached from Component.onDestruction, where a child
+  // Process could not outlive the service objects being torn down.
   //
-  // Teardown cannot depend on the plugin's own files, which omarchy removes
-  // when the plugin is disabled. So at startup the shell script and its awk
-  // partner are copied to a stable per-user path (installUnwireScript);
-  // teardown runs that copy, falling back to the plugin's own script when the
-  // copy has not completed yet (see teardownScript).
+  // Teardown cannot depend on the plugin's own files — omarchy removes them on
+  // disable — so at startup the shell script and its awk partner are copied to
+  // a stable per-user path (installUnwireScript); teardown runs that copy,
+  // falling back to the plugin's own script if the copy has not completed yet.
   readonly property string unwireRuntimeDir:
     Quickshell.env("XDG_RUNTIME_DIR") || Quickshell.env("HOME") + "/.cache/grace-window"
   readonly property string unwireRuntimeScript: root.unwireRuntimeDir + "/grace-window.sh"
@@ -1199,11 +1040,9 @@ Item {
   }
 
   // Teardown variant of cancel(): restores the grace look of every pending and
-  // half-restored (restoring) window in place (they stay where they are). Runs
-  // detached through the cleaned-up teardown script, for the same reason as
-  // unwireBindings: on Component.onDestruction a child Process could not outlive
-  // the service objects being torn down, and the plugin directory may already
-  // be gone.
+  // half-restored (restoring) window in place. Detached, like unwireBindings:
+  // on Component.onDestruction a child Process could not outlive the service
+  // objects being torn down, and the plugin directory may already be gone.
   function cancelDetached() {
     const all = root.teardownEntries()
     if (all.length === 0) return
@@ -1215,25 +1054,20 @@ Item {
   }
 
   // ------------------------------------------------------- state persistence
-  // Teardown saves the pending state to the runtime dir; startup loads it to
-  // restore the pre-teardown buffers. A shell restart or hot-reload therefore
-  // keeps hidden windows in grace — their look, remaining time and the ability
-  // to reopen them — instead of forgetting them. Only entries whose window
-  // still exists AND still sits on the workspace it was hidden into are
-  // restored: anything a user moved or closed while the service was down is
-  // dropped by the startup probe. Entries already closing when teardown fires
-  // cannot be saved (their close is in flight), and cancelled scheduled closes
-  // are simply re-queued from the restored `remaining` (≤ 0 ⇒ `expiring`). An
-  // empty pending set is saved as an empty state, which clears the file: a
-  // window forgotten by cancel() (or given up after closeRetryMax) must never
-  // be resurrected into pending with a re-armed auto-close on the next start.
+  // Teardown saves the pending state to the runtime dir; startup loads it, so a
+  // restart or hot-reload keeps hidden windows in grace instead of forgetting
+  // them. Only windows still existing on the workspace they were hidden into
+  // are restored — anything moved or closed while the service was down is
+  // dropped by the startup probe. Entries already closing cannot be saved, and
+  // cancelled scheduled closes re-queue from the restored `remaining` (≤ 0 ⇒
+  // `expiring`). An empty pending set clears the file: a window forgotten by
+  // cancel() (or given up after closeRetryMax) must never be resurrected into
+  // pending with a re-armed auto-close on the next start.
 
-  // Every entry teardown must account for: the pending windows plus the windows
-  // currently being reopened (`restoring`). A restoring entry is by definition
-  // not fully restored (its dispatches never ran to completion), so teardown
-  // treats it exactly like a pending one: its look is undone in place and its
-  // state saved, so the next startup either reclaims it (the window still sits
-  // on its grace workspace) or drops it (its reopen had already moved it back).
+  // Every entry teardown must account for: pending windows plus those being
+  // reopened. A restoring entry is not fully restored, so it is treated exactly
+  // like a pending one — its look undone and its state saved — and the next
+  // start either reclaims it (still on the grace workspace) or drops it.
   function teardownEntries() {
     const all = []
     for (let i = 0; i < root.pending.length; i++) all.push(root.pending[i])
@@ -1241,11 +1075,10 @@ Item {
     return all
   }
 
-  // The persistable subset of teardownEntries: every entry whose window is
-  // still reopenable (not closing) and was not forgotten by cancel() (its
-  // address is in `cancelled`). The transients that only mean something
-  // inside a running service (closeTag, closeFails, the state flag) are derived
-  // anew on load, so the file stays a stable snapshot of the captured state.
+  // The persistable subset of teardownEntries: entries with a live window (not
+  // closing) that cancel() did not forget. The service-only transients
+  // (closeTag, closeFails, `state`) are derived anew on load, so the file is a
+  // stable snapshot of the captured state.
   function saveableEntries() {
     const out = []
     const all = root.teardownEntries()
@@ -1279,20 +1112,17 @@ Item {
   }
 
   // Saves the pending state for the next startup, atomically, through the
-  // runtime script. Runs detached, mirroring cancelDetached: on
-  // Component.onDestruction a child Process could not outlive the service
-  // objects being torn down. An empty state (nothing pending, or a cancel()
-  // that forgot everything) sends the empty array so the script clears (or
-  // keeps cleared) state.json — a stale save must never resurrect forgotten
-  // windows or re-arm their auto-close on the next start.
+  // runtime script. Detached, like cancelDetached (a child Process could not
+  // outlive teardown). An empty state clears the file — a stale save must
+  // never resurrect forgotten windows or re-arm their auto-close.
   function saveStateDetached() {
     const saveable = root.saveableEntries()
     Quickshell.execDetached(["bash", root.teardownScript(), "save-state",
       root.unwireRuntimeDir, JSON.stringify(saveable)])
   }
 
-  // Retries loadState while another op is in flight; a bounded tick instead of
-  // a busy Qt.callLater spin.
+  // Bounded retry for loadState while another op is in flight, instead of a busy
+  // Qt.callLater spin.
   Timer {
     id: loadRetryTimer
     interval: 500
@@ -1300,12 +1130,11 @@ Item {
     onTriggered: root.loadState()
   }
 
-  // Startup: read the saved state and restore it for the windows that still
-  // exist on their saved grace workspace. Runs through the shared executor,
-  // so the read, the clients probe and the restore dispatches are serialized
-  // with every hide/reopen and carried by the same watchdog. A missing state
-  // file reads as empty and is a no-op. If a cancel lands mid-load the epoch
-  // test drops the rest silently.
+  // Startup restore: read the saved state, probe which saved windows still
+  // exist on their grace workspace, and restore those. Runs through the shared
+  // executor (serialized with hide/reopen, under the same watchdog). A missing
+  // state file reads as empty (no-op); a cancel landing mid-load aborts via the
+  // epoch check.
   function loadState() {
     if (root.opInFlight > 0) {
       // Another query is in flight (e.g. a hot-reload landed mid-operation);
@@ -1333,10 +1162,9 @@ Item {
   }
 
   // Rebuilds the pending list from the saved entries, keeping only windows the
-  // probe reports as still alive on the workspace they were hidden into, then
-  // re-applies their grace state (look, tiling, float/pin mode) so the desktop
-  // matches the pre-teardown state. The grace countdown resumes where it left
-  // off: the service's downtime is not charged to the windows.
+  // probe reports as still alive on the workspace they were hidden into, and
+  // re-applies their grace state so the desktop matches pre-teardown. The
+  // countdown resumes where it left off; downtime is not charged.
   function restorePending(saved, probeRaw) {
     const probe = root.parseJson(probeRaw)
     if (!Array.isArray(probe)) return
@@ -1376,8 +1204,8 @@ Item {
         y: Number(e.y) || 0,
         w: Number(e.w) || 0,
         h: Number(e.h) || 0,
-        // The applied grace look, if the saved entry carries it; fall back to
-        // the (un-dimmed) original so a stale file never injects NaN props.
+        // The applied grace look, if saved; fall back to the (un-dimmed)
+        // original so a stale file never injects NaN props.
         graceOpacity: root.savedLook(e, "graceOpacity", "opacity"),
         graceOpacityInactive: root.savedLook(e, "graceOpacityInactive", "opacityInactive"),
         graceRounding: root.savedLook(e, "graceRounding", "rounding"),
@@ -1387,35 +1215,32 @@ Item {
         closeTag: "",
       }
       root.pending.push(entry)
-      // Re-hide the window in place: it already sits on the grace workspace, so
-      // only its look and mode need restoring, exactly like a fresh hide.
+      // Re-hide in place: it already sits on the grace workspace, so only its
+      // look and mode need restoring, exactly like a fresh hide.
       if (entry.floating) root.setWindowPin(entry.address, "off")
       root.graceState(entry.address, entry.graceOpacity, entry.graceOpacityInactive,
         entry.graceRounding, entry.graceRoundingPower)
     }
   }
 
-  // The saved applied grace value, or the fallback property when the state file
-  // predates grace-look persistence (a number is always returned; NaN never
-  // reaches the dispatching code).
+  // Saved applied grace value, or the fallback property when the state file
+  // predates grace-look persistence. Always a number; NaN never dispatches.
   function savedLook(entry, prop, fallback) {
     const value = Number(entry[prop])
     if (!isNaN(value) && entry[prop] !== undefined && entry[prop] !== null) return value
     return Number(entry[fallback]) || 0
   }
 
-  // Runs one harmless dispatch through grace-window.lua at startup, so an
-  // unreadable or broken file is reported right away instead of at the first
-  // keybinding press.
+  // One harmless dispatch through grace-window.lua at startup, so an unreadable
+  // or broken file is reported up front instead of at the first keybinding.
   function selfCheck() {
     root.luaDispatch("check()")
   }
 
   // ---------------------------------------------------------------- startup
   Component.onCompleted: {
-    // The shell assigns root.manifest right after creating this service, so
-    // defer the wiring, the unwire-script copy, the state restore and the
-    // dispatcher self-check until that property is set.
+    // The shell assigns root.manifest after creating this service, so defer
+    // the wiring, unwire-copy, state restore and self-check until it is set.
     root.lastTick = Date.now()
     Qt.callLater(root.wireBindings)
     Qt.callLater(root.installUnwireScript)
@@ -1423,18 +1248,15 @@ Item {
     Qt.callLater(root.selfCheck)
   }
 
-  // The shell destroys this service when the plugin is disabled or removed,
-  // so teardown cancels pending windows in place (restores their grace look —
-  // including windows that were mid-reopen, whose queued restore dispatches die
-  // with the executor), saves the pending state for the next startup to
-  // restore, and unwires the managed block — omarchy's plugin remove then
-  // leaves nothing behind. It also fires on shell shutdown; the next start
-  // re-wires the block (a no-op when already present) and restores the saved
-  // state, reclaiming any window that is still on its grace workspace.
+  // Fires on plugin disable/remove and shell shutdown. Cancels pending windows
+  // in place (including mid-reopen ones, whose queued restore dispatches die
+  // with the executor), saves the state for the next start, and unwires the
+  // managed block — plugin removal then leaves nothing behind. The next start
+  // re-wires the block and restores any window still on its grace workspace.
   Component.onDestruction: {
-    // Drop queued auto-closes first, so the detached grace-look undo below is
-    // not immediately followed by the windows being closed for real. The saved
-    // entries re-derive their expiry (remaining ≤ 0 ⇒ expiring) on load.
+    // Drop queued auto-closes first, so the detached look undo below is not
+    // followed by the windows being closed for real. Expiry is re-derived on
+    // load (remaining ≤ 0 ⇒ expiring).
     root.cancelScheduledCloses()
     root.saveStateDetached()
     root.cancelDetached()

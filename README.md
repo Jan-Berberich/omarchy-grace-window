@@ -134,24 +134,19 @@ such workflows can coexist.
 
 ## Notes
 
+- The plugin manages persistent window states: shutting the service down (restart, hot-reload,
+  logout) saves the pending state to the per-user runtime dir. The next start
+  restores every hidden window still on the workspace it was hidden into:
+  look, remaining grace time and reopenability all carry over. Windows moved
+  or closed while down are skipped, windows mid-reopen are treated like
+  pending, and `cancel` (or a close given up after `closeRetryMax`) clears the
+  saved state so such a window is never resurrected or re-armed.
 - Multiple windows can be hidden in sequence, in any number of
   workspaces. Each one keeps its own grace period in its workspace's buffer,
   and `reopen <workspace>` restores the most recent one of that workspace
   (or the focused window if it was hidden to this workspace).
 - `cancel` (or stopping the service) restores the grace look of every pending
   window in place. It does not move or close them.
-- **State persistence**: shutting the service down (shell restart, plugin
-  hot-reload, logout) saves the pending state to the per-user runtime dir;
-  the next start loads it and restores every hidden window that still exists
-  on the workspace it was hidden into — its grace look, remaining grace time
-  and the ability to reopen it all carry over, as if the service never
-  stopped. Windows that moved or were closed while the service was down are
-  skipped, and nothing is ever saved once a window's close is already in
-  flight. A window that was still mid-reopen when the service stopped is
-  treated the same way, so a restart during a reopen never strands it. `cancel`
-  (or a close given up after `closeRetryMax` retries) clears the saved state,
-  so such a window is never resurrected into grace — and its auto-close never
-  re-armed — by a later restart.
 - Re-hiding a window always restarts its full grace period, so `status`
   reports the fresh pending seconds. A pending window that is gone from
   Hyprland for any other reason (closed on its own, crashed) is dropped by the

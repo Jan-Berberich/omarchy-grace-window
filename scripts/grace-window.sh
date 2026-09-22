@@ -1,53 +1,27 @@
 #!/usr/bin/env bash
 # Grace Window — every shell operation the plugin needs, in one file.
 #
-# Subcommands:
-#   hide-query                Capture the focused window for the hide path.
-#   reopen-query              Query the state the reopen path needs: active
-#                             window and workspace plus the focused monitor's
-#                             active special workspace (the scratchpad), so a
-#                             reopen can land on the scratchpad when it is up.
-#   leave-group ADDR DELAY    Pull a window out of its tabbed group before it
-#                             is hidden (applies the grouping delay).
-#   regroup ADDR FOCUS DELAY  Move a reopened window into the focused window's
-#                             tabbed group.
-#   close ADDR                Close window ADDR for real, then verify it is gone
-#                             from Hyprland: exit 0 when the address no longer
-#                             exists (final), exit 1 when the window is still
-#                             alive (dispatch failed, retryable) or the clients
-#                             query itself failed, so a transient hyprland
-#                             outage never looks like a successful close.
-#   wire SRC TARGET S E       Append the managed keybinding block from SRC to
-#                             TARGET between markers S and E (owner-checked,
-#                             atomic, no-op when exactly one intact block is
-#                             already present, and fails loudly instead of
-#                             touching a partially-marked file).
-#   unwire TARGET S E         Remove exactly the managed block again (fails
-#                             closed when the markers are not intact).
-#   undo-grace JSON           Restore the grace look of the pending windows in
-#                             JSON in place (no workspace change). Runs at
-#                             teardown, after the plugin directory may be gone,
-#                             so it uses this runtime copy of the scripts.
-#   save-state DIR JSON       Persist the pending state as DIR/state.json
-#                             (atomically), so the next startup can restore the
-#                             pre-teardown buffers. Also runs at teardown from
-#                             this runtime copy. An empty JSON (nothing pending)
-#                             clears any stale save instead: a leftover file
-#                             must never resurrect forgotten windows.
-#   state-probe               List every client's address and the workspace it
-#                             sits on (id string plus name), so a startup load
-#                             can keep only windows still on their saved grace
-#                             workspace.
-#   install-unwire DIR        Copy this script and its awk and lua partners into
-#                             DIR (atomically), creating it first. Teardown later
-#                             runs the copy, when the plugin directory is already
-#                             gone.
+# hide-query / reopen-query    Capture focused-window / workspace state (JSON).
+# leave-group ADDR DELAY       Pull ADDR out of its tabbed group (+ delay).
+# regroup ADDR FOCUS DELAY     Move ADDR into FOCUS's tabbed group.
+# close ADDR                   Close ADDR and verify it is gone: exit 0 only
+#                              when the address no longer exists (retryable
+#                              otherwise, never a success on a broken query).
+# wire SRC TARGET S E          Append the managed block from SRC to TARGET
+#                              (markers S/E), atomically; a no-op when one
+#                              intact block exists, fail-closed otherwise.
+# unwire TARGET S E            Remove exactly the managed block again.
+# undo-grace JSON              Restore the grace look of JSON's entries in
+#                              place (teardown, runtime copy).
+# save-state DIR JSON          Write DIR/state.json atomically; empty clears it.
+# state-probe                  Client address + workspace id/name JSON.
+# install-unwire DIR           Copy this script and its awk/lua partners into
+#                              DIR (atomically), for teardown.
 #
-# The heavy lifting lives next to this file: grace-window.lua carries every
-# hl.dsp dispatch, grace-window.jq every jq filter and grace-window.awk the
-# unwire stripper. "unwire" and "undo-grace" also run after the plugin directory
-# is gone, so they must not depend on anything but their arguments and this
-# file's directory.
+# grace-window.lua holds every hl.dsp dispatch, grace-window.jq every jq
+# filter, grace-window.awk the unwire stripper. "unwire" and "undo-grace" also
+# run after the plugin directory is gone, so they must not depend on anything
+# but their arguments and this file's directory.
 set -u
 
 self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -60,10 +34,8 @@ die() {
   exit 1
 }
 
-# A dispatch expression evaluates to a dispatcher in Hyprland's config VM, so
-# it loads grace-window.lua and calls one of its functions. hyprctl exits
-# nonzero (and prints the error) when the file is missing or broken, so surface
-# that instead of losing the dispatch silently.
+# hyprctl exits nonzero when the file is missing or broken; surface that
+# instead of losing the dispatch silently.
 lua_call() {
   local out
   if ! out=$(hyprctl dispatch "dofile('$self/grace-window.lua').$1" 2>&1); then
@@ -182,13 +154,9 @@ cmd_wire() {
   if [[ -z "$l0" || -z "$l1" ]]; then die "managed block not found in $src"; fi
   if (( l0 > l1 )); then die "managed block markers out of order in $src"; fi
   # The target must be either fully wired (exactly one intact start/end pair)
-  # or free of the markers. Anything else is a state this plugin did not write
-  # intact — a manual edit, or a legacy partial wire — and appending a second
-  # block would only corrupt it further. unwire fail-closes on the same test,
-  # so such a target used to wedge silently between the two; surfacing it here
-  # (instead of guessing) makes it recoverable. The partial block is never
-  # stripped automatically: content sitting between a stray marker and EOF may
-  # be the user's, and deleting it would be worse than the wedge.
+  # or free of the markers — any other state was not written by this plugin.
+  # Appending a second block would corrupt it further, and the partial block is
+  # never stripped automatically: content after a stray marker may be the user's.
   starts=$(grep -cFs -- "$start" "$target" 2>/dev/null || true)
   ends=$(grep -cFs -- "$end" "$target" 2>/dev/null || true)
   if (( starts == 1 && ends == 1 )); then
@@ -201,11 +169,10 @@ cmd_wire() {
   target_dir="$(dirname "$target")"
   if [[ ! -d "$target_dir" ]]; then die "target directory missing: $target_dir"; fi
   if [[ -f "$target" ]]; then
-    # Appending to an existing file: verify the whole path first.
+    # Appending to an existing file: verify the whole path.
     check_target "$target"
   else
-    # Fresh install without a bindings file yet: only its directory needs the
-    # owner/symlink checks, the file itself is created here.
+    # No file yet: only the directory needs the owner/symlink checks.
     check_target "$target_dir"
   fi
   tmpfile=$(mktemp "$target_dir/bindings.lua.tmp.XXXXXX") || die "could not create temporary file"
@@ -236,11 +203,9 @@ cmd_unwire() {
   if [[ ! -f "$target" ]]; then say "bindings file not found: $target; nothing to clean"; return; fi
   starts=$(grep -cFs -- "$start" "$target" || true)
   ends=$(grep -cFs -- "$end" "$target" || true)
-  # Only an intact, single managed block is ever unwired. A bare marker or a
-  # duplicated block means the file is not in a state this plugin created, so
-  # refuse to touch it rather than guessing (or stripping something twice).
-  # Markers are single-line comments, so line-based counts cannot be confounded
-  # by a marker mid-line.
+  # Only an intact, single managed block is ever unwired; duplicates or bare
+  # markers mean the file is not in a state this plugin created, so refuse to
+  # guess. Markers are single-line comments, so line counts cannot be confounded.
   if (( starts != 1 )) || (( ends != 1 )); then
     say "managed block markers not intact in $target ($starts start, $ends end); leaving file untouched"
     return
@@ -248,9 +213,9 @@ cmd_unwire() {
   check_target "$target"
   tmpfile=$(mktemp "${target}.tmp.XXXXXX") || die "could not create temporary file"
   orig_mode=$(stat -c "%a" "$target")
-  # The awk strip happens into a temporary file first; the target is only
-  # renamed over once the result is both produced and verified, so a failure
-  # here can never leave a half-stripped bindings file behind.
+  # Strip into a temp file first, and only rename over the target once the
+  # result is produced and verified, so a failure never leaves a half-stripped
+  # bindings file behind.
   if ! awk -v s="$start" -v e="$end" -f "$self/grace-window.awk" "$target" > "$tmpfile"; then
     rm -f "$tmpfile"
     die "unwire (awk) failed; $target left untouched"
@@ -279,20 +244,16 @@ cmd_install_unwire() {
     cp "$self/$f" "$tmp" || die "cannot copy $f to $dir"
     mv -f "$tmp" "$dir/$f" || { rm -f "$tmp"; die "cannot replace $f in $dir"; }
   done
-  # The teardown subcommands must exist in the installed copy — a stale script
-  # would silently strand the grace look on service stop and lose the pending
-  # state on restart.
+  # The teardown subcommands must exist in the copy — a stale script would
+  # strand the grace look on stop and lose the pending state on restart.
   grep -q 'undo-grace' "$dir/grace-window.sh" || die "installed unwire script lacks undo-grace"
   grep -q 'save-state' "$dir/grace-window.sh" || die "installed unwire script lacks save-state"
 }
 
 # Teardown variant of cancel(): restore the grace look (and pin) of every
-# pending window in place (they stay on the grace workspace). Works the same
-# way as the QML restoreInPlace, but runs detached from this runtime copy after
-# the plugin directory may already be gone. No workspace moves, no geometry
-# restore. A window that vanished (or a failed dispatch) must not abort the
-# rest, so each window's restore is best-effort and the loop carries on to the
-# next one.
+# pending window in place, from this runtime copy after the plugin directory may
+# be gone. Best-effort per window — a vanished window or failed dispatch must
+# not abort the rest.
 cmd_undo_grace() {
   local data="$1" rec addr opacity opacity_inactive rounding rounding_power \
     floating fullscreen fullscreen_client pinned
@@ -304,10 +265,9 @@ cmd_undo_grace() {
     opacity_inactive=$(jq -r '.opacityInactive // empty' <<<"$rec")
     rounding=$(jq -r '.rounding // empty' <<<"$rec")
     rounding_power=$(jq -r '.roundingPower // empty' <<<"$rec")
-    # Look fields are always captured by hide-query; an incomplete record can
-    # not be restored faithfully, so skip it instead of injecting empty values
-    # (an empty rounding_power would otherwise become a malformed dispatch that
-    # aborts the rest of this window's restore).
+    # Look fields are always captured by hide-query; an incomplete record can't
+    # be restored faithfully, so skip it rather than inject empty values (an
+    # empty rounding_power would become a malformed dispatch).
     if [[ -z "$opacity" || -z "$opacity_inactive" || -z "$rounding" || -z "$rounding_power" ]]; then
       say "skipping $addr: captured grace look incomplete"
       continue
@@ -326,20 +286,16 @@ cmd_undo_grace() {
     if (( fullscreen > 0 || fullscreen_client > 0 )); then
       lua_call "window_fullscreen('$addr', $fullscreen, $fullscreen_client)" || continue
     fi
-    # Pin is the last step, mirroring Service.qml restoreWindow / restoreInPlace
-    # (there is no move here, so it simply ends the in-place restore).
+    # Pin ends the restore, mirroring Service.qml restoreInPlace.
     if [[ "$pinned" == "true" ]]; then
       lua_call "window_pin('$addr', true)" || continue
     fi
   done < <(jq -c '.[]?' <<<"$data")
 }
 
-# Persist the pending state as $dir/state.json so teardown's state survives into
-# the next startup. Atomic (write next to it, then rename), so an interrupted
-# write can never leave a truncated state file that parses to garbage. An empty
-# state (nothing pending, or a cancel that forgot everything) removes any stale
-# file: a saved window that is no longer pending must not be resurrected with a
-# re-armed auto-close on the next start.
+# Persist the pending state as $dir/state.json for the next startup; atomic.
+# An empty state removes any stale file, so a window that is no longer pending
+# is never resurrected with a re-armed auto-close.
 cmd_save_state() {
   local dir="$1" data="$2" tmp
   mkdir -p "$dir" || die "cannot create state dir: $dir"
@@ -354,9 +310,8 @@ cmd_save_state() {
   mv -f "$tmp" "$dir/state.json" || { rm -f "$tmp"; die "cannot replace state file"; }
 }
 
-# The startup load probe: one JSON document listing every client's address and
-# workspace, used to filter the saved state down to windows that still exist on
-# their saved grace workspace.
+# Startup restore probe: every client's address and workspace, to filter the
+# saved state down to windows still on their grace workspace.
 cmd_state_probe() {
   local clients
   clients=$(hyprctl -j clients 2>/dev/null || true)
