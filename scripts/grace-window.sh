@@ -255,7 +255,7 @@ cmd_install_unwire() {
 # be gone. Best-effort per window — a vanished window or failed dispatch must
 # not abort the rest.
 cmd_undo_grace() {
-  local data="$1" rec addr opacity opacity_inactive rounding rounding_power \
+  local data="$1" rec addr opacity opacity_inactive \
     floating fullscreen fullscreen_client pinned
   [[ -n "$data" ]] || return 0
   while read -r rec; do
@@ -263,12 +263,11 @@ cmd_undo_grace() {
     [[ -n "$addr" ]] || continue
     opacity=$(jq -r '.opacity // empty' <<<"$rec")
     opacity_inactive=$(jq -r '.opacityInactive // empty' <<<"$rec")
-    rounding=$(jq -r '.rounding // empty' <<<"$rec")
-    rounding_power=$(jq -r '.roundingPower // empty' <<<"$rec")
-    # Look fields are always captured by hide-query; an incomplete record can't
-    # be restored faithfully, so skip it rather than inject empty values (an
-    # empty rounding_power would become a malformed dispatch).
-    if [[ -z "$opacity" || -z "$opacity_inactive" || -z "$rounding" || -z "$rounding_power" ]]; then
+    # Opacity is restored by its captured value (setprop has no unset for it);
+    # rounding/rounding_power are unset instead, so the window falls back to its
+    # dynamic window rules (e.g. the rounding=8 pop tag rule) instead of being
+    # stuck with a per-window override that mutes SUPER+O's rounding change.
+    if [[ -z "$opacity" || -z "$opacity_inactive" ]]; then
       say "skipping $addr: captured grace look incomplete"
       continue
     fi
@@ -278,8 +277,14 @@ cmd_undo_grace() {
     fullscreen_client=$(jq -r '.fullscreenClient // 0' <<<"$rec")
     lua_call "window_set_prop('$addr', 'opacity', $opacity)" || continue
     lua_call "window_set_prop('$addr', 'opacity_inactive', $opacity_inactive)" || continue
-    lua_call "window_set_prop('$addr', 'rounding', $rounding)" || continue
-    lua_call "window_set_prop('$addr', 'rounding_power', $rounding_power)" || continue
+    lua_call "window_set_prop('$addr', 'rounding', 'unset')" || continue
+    lua_call "window_set_prop('$addr', 'rounding_power', 'unset')" || continue
+    # A setprop on a numeric prop discards the window-rule copy of its value,
+    # so an "unset" alone would leave the rule look (a popped window's rounded
+    # corners) off until a tag change re-evaluates the rules. Cycling a
+    # throwaway static tag re-applies the dynamic rules and leaves nothing.
+    lua_call "window_tag('$addr', '+grace-window-recheck')" || continue
+    lua_call "window_tag('$addr', '-grace-window-recheck')" || continue
     if [[ "$floating" == "true" ]]; then
       lua_call "window_float('$addr', true)" || continue
     fi

@@ -391,8 +391,9 @@ Item {
     const graceOpacity = Number(opacity) * opacityFactor
     const graceOpacityInactive = Number(opacityInactive) * opacityFactor
     if (isNaN(graceOpacity) || isNaN(graceOpacityInactive)) return "none"
-    // Same guard for the originals, or a bogus power flows into restore
-    // dispatches as a bare "NaN" Lua token.
+    // Restore unsets rounding rather than re-setting it, so the originals are
+    // never dispatched; they are still captured and validated only so a broken
+    // getprop answer fails this hide instead of silently skipping the guard.
     const capturedRoundingValue = Number(capturedRounding)
     const capturedRoundingPowerValue = Number(capturedRoundingPower)
     if (isNaN(capturedRoundingValue) || isNaN(capturedRoundingPowerValue)) return "none"
@@ -540,10 +541,14 @@ Item {
     // Undo the grace look and the forced tiling/fullscreen/float modes. Never
     // restores the pin (the callers handle it as the last step, after any
     // move) and never touches the workspace, so the window stays where it is.
+    // Rounding is unset rather than re-set: a captured literal would override
+    // the dynamic rules (like the pop tag rule) for the rest of the window's
+    // life, while the pre-hide rounding was rule-derived in the first place.
     root.setWindowProp(entry.address, "opacity", entry.opacity, tag)
     root.setWindowProp(entry.address, "opacity_inactive", entry.opacityInactive, tag)
-    root.setWindowProp(entry.address, "rounding", entry.rounding, tag)
-    root.setWindowProp(entry.address, "rounding_power", entry.roundingPower, tag)
+    root.unsetWindowProp(entry.address, "rounding", tag)
+    root.unsetWindowProp(entry.address, "rounding_power", tag)
+    root.resetWindowRules(entry.address, tag)
     if (entry.fullscreen > 0 || entry.fullscreenClient > 0) {
       root.setWindowFullscreen(entry.address, entry.fullscreen, entry.fullscreenClient, tag)
     }
@@ -668,6 +673,27 @@ Item {
 
   function setWindowProp(addr, prop, value, tag) {
     root.luaDispatch(`window_set_prop('${root.luaString(addr)}', '${prop}', ${value})`, tag)
+  }
+
+  // Removes a per-window setprop override again, so the window returns to the
+  // look its (dynamic) window rules derive — e.g. re-applying Omarchy's
+  // rounding=8 pop rule when SUPER+O tags a window. Re-setting the captured
+  // value instead would pin the property and quiet any rule that has to react
+  // to future state changes. `unset` is only accepted for the numeric props;
+  // opacity has no unset path, so it is restored by value.
+  function unsetWindowProp(addr, prop, tag) {
+    root.luaDispatch(`window_set_prop('${root.luaString(addr)}', '${prop}', 'unset')`, tag)
+  }
+
+  // Re-runs a window's dynamic window rules. A setprop on a numeric prop (like
+  // rounding) writes through COverridableVar's operator=, which also discards
+  // the window-rule copy of the value; our "unset" alone therefore leaves rule
+  // look (e.g. a popped window's rounding=8) missing until a tag change forces
+  // a re-evaluation. Cycling a throwaway static tag makes Hyprland re-apply the
+  // matching rules, then removes itself, so no tag remains.
+  function resetWindowRules(addr, tag) {
+    root.luaDispatch(`window_tag('${root.luaString(addr)}', '+grace-window-recheck')`, tag)
+    root.luaDispatch(`window_tag('${root.luaString(addr)}', '-grace-window-recheck')`, tag)
   }
 
   function setWindowFloat(addr, action, tag) {

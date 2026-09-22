@@ -28,6 +28,10 @@ function gw.window_pin(address, action)
   return hl.dsp.window.pin({ window = addr(address), action = action })
 end
 
+function gw.window_tag(address, tag)
+  return hl.dsp.window.tag({ window = addr(address), tag = tag })
+end
+
 function gw.window_fullscreen(address, internal, client)
   return hl.dsp.window.fullscreen_state({
     window = addr(address),
