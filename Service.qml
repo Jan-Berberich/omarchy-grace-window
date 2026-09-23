@@ -332,9 +332,17 @@ Item {
   // dispatches queue behind them in the same FIFO, so nothing interleaves.
   property int opInFlight: 0
 
-  function graceState(addr, graceOpacity, graceOpacityInactive, rounding, roundingPower) {
+  // Enforces the grace look. `fullscreenClient` is the fullscreen state the
+  // client believes in, passed through so it is NEVER reset: telling a client
+  // it left fullscreen makes it exit its own fullscreen (e.g. a browser's DOM
+  // fullscreen), and re-forcing client fullscreen on reopen cannot re-enter it
+  // — the app's own fullscreen key (YouTube's F) is then ignored and the window
+  // stays stuck in fullscreen until the compositor resets it. Only the internal
+  // state (how Hyprland lays the window out) is reset, forcing it back to
+  // tiling; the client's belief survives the hide and reopens in sync.
+  function graceState(addr, fullscreenClient, graceOpacity, graceOpacityInactive, rounding, roundingPower) {
     root.setWindowFloat(addr, "off")
-    root.setWindowFullscreen(addr, 0, 0)
+    root.setWindowFullscreen(addr, 0, fullscreenClient)
     root.setWindowProp(addr, "opacity", graceOpacity)
     root.setWindowProp(addr, "opacity_inactive", graceOpacityInactive)
     root.setWindowProp(addr, "rounding", rounding)
@@ -371,6 +379,11 @@ Item {
       existing.closeFails = 0
       existing.remaining = graceMs
       root.rebuffer(existing, workspace)
+      // The client-side fullscreen is captured fresh too: it must mirror the
+      // state the window believes in right now (it is never reset while it
+      // hides), so a hidden window whose client changed its own fullscreen is
+      // captured as it is.
+      existing.fullscreenClient = rec.fullscreenClient || 0
       // As in a fresh hide: pull it out of any tabbed group so the whole group
       // is not dragged to the grace workspace.
       const grouped = Array.isArray(rec.grouped) ? rec.grouped : []
@@ -387,7 +400,7 @@ Item {
       existing.graceRounding = rounding
       existing.graceRoundingPower = roundingPower
       root.moveToGraceWorkspace(addr, workspace)
-      root.graceState(addr, graceOpacity, graceOpacityInactive, rounding, roundingPower)
+      root.graceState(addr, existing.fullscreenClient, graceOpacity, graceOpacityInactive, rounding, roundingPower)
       return "ok"
     }
     // Never hide a window whose look cannot be restored faithfully on reopen.
@@ -439,7 +452,7 @@ Item {
     }
     if (entry.floating) root.setWindowPin(addr, "off")
     root.moveToGraceWorkspace(addr, workspace)
-    root.graceState(addr, graceOpacity, graceOpacityInactive, rounding, roundingPower)
+    root.graceState(addr, entry.fullscreenClient, graceOpacity, graceOpacityInactive, rounding, roundingPower)
     return "ok"
   }
 
@@ -568,6 +581,10 @@ Item {
     // pinned mid-flight while a moved window is still on its way.
     root.undoGraceState(entry, tag)
     if (entry.fullscreen > 0 || entry.fullscreenClient > 0) {
+      // Restore the internal fullscreen. `fullscreenClient` was never reset by
+      // the plugin (the hide only forces internal back to tiling), so it still
+      // mirrors what the client believes and is restored unchanged — the app's
+      // own fullscreen toggle (e.g. a browser's F) stays in sync and works.
       root.setWindowFullscreen(entry.address, entry.fullscreen, entry.fullscreenClient, tag)
     }
     if (entry.floating) {
@@ -656,7 +673,7 @@ Item {
       // The restore already undid the grace look, so re-apply it — a pending
       // window must not look normal while its auto-close is armed.
       if (entry.floating) root.setWindowPin(entry.address, "off")
-      root.graceState(entry.address, entry.graceOpacity, entry.graceOpacityInactive,
+      root.graceState(entry.address, entry.fullscreenClient, entry.graceOpacity, entry.graceOpacityInactive,
         entry.graceRounding, entry.graceRoundingPower)
     } else {
       // Not on its grace workspace anymore — untracked, so no close is armed.
@@ -1261,7 +1278,7 @@ Item {
       // Re-hide in place: it already sits on the grace workspace, so only its
       // look and mode need restoring, exactly like a fresh hide.
       if (entry.floating) root.setWindowPin(entry.address, "off")
-      root.graceState(entry.address, entry.graceOpacity, entry.graceOpacityInactive,
+      root.graceState(entry.address, entry.fullscreenClient, entry.graceOpacity, entry.graceOpacityInactive,
         entry.graceRounding, entry.graceRoundingPower)
     }
   }
