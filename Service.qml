@@ -180,6 +180,15 @@ Item {
       const detail = (text || "").trim()
       console.warn(`grace-window: dispatch failed: ${detail || "non-zero exit"}`)
     }
+    // Settle a reopen once its last tagged dispatch completes, not just when
+    // the single `regroup` item's onDone fires: the trailing focus dispatch
+    // carries the same tag and is still queued at that moment, so the one
+    // settle attempt would bail on the queue scan and never be called again —
+    // leaving every reopened window tracked in `restoring` until teardown.
+    const tag = item.tag || ""
+    if (tag.indexOf("restore:") === 0 && !item.onDone) {
+      root.settleRestore(tag, !failed)
+    }
   }
 
   Process {
