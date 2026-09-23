@@ -378,7 +378,12 @@ Item {
       existing.state = "counting"
       existing.closeFails = 0
       existing.remaining = graceMs
+      // A re-hide that switches buffers (another workspace's workflow) sends the
+      // window on a fresh move, so its settled flag resets like a fresh hide;
+      // the liveness probe re-arms it once it is back on the grace workspace.
+      const rebuffered = existing.workspace !== workspace
       root.rebuffer(existing, workspace)
+      if (rebuffered) existing.settled = false
       // The client-side fullscreen is captured fresh too: it must mirror the
       // state the window believes in right now (it is never reset while it
       // hides), so a hidden window whose client changed its own fullscreen is
@@ -444,6 +449,12 @@ Item {
       state: "counting",
       closeFails: 0,
       closeTag: "",
+      // False until the liveness probe has observed the window on its grace
+      // workspace. While false a "not on the grace workspace" probe verdict is
+      // ignored, because the probe can land between this entry's creation and
+      // its move dispatch — reading the window still on its origin workspace
+      // and mistaking its own hide migration for a user relocation.
+      settled: false,
     }
     root.pending.push(entry)
     const grouped = Array.isArray(rec.grouped) ? rec.grouped : []
@@ -606,6 +617,24 @@ Item {
     root.undoGraceState(entry)
   }
 
+  // Full reopen minus every move: for a pending window that left its grace
+  // workspace on its own (see onClientsRead) — the user already relocated it,
+  // so unlike restoreInPlace this also gives back the window's captured mode,
+  // size and pin (the force-tiling of grace goes away again), but unlike
+  // restoreWindow it never moves it to the workspace it was hidden from and
+  // never repositions it: the window stays exactly where the user put it.
+  function reopenInPlace(entry) {
+    root.undoGraceState(entry)
+    if (entry.fullscreen > 0 || entry.fullscreenClient > 0) {
+      root.setWindowFullscreen(entry.address, entry.fullscreen, entry.fullscreenClient)
+    }
+    if (entry.floating) {
+      root.setWindowFloat(entry.address, "on")
+      if (entry.w > 0 && entry.h > 0) root.resizeWindow(entry.address, entry.w, entry.h)
+    }
+    if (entry.pinned) root.setWindowPin(entry.address, "on")
+  }
+
   // Settles the in-flight reopen of the entry in `restoring[address]`. Success
   // keeps the entry out for good (the window is back); a failure verifies
   // where the window actually is before re-queuing, so one that did land (only
@@ -670,6 +699,7 @@ Item {
       entry.state = entry.remaining <= 0 ? "expiring" : "counting"
       entry.closeTag = ""
       entry.closeFails = 0
+      entry.settled = true
       // The restore already undid the grace look, so re-apply it — a pending
       // window must not look normal while its auto-close is armed.
       if (entry.floating) root.setWindowPin(entry.address, "off")
@@ -839,16 +869,11 @@ Item {
     const snapshot = root.pending.slice()
     for (let i = 0; i < snapshot.length; i++) {
       const entry = snapshot[i]
-      // Expired windows close for real, regardless of focus. Queue the close
-      // now; the extra sweep interval is the window in which a reopen can
-      // cancel before the dispatch is ever submitted.
-      if (entry.state === "expiring") {
-        if (!entry.closeTag) {
-          entry.closeTag = `close:${entry.address}`
-          root.queueClose(entry, entry.closeTag)
-        }
-        continue
-      }
+      // Expired windows close for real, regardless of focus. The close is
+      // queued at the end of this sweep, behind the probes below, so a window
+      // relocated during its expiring window is rescued by onClientsRead
+      // before the dispatch is ever submitted.
+      if (entry.state === "expiring") continue
       // The timer pauses while the hidden window holds focus.
       if (entry.address === root.focusedAddress) continue
       entry.remaining -= delta
@@ -862,10 +887,24 @@ Item {
     root.enqueueProbe("focus", ["hyprctl", "-j", "activewindow"], function (text) {
       root.onFocusRead(text)
     })
-    if (root.pending.some(entry => entry.state === "counting")) {
+    // Probe while expiring windows exist too: one that left its grace workspace
+    // between expiry and its queued close must be rescued (see onClientsRead)
+    // before the close is handed to the process.
+    if (root.pending.some(entry => entry.state === "counting" || entry.state === "expiring")) {
       root.enqueueProbe("clients", ["hyprctl", "-j", "clients"], function (text) {
         root.onClientsRead(text)
       })
+    }
+    // Queue each expiring auto-close behind the probes above (and any probe
+    // still queued from a previous tick): onClientsRead must observe the
+    // window — and cancel the close of one that left the grace workspace —
+    // before the item pops. `closing` only marks when pump() hands the close
+    // to the process, so a queued close stays cancellable its whole wait.
+    for (let i = 0; i < root.pending.length; i++) {
+      const entry = root.pending[i]
+      if (entry.state !== "expiring" || entry.closeTag) continue
+      entry.closeTag = `close:${entry.address}`
+      root.queueClose(entry, entry.closeTag)
     }
   }
 
@@ -893,25 +932,47 @@ Item {
     }
     for (let i = root.pending.length - 1; i >= 0; i--) {
       const entry = root.pending[i]
-      if (entry.state === "closing" || entry.state === "expiring") continue
+      // A close already handed to the process cannot be undone; this probe
+      // cannot rescue it either way, so only `closing` is skipped.
+      if (entry.state === "closing") continue
       const win = whereabouts.get(entry.address)
       if (!win) {
+        // A window gone from Hyprland needs no close: drop a queued one so the
+        // teardown of its empty entry does not idle on a pointless dispatch.
+        if (entry.closeTag) {
+          root.cancelQueuedClose(entry.closeTag)
+          entry.closeTag = ""
+        }
         console.warn(`grace-window: ${entry.address} no longer exists in Hyprland; dropping its pending entry`)
         root.pending.splice(i, 1)
         continue
       }
-      // A window moved off its grace workspace (e.g. SUPER+SHIFT+1, dragged to
-      // another monitor, moved into the scratchpad) is not in grace anymore:
-      // the user took it back, so undo its grace look, cancel any queued
-      // auto-close and stop tracking it — it must never be force-closed on a
-      // workspace the user just placed it on.
-      if (root.onGraceWorkspace(entry, win)) continue
+      // A window moved off its grace workspace (e.g. switched away with
+      // SUPER+SHIFT+1, moved into the scratchpad, or dragged onto a monitor
+      // showing a different workspace) is not in grace anymore: the user took
+      // it back — reopen it in place (its mode, size and look restored, but
+      // where it now sits untouched) and cancel any queued auto-close; it must
+      // never be force-closed on a workspace the user just placed it on.
+      // Expired windows count here too: their close is only queued (or not yet
+      // submitted), so one that moved away while `expiring` is still rescued
+      // exactly like a `counting` one.
+      if (root.onGraceWorkspace(entry, win)) {
+        // The window is where grace expects it; once observed there, a later
+        // observation elsewhere is evidence the user really relocated it.
+        entry.settled = true
+        continue
+      }
+      // A pending window never observed on its grace workspace is still on its
+      // way there (a probe queued mid-hide can read the window on its origin,
+      // before the move it enqueued behind itself runs); do not yet call it
+      // "left". Only a relocation after settling on the grace workspace counts.
+      if (!entry.settled) continue
       if (entry.closeTag) {
         root.cancelQueuedClose(entry.closeTag)
         entry.closeTag = ""
       }
-      console.warn(`grace-window: ${entry.address} left its grace workspace; undoing its grace state and dropping its pending entry`)
-      root.restoreInPlace(entry)
+      console.warn(`grace-window: ${entry.address} left its grace workspace; reopening it in place and dropping its pending entry`)
+      root.reopenInPlace(entry)
       root.pending.splice(i, 1)
     }
   }
@@ -1304,6 +1365,10 @@ Item {
         state: remaining <= 0 ? "expiring" : "counting",
         closeFails: 0,
         closeTag: "",
+        // The state probe already verified this window sits on its saved grace
+        // workspace, so no hide migration is in flight; the settled flag is
+        // armed for the liveness probe right away.
+        settled: true,
       }
       root.pending.push(entry)
       // Re-hide in place: it already sits on the grace workspace, so only its
