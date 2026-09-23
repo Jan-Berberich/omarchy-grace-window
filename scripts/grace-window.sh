@@ -250,14 +250,15 @@ cmd_install_unwire() {
   grep -q 'save-state' "$dir/grace-window.sh" || die "installed unwire script lacks save-state"
 }
 
-# Teardown variant of cancel(): restore the grace look of every pending window
-# in place, from this runtime copy after the plugin directory may be gone.
-# Windows stay on the grace workspace, so no pin is applied — a pinned window
-# would silently move to the focused workspace. Best-effort per window — a
-# vanished window or failed dispatch must not abort the rest.
+# Teardown variant of cancel(): drop the grace look of every pending window in
+# place, from this runtime copy after the plugin directory may be gone. Windows
+# stay exactly where the hide left them on the grace workspace — no pin, no
+# mode or geometry changes, no moves; only a reopen restores those. The
+# pending queue dies with the service, so no auto-close can fire afterwards.
+# Best-effort per window — a vanished window or failed dispatch must not abort
+# the rest.
 cmd_undo_grace() {
-  local data="$1" rec addr opacity opacity_inactive \
-    floating fullscreen fullscreen_client
+  local data="$1" rec addr opacity opacity_inactive
   [[ -n "$data" ]] || return 0
   while read -r rec; do
     addr=$(jq -r '.address // empty' <<<"$rec")
@@ -272,9 +273,6 @@ cmd_undo_grace() {
       say "skipping $addr: captured grace look incomplete"
       continue
     fi
-    floating=$(jq -r '.floating // "false"' <<<"$rec")
-    fullscreen=$(jq -r '.fullscreen // 0' <<<"$rec")
-    fullscreen_client=$(jq -r '.fullscreenClient // 0' <<<"$rec")
     lua_call "window_set_prop('$addr', 'opacity', $opacity)" || continue
     lua_call "window_set_prop('$addr', 'opacity_inactive', $opacity_inactive)" || continue
     lua_call "window_set_prop('$addr', 'rounding', 'unset')" || continue
@@ -285,14 +283,6 @@ cmd_undo_grace() {
     # throwaway static tag re-applies the dynamic rules and leaves nothing.
     lua_call "window_tag('$addr', '+grace-window-recheck')" || continue
     lua_call "window_tag('$addr', '-grace-window-recheck')" || continue
-    if [[ "$floating" == "true" ]]; then
-      lua_call "window_float('$addr', true)" || continue
-    fi
-    if (( fullscreen > 0 || fullscreen_client > 0 )); then
-      lua_call "window_fullscreen('$addr', $fullscreen, $fullscreen_client)" || continue
-    fi
-    # No pin: the window stays on the grace workspace, and a pinned window
-    # would silently move to the focused workspace instead.
   done < <(jq -c '.[]?' <<<"$data")
 }
 

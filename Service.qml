@@ -547,28 +547,31 @@ Item {
   }
 
   function undoGraceState(entry, tag) {
-    // Undo the grace look and the forced tiling/fullscreen/float modes. Never
-    // restores the pin (the callers handle it as the last step, after any
-    // move) and never touches the workspace, so the window stays where it is.
-    // Rounding is unset rather than re-set: a captured literal would override
-    // the dynamic rules (like the pop tag rule) for the rest of the window's
-    // life, while the pre-hide rounding was rule-derived in the first place.
+    // Undo only the grace look — opacity back to the captured originals and
+    // rounding/rounding_power unset. Rounding is unset rather than re-set: a
+    // captured literal would override the dynamic rules (like the pop tag rule)
+    // for the rest of the window's life, while the pre-hide rounding was
+    // rule-derived in the first place. Modes (float/fullscreen) and geometry
+    // are left untouched: only a reopen — which moves the window back — may
+    // restore them; an in-place restore (cancel / give-up close / teardown)
+    // never changes what the hide forced, so the window just sits where it is,
+    // looking normal again.
     root.setWindowProp(entry.address, "opacity", entry.opacity, tag)
     root.setWindowProp(entry.address, "opacity_inactive", entry.opacityInactive, tag)
     root.unsetWindowProp(entry.address, "rounding", tag)
     root.unsetWindowProp(entry.address, "rounding_power", tag)
     root.resetWindowRules(entry.address, tag)
-    if (entry.fullscreen > 0 || entry.fullscreenClient > 0) {
-      root.setWindowFullscreen(entry.address, entry.fullscreen, entry.fullscreenClient, tag)
-    }
-    if (entry.floating) root.setWindowFloat(entry.address, "on", tag)
   }
 
   function restoreWindow(entry, workspaceId, tag) {
     // Undo the grace look, restore mode and geometry, then pin — nothing gets
     // pinned mid-flight while a moved window is still on its way.
     root.undoGraceState(entry, tag)
+    if (entry.fullscreen > 0 || entry.fullscreenClient > 0) {
+      root.setWindowFullscreen(entry.address, entry.fullscreen, entry.fullscreenClient, tag)
+    }
     if (entry.floating) {
+      root.setWindowFloat(entry.address, "on", tag)
       if (entry.w > 0 && entry.h > 0) root.resizeWindow(entry.address, entry.w, entry.h, tag)
       root.moveWindowTo(entry.address, entry.x, entry.y, tag)
     }
@@ -576,10 +579,12 @@ Item {
     if (entry.pinned) root.setWindowPin(entry.address, "on", tag)
   }
 
-  // In-place restore for cancel / give-up close: no moves, no pin. Re-pinning
-  // is only ever paired with a reopen's move back to the original workspace —
-  // a pinned window stays on the focused workspace, so pinning one left on the
-  // grace workspace would silently yank it to the workspace in focus.
+  // In-place restore for cancel / give-up close / teardown: only the grace look
+  // goes away. No moves, no pin, and no mode or geometry changes — the window
+  // stays exactly where the hide left it (on the grace workspace), just looking
+  // normal again. Ending the auto-close is the caller's job (cancelScheduledCloses);
+  // a pinned window is never re-pinned here because it would silently move to
+  // the focused workspace instead of staying on the grace one.
   function restoreInPlace(entry) {
     root.undoGraceState(entry)
   }
@@ -877,10 +882,11 @@ Item {
 
   // ---------------------------------------------------------------- cancel
   // Forget every pending window (of every workspace's buffer) without closing
-  // it, restoring its grace look (and pin) in place. The windows stay on the
-  // grace workspace; only reopen moves them back. Queued auto-closes are
-  // cancelled; the now-empty pending state is persisted too, so a restart can
-  // never resurrect a cancelled (or given-up) window and re-arm its close.
+  // it, restoring only its grace look in place. The windows stay on the grace
+  // workspace untouched otherwise; only reopen moves them back and restores
+  // their mode and geometry. Queued auto-closes are cancelled; the now-empty
+  // pending state is persisted too, so a restart can never resurrect a
+  // cancelled (or given-up) window and re-arm its close.
   function cancel() {
     // Bump the epoch so in-flight ops report "none" instead of applying after
     // the cancellation.
