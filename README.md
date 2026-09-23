@@ -15,7 +15,8 @@ closed for real:
 - <kbd>SUPER</kbd>+<kbd>SHIFT</kbd>+<kbd>W</kbd>: reopen closed window:
   bring it back, focus it, and cancel its grace period. If the focused window
   is itself a gracefully closed window, that one is reopened instead.
-  Otherwise reopens the most recent gracefully closed window.
+  Otherwise reopens the most recently closed window. Moving a gracefully
+  closed window out of its grace workspace also reopens it.
 - <kbd>SUPER</kbd>+<kbd>SHIFT</kbd>+<kbd>CTRL</kbd>+<kbd>W</kbd>: close window,
   for real, immediately. It can not be reopened again.
 - **Grace period**: time to reopen gracefully closed window before it gets

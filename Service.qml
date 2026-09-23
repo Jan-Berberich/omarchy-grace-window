@@ -884,17 +884,48 @@ Item {
     // An empty clients answer is far more likely a query hiccup than a desktop
     // with no windows at all; never prune on it.
     if (!Array.isArray(list) || list.length === 0) return
-    const alive = new Set()
+    // Address → client map. Beyond liveness, the probe also flags a pending
+    // window that left its grace workspace, which needs the client's current
+    // workspace — carried by the same probe JSON.
+    const whereabouts = new Map()
     for (const win of list) {
-      if (win && win.address) alive.add(win.address)
+      if (win && win.address) whereabouts.set(win.address, win)
     }
     for (let i = root.pending.length - 1; i >= 0; i--) {
       const entry = root.pending[i]
       if (entry.state === "closing" || entry.state === "expiring") continue
-      if (alive.has(entry.address)) continue
-      console.warn(`grace-window: ${entry.address} no longer exists in Hyprland; dropping its pending entry`)
+      const win = whereabouts.get(entry.address)
+      if (!win) {
+        console.warn(`grace-window: ${entry.address} no longer exists in Hyprland; dropping its pending entry`)
+        root.pending.splice(i, 1)
+        continue
+      }
+      // A window moved off its grace workspace (e.g. SUPER+SHIFT+1, dragged to
+      // another monitor, moved into the scratchpad) is not in grace anymore:
+      // the user took it back, so undo its grace look, cancel any queued
+      // auto-close and stop tracking it — it must never be force-closed on a
+      // workspace the user just placed it on.
+      if (root.onGraceWorkspace(entry, win)) continue
+      if (entry.closeTag) {
+        root.cancelQueuedClose(entry.closeTag)
+        entry.closeTag = ""
+      }
+      console.warn(`grace-window: ${entry.address} left its grace workspace; undoing its grace state and dropping its pending entry`)
+      root.restoreInPlace(entry)
       root.pending.splice(i, 1)
     }
+  }
+
+  // Whether the probe-reported window still sits on `entry`'s grace workspace,
+  // matched by workspace id or name. Mirrors the invariant used by the startup
+  // state restore and the post-reopen verify: pending ⇔ still on its grace
+  // workspace. Handles both the object `.workspace` (id + name) and a bare
+  // string/number, like the jq probe.
+  function onGraceWorkspace(entry, win) {
+    const ws = win.workspace || ""
+    const wid = ws && ws.id !== undefined && ws.id !== null ? String(ws.id) : String(ws)
+    const name = ws && ws.name ? String(ws.name) : ""
+    return wid === String(entry.workspace) || name === String(entry.workspace)
   }
 
   // ---------------------------------------------------------------- cancel
