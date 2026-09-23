@@ -369,7 +369,7 @@ Item {
       existing.remaining = graceMs
       // A re-hide that switches buffers (another workspace's workflow) sends the
       // window on a fresh move, so its settled flag resets like a fresh hide;
-      // the movewindow event of that move re-arms it once it lands on the new
+      // the movewindowv2 event of that move re-arms it once it lands on the new
       // grace workspace.
       const rebuffered = existing.workspace !== workspace
       root.rebuffer(existing, workspace)
@@ -394,7 +394,7 @@ Item {
       existing.graceOpacityInactive = graceOpacityInactive
       existing.graceRounding = rounding
       existing.graceRoundingPower = roundingPower
-      root.moveToGraceWorkspace(addr, workspace)
+      root.hideMove(existing, workspace)
       root.graceState(addr, existing.fullscreenClient, graceOpacity, graceOpacityInactive, rounding, roundingPower)
       return "ok"
     }
@@ -441,10 +441,10 @@ Item {
       closeTag: "",
       // False until the window is observed on its grace workspace: straight
       // from the capture when it already sits there, otherwise from the
-      // movewindow event of the hide's own move dispatch. While false a
-      // movewindow away is ignored — the capture was taken at the window's
-      // origin, before the move dispatch queued behind it lands, so a move
-      // away that soon is the hide migration, not a user relocation.
+      // movewindowv2 event of the hide's own move dispatch. While false an
+      // away move is ignored only while that dispatch is still queued (it then
+      // is the hide migration, not a user relocation); a move without one in
+      // flight means the hide never took (see onWindowMoved).
       settled: root.onGracePosition(rec, workspace),
     }
     root.pending.push(entry)
@@ -453,7 +453,7 @@ Item {
       root.dispatchOps(["bash", root.bashScript, "leave-group", addr, String(root.groupingDelay)])
     }
     if (entry.floating) root.setWindowPin(addr, "off")
-    root.moveToGraceWorkspace(addr, workspace)
+    root.hideMove(entry, workspace)
     root.graceState(addr, entry.fullscreenClient, graceOpacity, graceOpacityInactive, rounding, roundingPower)
     return "ok"
   }
@@ -537,6 +537,7 @@ Item {
     // pick it again until the last tagged dispatch settles.
     const restoreTag = "restore:" + entry.address
     entry.state = "restoring"
+    entry.restoreFailed = false
     root.restoring[entry.address] = entry
     root.restoreWindow(entry, target, restoreTag)
     // Join the group that had focus when reopening was triggered.
@@ -630,17 +631,23 @@ Item {
   // Settles the in-flight reopen of the entry in `restoring[address]`. Success
   // keeps the entry out for good (the window is back); a failure verifies
   // where the window actually is before re-queuing, so one that did land (only
-  // a trailing dispatch failed) is never closed by a stale expiry.
+  // a trailing dispatch failed) is never closed by a stale expiry. Failures
+  // accumulate on the shared entry across the tagged dispatches as they settle
+  // one by one, so any failed restore dispatch — not just the last one to
+  // settle — decides whether the reopen really landed the window.
   function settleRestore(tag, success) {
     if (tag.indexOf("restore:") !== 0) return
     const address = tag.slice("restore:".length)
     const entry = root.restoring[address]
     if (!entry) return
+    // Record the failure before the early return, so a bad move is not masked
+    // by the next dispatch settling successfully.
+    if (!success) entry.restoreFailed = true
     for (let i = 0; i < root.queue.length; i++) {
       if (root.queue[i].tag === tag) return  // more restore dispatches queued; keep waiting
     }
     delete root.restoring[address]
-    if (success) {
+    if (!entry.restoreFailed) {
       console.log(`grace-window: reopened ${entry.address}`)
       return
     }
@@ -691,6 +698,7 @@ Item {
       entry.state = entry.remaining <= 0 ? "expiring" : "counting"
       entry.closeTag = ""
       entry.closeFails = 0
+      entry.restoreFailed = false
       entry.settled = true
       // The restore already undid the grace look, so re-apply it — a pending
       // window must not look normal while its auto-close is armed.
@@ -767,8 +775,52 @@ Item {
     root.luaDispatch(`window_to_workspace('${root.luaString(addr)}', '${root.luaString(workspace)}')`, tag)
   }
 
-  function moveToGraceWorkspace(addr, workspace, tag) {
-    root.luaDispatch(`window_to_grace_workspace('${root.luaString(addr)}', '${root.luaString(workspace)}')`, tag)
+  // The hide's own move to its grace workspace, tagged so liveness can tell a
+  // queued migration from a real relocation (see onWindowMoved). Its failure is
+  // attributed: a hide whose move failed before the window was ever observed on
+  // the grace workspace means the hide did not happen, so the grace look is
+  // restored in place and the entry dropped — never a force-close on the
+  // workspace the window actually sits on.
+  function hideMove(entry, workspace) {
+    root.run(["hyprctl", "dispatch", `dofile('${root.luaScript}').window_to_grace_workspace('${root.luaString(entry.address)}', '${root.luaString(workspace)}')`], {
+      tag: "hidemove:" + entry.address,
+      onDone: function (ok) {
+        if (ok) return
+        if (root.hideMovePending(entry.address)) return  // a fresh move is still coming
+        if (root.findPending(entry.address) !== entry) return  // superseded meanwhile
+        if (entry.settled) return  // observed on the grace workspace; the move was redundant
+        root.hidePlaceFailed(entry)
+      },
+    })
+  }
+
+  // Whether a hide-move for `address` is still queued or running: the window is
+  // on its way to its grace workspace and an away event is the migration.
+  function hideMovePending(address) {
+    const tag = "hidemove:" + address
+    if (root.runningItem && root.runningItem.tag === tag) return true
+    for (let i = 0; i < root.queue.length; i++) {
+      if (root.queue[i].tag === tag) return true
+    }
+    return false
+  }
+
+  // A hide never reached its grace workspace (failed move dispatch, or a
+  // movewindowv2 away with no hide-move in flight). Undo the grace look in
+  // place, cancel any queued close and drop the entry — the window stays where
+  // it is, looking normal, untracked and unarmed.
+  function hidePlaceFailed(entry) {
+    for (let i = 0; i < root.pending.length; i++) {
+      if (root.pending[i] !== entry) continue
+      if (entry.closeTag) {
+        root.cancelQueuedClose(entry.closeTag)
+        entry.closeTag = ""
+      }
+      console.warn(`grace-window: ${entry.address} never reached its grace workspace; restoring its grace look in place and dropping its pending entry`)
+      root.restoreInPlace(entry)
+      root.pending.splice(i, 1)
+      return
+    }
   }
 
   function moveWindowTo(addr, x, y, tag) {
@@ -900,7 +952,12 @@ Item {
       root.focusedAddress = root.eventAddress(event)
     } else if (name === "closewindow") {
       root.onWindowClosed(root.eventAddress(event))
-    } else if (name === "movewindow" || name === "movewindowv2") {
+    } else if (name === "movewindowv2") {
+      // Only movewindowv2, never the legacy movewindow: both fire per move, but
+      // movewindow carries (address, workspaceName) while this handler reads
+      // (address, workspaceId, workspaceName), which would misplace the name in
+      // the id slot for custom-named workspaces. movewindowv2 is the disambiguated
+      // form and has existed since before Hyprland 0.55.
       root.onWindowMoved(event)
     }
   }
@@ -943,14 +1000,18 @@ Item {
     }
   }
 
-  // A hidden window changed workspace. Landing on its grace workspace settles
-  // it (re-armed like a fresh hide after a re-buffer); leaving it once settled
-  // means the user took it back — reopen it in place (mode, size and look
-  // restored, but where it now sits untouched), cancel any queued close, and
-  // drop the entry, never force-closing it on the workspace the user put it on.
-  // A window never observed on its grace workspace is still on its way there
-  // (the hide's own move dispatch is in flight), so only a move after settling
-  // counts as a relocation.
+  // A hidden window changed workspace (movewindowv2: address, id, name). Landing
+  // on its grace workspace settles it (re-armed like a fresh hide after a
+  // re-buffer); leaving it once settled means the user took it back — reopen it
+  // in place (mode, size and look restored, but where it now sits untouched),
+  // cancel any queued close, and drop the entry, never force-closing it on the
+  // workspace the user put it on. A window never observed on its grace workspace
+  // is usually still on its way there (the hide's own move dispatch is in
+  // flight), so only a move after settling counts as a relocation. But if no
+  // hide-move for it is queued or running anymore, the away-move is ground
+  // truth: the hide never took — undo its grace look in place and drop the
+  // entry instead of force-closing the window later on the workspace it is
+  // actually on.
   function onWindowMoved(event) {
     let parts = []
     try {
@@ -970,7 +1031,15 @@ Item {
         entry.settled = true
         return
       }
-      if (!entry.settled) return
+      if (!entry.settled) {
+        // An away-move while the hide's own move dispatch is still queued or
+        // running is the migration itself, about to be overridden the moment it
+        // lands on the grace workspace — ignore it. Without a pending hide-move
+        // the window is not on (and will not get to) its grace workspace.
+        if (root.hideMovePending(address)) return
+        root.hidePlaceFailed(entry)
+        return
+      }
       if (entry.closeTag) {
         root.cancelQueuedClose(entry.closeTag)
         entry.closeTag = ""
@@ -983,7 +1052,7 @@ Item {
   }
 
   // Whether the window is on `workspace`'s id or name, be it a hyprctl capture
-  // ({ workspaceId, workspaceName }) or a movewindow event ({ workspaceId,
+  // ({ workspaceId, workspaceName }) or the movewindowv2 event ({ workspaceId,
   // workspaceName }). Mirrors the invariant used everywhere: pending ⇔ still on
   // its grace workspace.
   function onGracePosition(rec, workspace) {
