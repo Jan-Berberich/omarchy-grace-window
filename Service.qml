@@ -21,10 +21,16 @@
 // state survives service lifecycles (saved on teardown, restored on start);
 // the managed keybinding block is wired into ~/.config/hypr/bindings.lua on
 // start and removed on teardown.
+//
+// Focus, liveness and workspace moves are tracked from Hyprland's event socket
+// (Quickshell's Hyprland rawEvent) instead of polling, so the grace timer only
+// counts down and never queries the compositor; the one startup focus query
+// seeds it because events only fire on changes.
 
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import Quickshell.Hyprland
 
 Item {
   id: root
@@ -62,7 +68,7 @@ Item {
   //   expiring   grace ran out; the close is queued but a reopen can still win,
   //   closing    the close dispatch runs; the entry leaves on success,
   //   restoring  held in `restoring` while its reopen dispatches run.
-  // Windows gone from Hyprland are pruned by the liveness probe. `closeFails`
+  // Windows gone from Hyprland are pruned by its closewindow event. `closeFails`
   // counts consecutive failed closes; past closeRetryMax the look is restored
   // in place and the entry is dropped instead of stranded.
   property var pending: []
@@ -115,11 +121,11 @@ Item {
 
   // ------------------------------------------------------- the single executor
   // Every hyprctl call — window dispatch, hide/reopen query, startup load,
-  // sweep probe — runs through ONE serial FIFO drained by one Process. A
-  // command must run in the order it was asked for, so the queue is strict
-  // FIFO; the sweep's sample probes and the operational queries all share it,
-  // which removes the separate opBusy/opToken machinery and the class of races
-  // between parallel runners entirely.
+  // startup focus query — runs through ONE serial FIFO drained by one Process.
+  // A command must run in the order it was asked for, so the queue is strict
+  // FIFO and the operational queries all share it, which removes the separate
+  // opBusy/opToken machinery and the class of races between parallel runners
+  // entirely.
   //
   // Each item is { args, tag, onDone, done }. Tags let a reopen's restore be
   // attributed as a whole and the sweep's queued close be cancelled by a
@@ -138,9 +144,6 @@ Item {
   property var queue: []
   property var runningItem: null
   property bool abortPending: false
-  // Sweep probes never stack: only one queued/running probe per key, so a
-  // slow hyprctl cannot pile up probes behind the queue.
-  property var probeInFlight: ({})
 
   function run(args, opts) {
     const tag = (opts && opts.tag) || ""
@@ -279,20 +282,6 @@ Item {
     })
   }
 
-  // One-shot probe, keyed so it never stacks; failures keep the last good
-  // state.
-  function enqueueProbe(key, args, parser) {
-    if (root.probeInFlight[key]) return
-    root.probeInFlight[key] = true
-    root.run(args, {
-      tag: "probe:" + key,
-      onDone: function (ok, text) {
-        delete root.probeInFlight[key]
-        if (ok) parser(text)
-      },
-    })
-  }
-
   // ----------------------------------------------------------- hide path
   // The call hands off synchronously; the real verdict surfaces on the `result`
   // signal. Unusable arguments are rejected up front: a NaN or negative period
@@ -380,7 +369,8 @@ Item {
       existing.remaining = graceMs
       // A re-hide that switches buffers (another workspace's workflow) sends the
       // window on a fresh move, so its settled flag resets like a fresh hide;
-      // the liveness probe re-arms it once it is back on the grace workspace.
+      // the movewindow event of that move re-arms it once it lands on the new
+      // grace workspace.
       const rebuffered = existing.workspace !== workspace
       root.rebuffer(existing, workspace)
       if (rebuffered) existing.settled = false
@@ -449,12 +439,13 @@ Item {
       state: "counting",
       closeFails: 0,
       closeTag: "",
-      // False until the liveness probe has observed the window on its grace
-      // workspace. While false a "not on the grace workspace" probe verdict is
-      // ignored, because the probe can land between this entry's creation and
-      // its move dispatch — reading the window still on its origin workspace
-      // and mistaking its own hide migration for a user relocation.
-      settled: false,
+      // False until the window is observed on its grace workspace: straight
+      // from the capture when it already sits there, otherwise from the
+      // movewindow event of the hide's own move dispatch. While false a
+      // movewindow away is ignored — the capture was taken at the window's
+      // origin, before the move dispatch queued behind it lands, so a move
+      // away that soon is the hide migration, not a user relocation.
+      settled: root.onGracePosition(rec, workspace),
     }
     root.pending.push(entry)
     const grouped = Array.isArray(rec.grouped) ? rec.grouped : []
@@ -541,7 +532,8 @@ Item {
       entry.closeTag = ""
     }
     // Hold the entry in `restoring` while its tagged dispatches run: the sweep
-    // cannot expire it, the liveness probe cannot prune it and reopen cannot
+    // cannot expire it, Hyprland's closewindow event cannot prune it and
+    // reopen cannot
     // pick it again until the last tagged dispatch settles.
     const restoreTag = "restore:" + entry.address
     entry.state = "restoring"
@@ -618,7 +610,7 @@ Item {
   }
 
   // Full reopen minus every move: for a pending window that left its grace
-  // workspace on its own (see onClientsRead) — the user already relocated it,
+  // workspace on its own (see onWindowMoved) — the user already relocated it,
   // so unlike restoreInPlace this also gives back the window's captured mode,
   // size and pin (the force-tiling of grace goes away again), but unlike
   // restoreWindow it never moves it to the workspace it was hidden from and
@@ -869,11 +861,10 @@ Item {
     const snapshot = root.pending.slice()
     for (let i = 0; i < snapshot.length; i++) {
       const entry = snapshot[i]
-      // Expired windows close for real, regardless of focus. The close is
-      // queued at the end of this sweep, behind the probes below, so a window
-      // relocated during its expiring window is rescued by onClientsRead
-      // before the dispatch is ever submitted.
-      if (entry.state === "expiring") continue
+      // A close already handed to the process owns the entry's fate; one
+      // expired but still queued stays expiring until a reopen or a
+      // movewindow-away rescues it before the close dispatches.
+      if (entry.state === "expiring" || entry.state === "closing") continue
       // The timer pauses while the hidden window holds focus.
       if (entry.address === root.focusedAddress) continue
       entry.remaining -= delta
@@ -882,24 +873,11 @@ Item {
       // interval still wins — the close is only submitted on a later tick.
       entry.state = "expiring"
     }
-    // Sample the focused window and whether hidden windows still exist, so one
-    // closed by other means leaves pending without waiting out its grace.
-    root.enqueueProbe("focus", ["hyprctl", "-j", "activewindow"], function (text) {
-      root.onFocusRead(text)
-    })
-    // Probe while expiring windows exist too: one that left its grace workspace
-    // between expiry and its queued close must be rescued (see onClientsRead)
-    // before the close is handed to the process.
-    if (root.pending.some(entry => entry.state === "counting" || entry.state === "expiring")) {
-      root.enqueueProbe("clients", ["hyprctl", "-j", "clients"], function (text) {
-        root.onClientsRead(text)
-      })
-    }
-    // Queue each expiring auto-close behind the probes above (and any probe
-    // still queued from a previous tick): onClientsRead must observe the
-    // window — and cancel the close of one that left the grace workspace —
-    // before the item pops. `closing` only marks when pump() hands the close
-    // to the process, so a queued close stays cancellable its whole wait.
+    // Queue each expiring auto-close. A reopen or a movewindow-away still
+    // cancels one while it waits; `closing` only marks when pump() hands the
+    // close to the process, so the queued close stays cancellable its whole
+    // wait. Liveness and workspace tracking come from Hyprland's events, so
+    // the sweep itself never queries the compositor.
     for (let i = 0; i < root.pending.length; i++) {
       const entry = root.pending[i]
       if (entry.state !== "expiring" || entry.closeTag) continue
@@ -908,85 +886,109 @@ Item {
     }
   }
 
-  function onFocusRead(raw) {
-    const win = root.parseJson(raw)
-    if (!win) {
-      root.focusedAddress = ""
-      return
-    }
-    const addr = win.address || ""
-    root.focusedAddress = addr === "0x0" ? "" : addr
+  // ------------------------------------------------------- Hyprland events
+  // Focus, liveness and workspace moves arrive as push events from Quickshell's
+  // Hyprland socket, so the sweep no longer samples the compositor every tick.
+  Connections {
+    target: Hyprland
+    function onRawEvent(event) { root.onHyprEvent(event) }
   }
 
-  function onClientsRead(raw) {
-    const list = root.parseJson(raw)
-    // An empty clients answer is far more likely a query hiccup than a desktop
-    // with no windows at all; never prune on it.
-    if (!Array.isArray(list) || list.length === 0) return
-    // Address → client map. Beyond liveness, the probe also flags a pending
-    // window that left its grace workspace, which needs the client's current
-    // workspace — carried by the same probe JSON.
-    const whereabouts = new Map()
-    for (const win of list) {
-      if (win && win.address) whereabouts.set(win.address, win)
+  function onHyprEvent(event) {
+    const name = event && event.name ? String(event.name) : ""
+    if (name === "activewindowv2") {
+      root.focusedAddress = root.eventAddress(event)
+    } else if (name === "closewindow") {
+      root.onWindowClosed(root.eventAddress(event))
+    } else if (name === "movewindow" || name === "movewindowv2") {
+      root.onWindowMoved(event)
     }
-    for (let i = root.pending.length - 1; i >= 0; i--) {
+  }
+
+  // Hyprland's event socket sends addresses as bare lowercase hex
+  // (e.g. "5fba0c5f"), while hyprctl's JSON answers embed the same address
+  // with a "0x" prefix. Normalize so the two always compare equal.
+  function eventAddress(event) {
+    let addr = ""
+    try {
+      if (event && event.parse) {
+        const parts = event.parse(1)
+        if (parts && parts.length > 0) addr = parts[0]
+      }
+    } catch (e) { }
+    return root.normalizeAddress(addr)
+  }
+
+  function normalizeAddress(address) {
+    address = String(address || "").trim()
+    if (address === "" || address === "0" || address === "0x0") return ""
+    if (address.indexOf("0x") === 0 || address.indexOf("0X") === 0) return address.toLowerCase()
+    return /^[0-9a-f]+$/.test(address) ? "0x" + address : address
+  }
+
+  // A window vanished (closed in any way) — no close of ours is needed, drop
+  // its pending entry and any close we still have queued for it.
+  function onWindowClosed(address) {
+    if (address === "") return
+    for (let i = 0; i < root.pending.length; i++) {
+      if (root.pending[i].address !== address) continue
       const entry = root.pending[i]
-      // A close already handed to the process cannot be undone; this probe
-      // cannot rescue it either way, so only `closing` is skipped.
-      if (entry.state === "closing") continue
-      const win = whereabouts.get(entry.address)
-      if (!win) {
-        // A window gone from Hyprland needs no close: drop a queued one so the
-        // teardown of its empty entry does not idle on a pointless dispatch.
-        if (entry.closeTag) {
-          root.cancelQueuedClose(entry.closeTag)
-          entry.closeTag = ""
-        }
-        console.warn(`grace-window: ${entry.address} no longer exists in Hyprland; dropping its pending entry`)
-        root.pending.splice(i, 1)
-        continue
-      }
-      // A window moved off its grace workspace (e.g. switched away with
-      // SUPER+SHIFT+1, moved into the scratchpad, or dragged onto a monitor
-      // showing a different workspace) is not in grace anymore: the user took
-      // it back — reopen it in place (its mode, size and look restored, but
-      // where it now sits untouched) and cancel any queued auto-close; it must
-      // never be force-closed on a workspace the user just placed it on.
-      // Expired windows count here too: their close is only queued (or not yet
-      // submitted), so one that moved away while `expiring` is still rescued
-      // exactly like a `counting` one.
-      if (root.onGraceWorkspace(entry, win)) {
-        // The window is where grace expects it; once observed there, a later
-        // observation elsewhere is evidence the user really relocated it.
-        entry.settled = true
-        continue
-      }
-      // A pending window never observed on its grace workspace is still on its
-      // way there (a probe queued mid-hide can read the window on its origin,
-      // before the move it enqueued behind itself runs); do not yet call it
-      // "left". Only a relocation after settling on the grace workspace counts.
-      if (!entry.settled) continue
       if (entry.closeTag) {
         root.cancelQueuedClose(entry.closeTag)
         entry.closeTag = ""
       }
-      console.warn(`grace-window: ${entry.address} left its grace workspace; reopening it in place and dropping its pending entry`)
-      root.reopenInPlace(entry)
+      console.warn(`grace-window: ${address} no longer exists in Hyprland; dropping its pending entry`)
       root.pending.splice(i, 1)
+      return
     }
   }
 
-  // Whether the probe-reported window still sits on `entry`'s grace workspace,
-  // matched by workspace id or name. Mirrors the invariant used by the startup
-  // state restore and the post-reopen verify: pending ⇔ still on its grace
-  // workspace. Handles both the object `.workspace` (id + name) and a bare
-  // string/number, like the jq probe.
-  function onGraceWorkspace(entry, win) {
-    const ws = win.workspace || ""
-    const wid = ws && ws.id !== undefined && ws.id !== null ? String(ws.id) : String(ws)
-    const name = ws && ws.name ? String(ws.name) : ""
-    return wid === String(entry.workspace) || name === String(entry.workspace)
+  // A hidden window changed workspace. Landing on its grace workspace settles
+  // it (re-armed like a fresh hide after a re-buffer); leaving it once settled
+  // means the user took it back — reopen it in place (mode, size and look
+  // restored, but where it now sits untouched), cancel any queued close, and
+  // drop the entry, never force-closing it on the workspace the user put it on.
+  // A window never observed on its grace workspace is still on its way there
+  // (the hide's own move dispatch is in flight), so only a move after settling
+  // counts as a relocation.
+  function onWindowMoved(event) {
+    let parts = []
+    try {
+      if (event && event.parse) parts = event.parse(3)
+    } catch (e) { }
+    const address = root.normalizeAddress(parts[0] || "")
+    if (address === "") return
+    const wsId = String(parts[1] || "")
+    const wsName = String(parts[2] || "")
+    for (let i = 0; i < root.pending.length; i++) {
+      const entry = root.pending[i]
+      if (entry.address !== address) continue
+      // A close already handed to the process cannot be undone; only `closing`
+      // is exempt, a queued close is still cancellable.
+      if (entry.state === "closing") return
+      if (root.onGracePosition({ workspaceId: wsId, workspaceName: wsName }, entry.workspace)) {
+        entry.settled = true
+        return
+      }
+      if (!entry.settled) return
+      if (entry.closeTag) {
+        root.cancelQueuedClose(entry.closeTag)
+        entry.closeTag = ""
+      }
+      console.warn(`grace-window: ${address} left its grace workspace; reopening it in place and dropping its pending entry`)
+      root.reopenInPlace(entry)
+      root.pending.splice(i, 1)
+      return
+    }
+  }
+
+  // Whether the window is on `workspace`'s id or name, be it a hyprctl capture
+  // ({ workspaceId, workspaceName }) or a movewindow event ({ workspaceId,
+  // workspaceName }). Mirrors the invariant used everywhere: pending ⇔ still on
+  // its grace workspace.
+  function onGracePosition(rec, workspace) {
+    return (rec.workspaceId !== undefined && rec.workspaceId !== null && String(rec.workspaceId) === String(workspace)) ||
+           (rec.workspaceName !== undefined && rec.workspaceName !== null && String(rec.workspaceName) === String(workspace))
   }
 
   // ---------------------------------------------------------------- cancel
@@ -1367,7 +1369,7 @@ Item {
         closeTag: "",
         // The state probe already verified this window sits on its saved grace
         // workspace, so no hide migration is in flight; the settled flag is
-        // armed for the liveness probe right away.
+        // armed so a movewindow away counts as a relocation right away.
         settled: true,
       }
       root.pending.push(entry)
@@ -1393,6 +1395,16 @@ Item {
     root.luaDispatch("check()")
   }
 
+  // One-shot query through the executor: Hyprland only pushes activewindowv2
+  // on focus *changes*, so a restored window that already holds focus (and its
+  // grace countdown, which pauses while focused) must be checked at start.
+  function hydrateFocus() {
+    root.runOpQuery(["hyprctl", "-j", "activewindow"]).then(function (raw) {
+      const win = root.parseJson(raw)
+      root.focusedAddress = win && win.address ? root.normalizeAddress(win.address) : ""
+    })
+  }
+
   // ---------------------------------------------------------------- startup
   Component.onCompleted: {
     // The shell assigns root.manifest after creating this service, so defer
@@ -1401,6 +1413,7 @@ Item {
     Qt.callLater(root.wireBindings)
     Qt.callLater(root.installUnwireScript)
     Qt.callLater(root.loadState)
+    Qt.callLater(root.hydrateFocus)
     Qt.callLater(root.selfCheck)
   }
 

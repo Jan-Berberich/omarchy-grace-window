@@ -15,6 +15,8 @@ def firstOrNull: if length == 0 then null else .[0] end;
 def hideQuery($opacity; $opacityInactive; $rounding; $roundingPower):
   {
     address: .address,
+    workspaceId: ((.workspace.id // 0) | tostring),
+    workspaceName: (.workspace.name // ""),
     opacity: $opacity,
     opacityInactive: $opacityInactive,
     rounding: $rounding,

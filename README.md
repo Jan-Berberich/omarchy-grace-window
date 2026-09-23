@@ -46,7 +46,7 @@ background script.
 | File | Purpose |
 |------|---------|
 | `manifest.json` | Omarchy plugin manifest (schema v1, kind `service`) |
-| `Service.qml` | The service: IPC handlers, a single serial hyprctl dispatch queue (with watchdog), the grace sweep, and automatic wiring of the keybindings on start / unwiring on teardown |
+| `Service.qml` | The service: IPC handlers, a single serial hyprctl dispatch queue (with watchdog), an event-driven grace tracker (focus, liveness and workspace moves come from Hyprland's event socket, so the timer never probes), and automatic wiring of the keybindings on start / unwiring on teardown |
 | `hypr/bindings.lua` | The keybindings, wrapped in the managed block the service copies on start |
 | `scripts/*` | `.sh`, `.lua`, `.jq` and `.awk` scripts backing the service |
 
@@ -150,8 +150,8 @@ such workflows can coexist.
   window in place. It does not move or close them.
 - Re-hiding a window always restarts its full grace period, so `status`
   reports the fresh pending seconds. A pending window that is gone from
-  Hyprland for any other reason (closed on its own, crashed) is dropped by the
-  sweep's periodic probe, so `status` never counts a window that no longer
+  Hyprland for any other reason (closed on its own, crashed) is dropped by its
+  `closewindow` event, so `status` never counts a window that no longer
   exists.
 - Uses Hyprland's Lua dispatcher syntax
   (e.g. `hl.dsp.window.close({ window = "address:..." })`),
