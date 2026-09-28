@@ -156,4 +156,17 @@ such workflows can coexist.
 - Uses Hyprland's Lua dispatcher syntax
   (e.g. `hl.dsp.window.close({ window = "address:..." })`),
   which needs Hyprland >= 0.55 (present in Omarchy 4.x).
+- Every file the plugin writes (the managed keybinding block, the teardown
+  copy of the scripts, the saved state) is written through a directory
+  descriptor that was opened and checked beforehand and then kept open, and is
+  published with an atomic rename from a randomly named temporary file in that
+  same directory. A name swapped for a symlink, a directory replaced while the
+  plugin is working, or a temporary name planted in advance therefore cannot
+  redirect a write onto a file of someone else's choosing; if the target is
+  replaced underneath the plugin it is left untouched and the command fails.
+  For the same reason the script refuses to write when a path component is a
+  symlink, when a directory in the path is group/other writable, or when the
+  target is not a regular file owned by you (or root). This means a symlinked
+  `~/.config/hypr` (through, say, a dotfiles manager) is the one setup that
+  stops working, because every component is required to be a real directory.
 - Validated with `omarchy plugin validate`.
