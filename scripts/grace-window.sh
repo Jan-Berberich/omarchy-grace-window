@@ -25,7 +25,9 @@
 #
 # Every read, write and replacement of a file is done relative to an open
 # directory descriptor rather than to a pathname (see "descriptor-bound paths"),
-# so a checked path cannot be swapped for another one behind our back.
+# so a checked path cannot be swapped for another one behind our back - and no
+# name is ever opened in a way that could wait for something (a fifo, say) to
+# happen, so a swap can cost at most a failed command, never a wedged service.
 set -u
 
 # Physical path of this script's directory: a plugin directory reached through a
@@ -37,6 +39,14 @@ self="$(phys_dir "$(dirname -- "$script_path")")"
 tmpfile=""
 me_uid=""
 proc_seen=""
+# How long a read-only open in a child (open_file_in_child) may take before it
+# counts as stuck. Comfortably under the service's own 10s watchdog, so a name
+# that blocks is reported as an error by this script instead of the whole
+# command being killed from the outside.
+open_wait=5
+# The children holding a descriptor open on our behalf, killed and reaped by
+# release_holders on every way out.
+declare -a holder_pids=()
 # Descriptor state, filled in by the helpers below and used by the commands.
 # DIR_PATH is the pinned directory ("/proc/self/fd/$DIR_FD"), FILE_PATH the
 # pinned file in it, SELF_PATH this script's own directory.
@@ -78,15 +88,31 @@ lua_call() {
 # symlink swapped in for bindings.lua, or an ancestor directory replaced
 # altogether, can no longer redirect the read, the write or the rename.
 #
-# Two properties make the binding work:
-#   * Components are opened one at a time, each relative to the descriptor of
+# Three properties make the binding work:
+#   * Components are entered one at a time, each relative to the descriptor of
 #     the one before it, and the object a new descriptor resolves to must be
 #     the very inode the check just saw (same device, same inode). A component
-#     replaced between check and open is thus either caught or has no effect.
+#     replaced between check and enter is thus either caught or has no effect.
 #   * The descriptors stay open in this shell and every child inherits them, so
 #     /proc/self/fd/N names the same open file here and in grep, awk, sed, cat,
 #     mktemp or mv. Those paths only exist while we hold the descriptor and are
 #     never passed to a process that outlives this command.
+#   * No name is opened in a way that can wait. bash opens read-only or
+#     read-write and nothing else, and of the two exactly one returns at once
+#     whatever the name resolves to: a fifo opened read-write does not wait for
+#     a writer, the same fifo opened read-only does. A fifo swapped in for
+#     bindings.lua, or for a directory in its path, would therefore wedge this
+#     script inside open() - before the inode check could run at all, and with
+#     the state the checks exist to protect not yet touched. Nothing here may
+#     wait, because nothing here is waited for: a wedged script wedges the
+#     service with it, and the teardown that unwires the keybindings runs with
+#     no watchdog left to kill it. So a directory is entered with cd (which
+#     answers ENOTDIR for a fifo instead of waiting for one) and pinned through
+#     /proc/self/cwd, and a file is opened read-write - or, when it may not be
+#     written at all, in a child that is waited for with a bound and killed when
+#     it does not come back. A name that turns out to be a fifo is then a failed
+#     command, which the callers already report and recover from, and never a
+#     service that stops answering.
 #
 # Opening a directory needs read permission on it (O_RDONLY); every directory
 # involved here — $HOME, ~/.config, ~/.config/hypr, the runtime dir — is.
@@ -133,12 +159,59 @@ refuse_unless_safe() {
   fi
 }
 
-# One component of a directory chain: check CUR/COMP without following it, open
-# it, and prove the descriptor is the object that was checked. Sets DIR_FD and
-# DIR_PATH to the new descriptor. Returns 1 when there is no directory there to
-# operate on (missing, or not a directory at all), and dies on a path that is
-# refused: a symlinked component, a foreign or group/other writable owner, or a
-# component that changed between the check and the open.
+# Enter a directory and pin it, without ever opening its name. `builtin cd` is
+# the only way into a directory that cannot block: chdir(2) fails on a fifo with
+# ENOTDIR instead of waiting for a writer, and the descriptor is then taken from
+# /proc/self/cwd, which names the directory the shell is sitting in rather than
+# the name it walked - so whatever replaced that name in the meantime has no say
+# in the open at all. The way back is an inode as well: the working directory
+# this shell started in is pinned the same way and entered again through its own
+# descriptor, which is what keeps several pins independent of each other and of
+# every name in the path. PWD and OLDPWD are put back by hand afterwards, since
+# the round trip goes through /proc and would otherwise leave the shell sitting
+# in /proc/self/fd/7.
+#
+# Sets DIR_FD and DIR_PATH to the new descriptor. Returns 1 when PATH is not a
+# directory to operate on at all (missing, or a fifo or anything else that is
+# not a directory) and 2 when it is one but cannot be opened for reading.
+pin_entered_dir() {
+  local path="$1" back saved_pwd saved_oldpwd fd
+  ensure_proc
+  # Nothing is pinned until the dance below succeeds, so a failure cannot leave
+  # a caller holding the previous call's descriptor.
+  DIR_FD=""
+  DIR_PATH=""
+  # /proc/self/cwd is a magic link to the current directory, so this open names
+  # an inode directly: it cannot be redirected, and it cannot block either.
+  exec {back}</proc/self/cwd || return 2
+  saved_pwd=$PWD
+  saved_oldpwd=${OLDPWD-}
+  # cd's own complaint is dropped: there is nothing to add to it, and this
+  # function reports what happened in the caller's words.
+  if ! builtin cd -- "$path" 2>/dev/null; then
+    eval "exec ${back}>&-"
+    return 1
+  fi
+  if ! exec {fd}</proc/self/cwd; then
+    builtin cd -- "/proc/self/fd/$back" 2>/dev/null
+    eval "exec ${back}>&-"
+    return 2
+  fi
+  builtin cd -- "/proc/self/fd/$back" || die "cannot return to the working directory"
+  eval "exec ${back}>&-"
+  PWD=$saved_pwd
+  if [[ -n "$saved_oldpwd" ]]; then OLDPWD=$saved_oldpwd; else unset OLDPWD; fi
+  DIR_FD=$fd
+  DIR_PATH="/proc/self/fd/$fd"
+}
+
+# One component of a directory chain: check CUR/COMP without following it, enter
+# and pin it, and prove the descriptor is the object that was checked. Sets
+# DIR_FD and DIR_PATH to the new descriptor. Returns 1 when there is no
+# directory there to operate on (missing, or not a directory at all), and dies
+# on a path that is refused: a symlinked component, a foreign or group/other
+# writable owner, a directory that cannot be opened for reading, or a component
+# that changed between the check and the enter.
 #
 # No component may be a symlink, not even one the user put there: the whole
 # point is that a name cannot be pointed somewhere else between the check and
@@ -146,9 +219,8 @@ refuse_unless_safe() {
 # the two arguments that name such a directory (this script's own, and the
 # source block's) are resolved to their physical path first.
 open_dir_at() {
-  local cur="$1" comp="$2" info finfo dev ino uid mode type
-  local fdev fino fuid fmode ftype fd
-  ensure_proc
+  local cur="$1" comp="$2" info finfo dev ino uid mode typebits fd
+  local fdev fino fuid fmode ftype
   # A missing component is an ordinary answer here (return 1, quietly): the
   # callers decide whether that means "nothing to do" or "refuse".
   info=$(lstat_info "$cur$comp" 2>/dev/null) || return 1
@@ -157,18 +229,22 @@ open_dir_at() {
     die "refusing to write: $cur$comp is a symlink"
   fi
   is_dir_mode "$typebits" || return 1
-  exec {fd}<"$cur$comp" || die "cannot open directory $cur$comp"
+  pin_entered_dir "$cur$comp"
+  case $? in
+    0) ;;
+    1) return 1 ;;
+    *) die "cannot open directory $cur$comp" ;;
+  esac
+  fd=$DIR_FD
   # The descriptor must resolve to the object that was just checked, not to
   # whatever replaced it in the meantime.
   finfo=$(fstat_info "$fd") || die "cannot inspect directory $cur$comp"
-  read -r fdev fino fuid fmode ftypebits <<< "$finfo"
-  if [[ "$fdev" != "$dev" || "$fino" != "$ino" ]] || ! is_dir_mode "$ftypebits"; then
+  read -r fdev fino fuid fmode ftype <<< "$finfo"
+  if [[ "$fdev" != "$dev" || "$fino" != "$ino" ]] || ! is_dir_mode "$ftype"; then
     eval "exec ${fd}>&-"
     die "refusing to write: $cur$comp changed while it was being opened"
   fi
   refuse_unless_safe "$cur$comp" "$fuid" "$fmode" "directory"
-  DIR_FD=$fd
-  DIR_PATH="/proc/self/fd/$fd"
 }
 
 # Open a directory path component by component, each one relative to the
@@ -236,38 +312,159 @@ ensure_dir_chain() {
   [[ -n "$DIR_FD" ]]
 }
 
-# Open a plain file in the pinned directory and keep its descriptor, so the
-# reads that follow address the inode that was checked. NAME is the entry in
-# the pinned directory, WHAT the same entry is called for in messages.
+# Open a plain file in a pinned directory and keep a descriptor on it, so the
+# reads that follow address the inode that was checked and not whatever the name
+# points at afterwards.
+#   DIR   the pinned directory   NAME entry in it   WHAT the same entry is
+#         called for in messages
 # Returns 1 when there is no such entry; dies when the entry exists but may not
-# be touched (a symlink, a directory, a device node, a foreign owner). Sets
-# FILE_FD, FILE_PATH and the FILE_DEV / FILE_INO / FILE_MODE of that inode.
-open_file_in_dir() {
-  local name="$1" what="${2:-$1}" info finfo dev ino uid mode type fd
+# be touched (a symlink, a directory, a device node, a foreign owner) or when it
+# is not the object it was checked to be. Sets FILE_FD (empty when a child holds
+# the descriptor instead), FILE_PATH and that inode's FILE_DEV / FILE_INO /
+# FILE_MODE.
+#
+# The open cannot block, which is the whole reason it is written this way round.
+# Check-then-open leaves a window in which a name can be replaced; the check that
+# follows the open is what catches that, and it only ever runs if the open
+# returned. Opening read-only would not return for a fifo: open(2) waits for a
+# writer that a service nobody is serving will never see, so the window would
+# not be a rejected open but a script that stops existing mid-command. So:
+#   * a file that may be written is opened read-write, which returns at once
+#     whatever it finds; a fifo that replaced it is then refused by the fstat
+#     below, and a directory that replaced it fails the open outright
+#   * a file that may not be written can only be opened read-only, so its open
+#     is delegated to a child that is waited for with a bound (open_file_in_child)
+# [[ -w ]] only picks between the two, so a file whose permissions change in
+# between costs a slower open or a failed one, never a wrong decision about
+# safety: the descriptor is checked either way.
+open_file_at() {
+  local dir="$1" name="$2" what="${3:-$2}" path
+  local info finfo dev ino uid mode typebits fd
   local fdev fino fuid fmode ftype
+  # Built separately: a word on a `local` line is expanded before the builtin
+  # runs, so "$dir/$name" there would still be the caller's directory.
+  path="$dir/$name"
+  ensure_proc
   FILE_FD=""
   FILE_PATH=""
   FILE_DEV=""
   FILE_INO=""
   FILE_MODE=""
-  info=$(lstat_info "$DIR_PATH/$name" 2>/dev/null) || return 1
+  info=$(lstat_info "$path" 2>/dev/null) || return 1
   read -r dev ino uid mode typebits <<< "$info"
   is_symlink_mode "$typebits" && die "refusing to write: $what is a symlink"
   is_regular_mode "$typebits" || die "refusing to write: $what is not a regular file"
-  exec {fd}<"$DIR_PATH/$name" || die "cannot open $what"
-  finfo=$(fstat_info "$fd") || die "cannot inspect $what"
-  read -r fdev fino fuid fmode ftypebits <<< "$finfo"
-  if [[ "$fdev" != "$dev" || "$fino" != "$ino" ]] || ! is_regular_mode "$ftypebits"; then
-    eval "exec ${fd}>&-"
+  if [[ -w "$path" ]]; then
+    exec {fd}<>"$path" || die "cannot open $what"
+    finfo=$(fstat_info "$fd") || die "cannot inspect $what"
+    read -r fdev fino fuid fmode ftype <<< "$finfo"
+    if [[ "$fdev" != "$dev" || "$fino" != "$ino" ]] || ! is_regular_mode "$ftype"; then
+      eval "exec ${fd}>&-"
+      die "refusing to write: $what changed while it was being opened"
+    fi
+    refuse_unless_safe "$what" "$fuid" "$fmode" "regular file"
+    FILE_FD=$fd
+    FILE_PATH="/proc/self/fd/$fd"
+    FILE_DEV=$fdev
+    FILE_INO=$fino
+    FILE_MODE=$fmode
+    return 0
+  fi
+  open_file_in_child "$path" "$what" "$dev" "$ino"
+}
+
+# Open PATH read-only in a child, for the files open_file_at cannot open
+# read-write. The child reports what it got and then parks, so the descriptor it
+# opened stays open for us as /proc/PID/fd/9 for as long as we hold the pipe
+# that keeps it parked.
+#
+# This is the one place where a name is opened the way that can wait, so the
+# wait for it is ours and it is bounded: a name that never finishes opening costs
+# open_wait seconds and a clear error, instead of a service that has stopped.
+# The child is given the path by variable, never on its standard input, which it
+# is busy reading; what it reports is compared against the inode that was checked
+# before it is used for anything.
+#
+# want_dev/want_ino are the inode the name resolved to when it was checked: the
+# child may well be looking at a different object by now, and that is the
+# question the child exists to answer.
+open_file_in_child() {
+  local path="$1" what="$2" want_dev="$3" want_ino="$4"
+  local pid out report rc fdev fino fuid fmode ftype
+  coproc GW_HOLDER {
+    # The child's own open error would land in our output and be read as a
+    # report; dropping it leaves the parent with an empty read, which is a
+    # failure it can tell apart from a success.
+    { exec 9<"$path"; } 2>/dev/null || exit 1
+    stat -L -c "%d %i %u %a %f" /proc/self/fd/9 2>/dev/null || exit 1
+    # Park on stdin: it is the pipe this shell holds the other end of, so the
+    # child lives as long as we need it and sees eof (and leaves) when this
+    # command is done, rather than outliving the script that spawned it.
+    read -r _ || :
+  }
+  # Coproc state is per-name and the next coproc would take it over, so the
+  # child's pid and pipe are taken out of it at once.
+  pid=${GW_HOLDER_PID:-}
+  out=${GW_HOLDER[0]:-}
+  [[ -n "$pid" && -n "$out" ]] || die "cannot open $what"
+  holder_pids+=("$pid")
+  rc=0
+  # The read is wrapped so that a pipe bash has already closed (the child gone)
+  # fails quietly instead of printing a shell diagnostic into the output.
+  { IFS= read -r -t "$open_wait" report <&"$out"; } 2>/dev/null || rc=$?
+  if (( rc != 0 )); then
+    release_holder "$pid"
+    # A timed-out read is how a blocked open shows up here; a plain failure is
+    # a child that could not open the name at all and did say so.
+    if (( rc > 128 )); then
+      die "refusing to write: $what did not open within ${open_wait}s; left untouched (a fifo in place of a file?)"
+    fi
+    die "cannot open $what"
+  fi
+  read -r fdev fino fuid fmode ftype <<< "$report"
+  if [[ "$fdev" != "$want_dev" || "$fino" != "$want_ino" ]] || ! is_regular_mode "$ftype"; then
+    release_holder "$pid"
     die "refusing to write: $what changed while it was being opened"
   fi
+  # The child reports the object it opened, so the ownership and mode are those
+  # of the inode we are about to read, not of a name that may since have moved.
   refuse_unless_safe "$what" "$fuid" "$fmode" "regular file"
-  FILE_FD=$fd
-  FILE_PATH="/proc/self/fd/$fd"
+  FILE_PATH="/proc/$pid/fd/9"
   FILE_DEV=$fdev
   FILE_INO=$fino
   FILE_MODE=$fmode
 }
+
+# open_file_in_dir NAME [WHAT]: open_file_at in the directory pinned by the
+# current command.
+open_file_in_dir() {
+  open_file_at "$DIR_PATH" "$1" "${2:-$1}"
+}
+
+# Stop a holder child. Killing it closes the descriptor it was holding for us —
+# /proc/PID/fd/9 goes with it, so the caller must be done with FILE_PATH first —
+# and waiting reaps it. The child is our own and is still parked when we get
+# here, so the pid is the child's and not a stranger's.
+release_holder() {
+  local pid="$1"
+  [[ -n "$pid" ]] || return 0
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
+# Stop every holder child on the way out, so none of them outlives the command
+# that needed the file — including when this script is killed rather than
+# returning, which is the case that matters most: the teardown path has no
+# watchdog behind it to clean up after a wedged process.
+release_holders() {
+  local pid
+  for pid in "${holder_pids[@]:-}"; do
+    release_holder "$pid"
+  done
+  holder_pids=()
+}
+trap release_holders EXIT
+trap 'exit 1' HUP INT TERM
 
 # Before renaming over a name, the name must still be the entry we worked on:
 # a file that appeared or was replaced while we were building the result is
@@ -458,7 +655,7 @@ cmd_wire() {
     die "managed block markers in $target are not intact ($starts start, $ends end); remove them by hand, then restart the service to re-wire a clean block"
   fi
   tmpfile=$(mktemp "$DIR_PATH/$target_name.tmp.XXXXXX") || die "could not create temporary file"
-  if [[ -n "$FILE_FD" ]]; then
+  if [[ -n "$FILE_PATH" ]]; then
     # Appending to an existing file: its mode, and the exact bytes we counted
     # the markers in, come from the inode we hold open.
     orig_mode="$FILE_MODE"
@@ -469,7 +666,7 @@ cmd_wire() {
   fi
   sed -n "${l0},${l1}p" "$src_path" >> "$tmpfile" || die "could not write temporary file"
   chmod "$orig_mode" "$tmpfile" || die "could not set permissions on temporary file"
-  if [[ -n "$FILE_FD" ]]; then
+  if [[ -n "$FILE_PATH" ]]; then
     replace_in_dir "$tmpfile" "$target_name" "$target" inode "$FILE_DEV" "$FILE_INO"
   else
     replace_in_dir "$tmpfile" "$target_name" "$target" absent
@@ -490,10 +687,12 @@ cmd_wire() {
 
 cmd_unwire() {
   local target="$1" start="$2" end="$3" starts ends target_dir target_name
+  local target_path target_dev target_ino target_mode stripper_path
   # The stripper comes from the pinned script directory, the target is opened
   # through its own pinned directory, and both stay bound while the result is
   # built and renamed: a symlink swapped in for bindings.lua, or a replaced
-  # ~/.config/hypr, cannot redirect the strip onto another file.
+  # ~/.config/hypr, cannot redirect the strip onto another file. Both are opened
+  # rather than named, so neither can be a fifo that stops the command opening.
   bind_self_dir
   target_dir="$(dirname -- "$target")"
   target_name="$(basename -- "$target")"
@@ -501,8 +700,13 @@ cmd_unwire() {
     say "bindings file not found: $target; nothing to clean"
     return
   fi
-  starts=$(count_marker "$FILE_PATH" "$start") || die "cannot read $target"
-  ends=$(count_marker "$FILE_PATH" "$end") || die "cannot read $target"
+  # Keep the target's descriptor state: opening the stripper below replaces it.
+  target_path=$FILE_PATH
+  target_dev=$FILE_DEV
+  target_ino=$FILE_INO
+  target_mode=$FILE_MODE
+  starts=$(count_marker "$target_path" "$start") || die "cannot read $target"
+  ends=$(count_marker "$target_path" "$end") || die "cannot read $target"
   # Only an intact, single managed block is ever unwired; duplicates or bare
   # markers mean the file is not in a state this plugin created, so refuse to
   # guess. Markers are single-line comments, so line counts cannot be confounded.
@@ -514,14 +718,17 @@ cmd_unwire() {
   # Strip into a temp file in the same (pinned) directory, and only rename over
   # the target once the result is produced and verified, so a failure never
   # leaves a half-stripped bindings file behind.
-  if ! awk -v s="$start" -v e="$end" -f "$SELF_PATH/grace-window.awk" "$FILE_PATH" > "$tmpfile"; then
+  open_file_at "$SELF_PATH" grace-window.awk "$self/grace-window.awk" \
+    || die "stripper not found: $self/grace-window.awk"
+  stripper_path=$FILE_PATH
+  if ! awk -v s="$start" -v e="$end" -f "$stripper_path" "$target_path" > "$tmpfile"; then
     die "unwire (awk) failed; $target left untouched"
   fi
   if grep -qFs -- "$start" "$tmpfile"; then
     die "unwire produced a malformed result (marker still present); $target left untouched"
   fi
-  chmod "$FILE_MODE" "$tmpfile" || die "could not set permissions on temporary file"
-  replace_in_dir "$tmpfile" "$target_name" "$target" inode "$FILE_DEV" "$FILE_INO"
+  chmod "$target_mode" "$tmpfile" || die "could not set permissions on temporary file"
+  replace_in_dir "$tmpfile" "$target_name" "$target" inode "$target_dev" "$target_ino"
   tmpfile=""
   if hyprctl reload >/dev/null 2>&1; then
     say "managed keybinding block removed from $target and hyprland reloaded"
@@ -531,26 +738,34 @@ cmd_unwire() {
 }
 
 cmd_install_unwire() {
-  local dir="$1" f tmp
+  local dir="$1" f tmp src_path
   # This copy is what the service runs on teardown, so the runtime directory is
   # opened, checked and kept open like the bindings directory, and every file is
   # written and renamed inside it. The temporary names are no longer predictable
   # — "$f.tmp.$$" let a name planted in its place redirect a copy onto another
   # file — and the rename replaces the destination name itself, so even a
-  # symlink sitting there is overwritten rather than written through.
+  # symlink sitting there is overwritten rather than written through. The source
+  # files are read through a checked descriptor too: cp opening a name read-only
+  # would wait on a fifo planted in the plugin directory.
   bind_self_dir
   ensure_dir_chain "$dir" || die "cannot open or create runtime directory: $dir"
   for f in grace-window.sh grace-window.awk grace-window.lua; do
-    tmp=$(mktemp "$DIR_PATH/$f.tmp.XXXXXX") || die "cannot create temporary file for $f"
+    open_file_at "$SELF_PATH" "$f" "$self/$f" || die "cannot read $f from the plugin directory"
+    src_path=$FILE_PATH
+    tmp=$(mktemp "$DIR_PATH/$f.tmp.XXXXXX") || die "could not create temporary file for $f"
     tmpfile=$tmp
-    cp -- "$SELF_PATH/$f" "$tmp" || die "cannot copy $f to $dir"
+    cp -- "$src_path" "$tmp" || die "cannot copy $f to $dir"
     replace_in_dir "$tmp" "$f" "$dir/$f" any
     tmpfile=""
   done
   # The teardown subcommands must exist in the copy — a stale script would
-  # strand the grace look on stop and lose the pending state on restart.
-  grep -q 'undo-grace' "$DIR_PATH/grace-window.sh" || die "installed unwire script lacks undo-grace"
-  grep -q 'save-state' "$DIR_PATH/grace-window.sh" || die "installed unwire script lacks save-state"
+  # strand the grace look on stop and lose the pending state on restart. Read
+  # through a descriptor, like every other file here.
+  open_file_at "$DIR_PATH" grace-window.sh "$dir/grace-window.sh" \
+    || die "installed unwire script is missing"
+  src_path=$FILE_PATH
+  grep -q 'undo-grace' "$src_path" || die "installed unwire script lacks undo-grace"
+  grep -q 'save-state' "$src_path" || die "installed unwire script lacks save-state"
 }
 
 # Teardown variant of cancel(): drop the grace look of every pending window in

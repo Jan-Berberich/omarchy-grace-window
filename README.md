@@ -17,8 +17,8 @@ closed for real:
   is itself a gracefully closed window, that one is reopened instead.
   Otherwise reopens the most recently closed window. Moving a gracefully
   closed window out of its grace workspace also reopens it.
-- <kbd>SUPER</kbd>+<kbd>SHIFT</kbd>+<kbd>CTRL</kbd>+<kbd>W</kbd>: close window,
-  for real, immediately. It can not be reopened again.
+- <kbd>SUPER</kbd>+<kbd>SHIFT</kbd>+<kbd>CTRL</kbd>+<kbd>W</kbd>: close
+  window, for real, immediately. It can not be reopened again.
 - **Grace period**: time to reopen gracefully closed window before it gets
   closed for real. Pauses if gracefully closed window is focused.
 - **Grace look**: a gracefully closed window gets a distinctive look so you
@@ -121,9 +121,9 @@ omarchy restart shell
   Note that this plugin exposes these glitches, rather then being the root
   cause of them.
 
-**Example**: You can configure custom behaviour, like a "Minimize / Recover" workflow
-(hide on workspace 9 with no auto-close and only suttle look change) by adding
-the desired keybindings to the managed block in `hypr/bindings.lua`:
+**Example**: You can configure custom behaviour, like a "Minimize / Recover"
+workflow (hide on workspace 9 with no auto-close and only suttle look change)
+by adding the desired keybindings to the managed block in `hypr/bindings.lua`:
 ```
 hl.unbind("SUPER + ALT + W")
 o.bind("SUPER + ALT + W", "Minimize window (jam.grace-window)", "omarchy-shell grace-window hide '9' 9e9 9 1 1")
@@ -135,13 +135,14 @@ such workflows can coexist.
 
 ## Notes
 
-- The plugin manages persistent window states: shutting the service down (restart, hot-reload,
-  logout) saves the pending state to the per-user runtime dir. The next start
-  restores every hidden window still on the workspace it was hidden into:
-  look, remaining grace time and reopenability all carry over. Windows moved
-  or closed while down are skipped, windows mid-reopen are treated like
-  pending, and `cancel` (or a close given up after `closeRetryMax`) clears the
-  saved state so such a window is never resurrected or re-armed.
+- The plugin manages persistent window states: shutting the service down
+  (restart, hot-reload, logout) saves the pending state to the per-user
+  runtime dir. The next start restores every hidden window still on the
+  workspace it was hidden into: look, remaining grace time and reopenability
+  all carry over. Windows moved or closed while down are skipped, windows
+  mid-reopen are treated like pending, and `cancel` (or a close given up after
+  `closeRetryMax`) clears the saved state so such a window is never
+  resurrected or re-armed.
 - Multiple windows can be hidden in sequence, in any number of
   workspaces. Each one keeps its own grace period in its workspace's buffer,
   and `reopen <workspace>` restores the most recent one of that workspace
@@ -153,20 +154,22 @@ such workflows can coexist.
   Hyprland for any other reason (closed on its own, crashed) is dropped by its
   `closewindow` event, so `status` never counts a window that no longer
   exists.
-- Uses Hyprland's Lua dispatcher syntax
-  (e.g. `hl.dsp.window.close({ window = "address:..." })`),
-  which needs Hyprland >= 0.55 (present in Omarchy 4.x).
-- Every file the plugin writes (the managed keybinding block, the teardown
-  copy of the scripts, the saved state) is written through a directory
-  descriptor that was opened and checked beforehand and then kept open, and is
-  published with an atomic rename from a randomly named temporary file in that
-  same directory. A name swapped for a symlink, a directory replaced while the
-  plugin is working, or a temporary name planted in advance therefore cannot
-  redirect a write onto a file of someone else's choosing; if the target is
-  replaced underneath the plugin it is left untouched and the command fails.
-  For the same reason the script refuses to write when a path component is a
-  symlink, when a directory in the path is group/other writable, or when the
-  target is not a regular file owned by you (or root). This means a symlinked
-  `~/.config/hypr` (through, say, a dotfiles manager) is the one setup that
-  stops working, because every component is required to be a real directory.
+- Every file the plugin reads or writes (managed keybinding block, teardown
+  copy of the scripts, saved state) goes through a directory descriptor that
+  was opened, checked and then kept open, and is published with an atomic
+  rename from a randomly named temporary file in that same directory. A name
+  swapped for a symlink, a directory replaced while the plugin works, or a
+  temporary name planted in advance therefore cannot redirect a read/write;
+  a target replaced underneath the plugin is left untouched and the command
+  fails. The script also refuses to write when a path component is a symlink,
+  when a directory in the path is group/other writable, or when the target is
+  not a regular file owned by you (or root), which is why a symlinked
+  `~/.config/hypr` (through a dotfiles manager, say) is the one setup that
+  stops working. No open can wait, either: a fifo swapped in for a file or a
+  directory is opened the way that returns at once and then refused, and a
+  read-only open is delegated to a child with a five-second deadline, so a
+  swap is a command that fails and says so, never a service that stops
+  answering. The jq module and the Lua dispatcher are the exception: those are
+  found by name inside jq's and Hyprland's own processes, where the plugin's
+  descriptors do not exist.
 - Validated with `omarchy plugin validate`.
