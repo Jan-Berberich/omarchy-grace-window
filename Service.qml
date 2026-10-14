@@ -211,6 +211,19 @@ Item {
         runnerTimeout.restart()
       } else {
         runnerTimeout.stop()
+        // A process that never started (its binary is missing) reports no
+        // `exited` — Quickshell's Process has no QML error signal for it — only
+        // this running=false. A normal finish emits `exited` first, which has
+        // already cleared runningItem, so an item still unattributed here is a
+        // failed start: attribute it so its promise settles and opInFlight
+        // clears, instead of the queue silently advancing past it forever.
+        if (root.runningItem && !root.runningItem.done) {
+          console.warn("grace-window: command failed to start; attributing it as failed")
+          const item = root.runningItem
+          root.runningItem = null
+          root.abortPending = false
+          root.attributeItem(item, true, null)
+        }
         // onExited normally pumps; this self-heals the late-ghost abort case,
         // where the fallback already attributed the item and the delayed
         // onExited early-returns without queueing a pump.
@@ -254,9 +267,11 @@ Item {
   // Safety net if a SIGKILLed process's onExited never arrives: attribute the
   // item as failed so its promise resolves and opInFlight clears, instead of
   // leaving it raised forever. Only acts while the abort is unattributed,
-  // since onExited clears abortPending. Not stopped here: onRunningChanged
-  // already disarmed it when the abort flipped `running` back to false, and it
-  // re-arms for whichever command the drain starts.
+  // since onExited clears abortPending. It is deliberately not disarmed by the
+  // abort itself: `running = false` only asks the process to terminate, so
+  // `running` stays true (and the queue held) until the child is actually
+  // reaped, and the timer stays armed until onExited stops it on the real
+  // exit, or it fires once and drops the item.
   Timer {
     id: runnerAbortFallback
     repeat: false
