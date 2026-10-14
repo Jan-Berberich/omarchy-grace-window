@@ -20,7 +20,9 @@
 // scripts/grace-window.lua, the single file holding every hl.dsp call. Pending
 // state survives service lifecycles (saved on teardown, restored on start);
 // the managed keybinding block is wired into ~/.config/hypr/bindings.lua on
-// start and removed on teardown.
+// start and removed on teardown, a block customized there captured to
+// hypr/bindings-custom.lua first and preferred over the plugin's default on
+// the next start.
 //
 // Focus, liveness and workspace moves are tracked from Hyprland's event socket
 // (Quickshell's Hyprland rawEvent) instead of polling, so the grace timer only
@@ -1199,20 +1201,39 @@ Item {
   }
 
   // --------------------------------------------------------- keybinding wiring
-  // On start the managed block from hypr/bindings.lua is appended to
-  // ~/.config/hypr/bindings.lua when not already present, then Hyprland is
-  // reloaded — idempotent across restarts and hot-reloads. Teardown removes it.
+  // On start the managed block is appended to ~/.config/hypr/bindings.lua when
+  // not already present, then Hyprland is reloaded — idempotent across restarts
+  // and hot-reloads. Teardown removes it.
+  //
+  // The block comes from the captured custom bindings when they hold one, and
+  // from the plugin's shipped hypr/bindings.lua otherwise. Teardown first
+  // captures the live block there (only when it differs from the one this start
+  // wired), so a block customized in ~/.config/hypr/bindings.lua round-trips
+  // across disable/enable — and since the captured file is untracked and
+  // gitignored, customizing it never gets in the way of `omarchy plugin update`,
+  // whose fast-forward would otherwise be blocked by local changes to the
+  // plugin's own bindings.lua.
   readonly property string bindingsBlockBgn:
     "-- BEGIN Grace Window (jam.grace-window) managed block - do not edit this comment"
   readonly property string bindingsBlockEnd:
     "-- END Grace Window (jam.grace-window) managed block - do not edit this comment"
+
+  // The captured customization, next to the shipped block inside the plugin
+  // directory. Untracked and gitignored, so it is neither committed nor seen as
+  // a local change by `omarchy plugin update` (which fast-forwards and can
+  // reset --hard); keep it a regular file — `omarchy plugin update` re-validates
+  // the folder and refuses any symlink in it. Its presence means the live block
+  // differs from the shipped default.
+  readonly property string customBindingsFile: root.sourceDir + "/hypr/bindings-custom.lua"
 
   function wireBindings() {
     wireProc.command = ["bash", root.bashScript, "wire",
       root.sourceDir + "/hypr/bindings.lua",
       Quickshell.env("HOME") + "/.config/hypr/bindings.lua",
       root.bindingsBlockBgn,
-      root.bindingsBlockEnd]
+      root.bindingsBlockEnd,
+      root.customBindingsFile,
+      root.wiredBindingsFile]
     wireProc.running = true
   }
 
@@ -1241,6 +1262,12 @@ Item {
   // workspace. Lives next to the runtime scripts, which persist for the whole
   // user session.
   readonly property string stateFile: root.unwireRuntimeDir + "/state.json"
+  // The block the last wire put in place, next to the state file. Teardown
+  // compares the live block against it: while the two agree nothing was
+  // customized and no custom file is written; once they differ the live block
+  // is captured (see customBindingsFile). It therefore also captures an edit
+  // that was made while running, once the next start has wired it.
+  readonly property string wiredBindingsFile: root.unwireRuntimeDir + "/bindings-wired.lua"
   property bool unwireInstalled: false
 
   function installUnwireScript() {
@@ -1266,6 +1293,9 @@ Item {
     return root.unwireInstalled ? root.unwireRuntimeScript : root.bashScript
   }
 
+  // The capture of the live block into customBindingsFile rides along with the
+  // strip, in the same command: a separate one could run after the block is
+  // already gone, or not at all.
   function unwireBindings() {
     const target = Quickshell.env("HOME") + "/.config/hypr/bindings.lua"
     if (!root.unwireInstalled) {
@@ -1274,7 +1304,9 @@ Item {
     Quickshell.execDetached(["bash", root.teardownScript(), "unwire",
       target,
       root.bindingsBlockBgn,
-      root.bindingsBlockEnd])
+      root.bindingsBlockEnd,
+      root.customBindingsFile,
+      root.wiredBindingsFile])
   }
 
   // Teardown variant of cancel(): restores the grace look of every pending and

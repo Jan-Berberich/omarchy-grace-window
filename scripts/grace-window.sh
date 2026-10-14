@@ -7,10 +7,16 @@
 # close ADDR                   Close ADDR and verify it is gone: exit 0 only
 #                              when the address no longer exists (retryable
 #                              otherwise, never a success on a broken query).
-# wire SRC TARGET S E          Append the managed block from SRC to TARGET
-#                              (markers S/E), atomically; a no-op when one
-#                              intact block exists, fail-closed otherwise.
-# unwire TARGET S E            Remove exactly the managed block again.
+# wire SRC TARGET S E [CUSTOM REF]
+#                              Append the managed block to TARGET (markers S/E),
+#                              atomically; a no-op when one intact block exists,
+#                              fail-closed otherwise. SRC is the shipped default;
+#                              an intact block in CUSTOM (the captured
+#                              customization) is preferred over it. REF records
+#                              the block this run wired, for unwire.
+# unwire TARGET S E [CUSTOM REF]
+#                              Remove exactly the managed block again, first
+#                              capturing it to CUSTOM when it differs from REF.
 # undo-grace JSON              Restore the grace look of JSON's entries in
 #                              place (teardown, runtime copy).
 # save-state DIR JSON          Write DIR/state.json atomically; empty clears it.
@@ -34,6 +40,25 @@ set -u
 # symlink (a dotfile checkout, say) is used as the real directory it points at,
 # so the no-follow check below sees no symlink of our own making.
 phys_dir() { (cd -- "$1" 2>/dev/null && pwd -P); }
+
+# Physical path of the longest existing prefix of a directory path, with the
+# components that do not exist yet left on the end. A component the user created
+# as a symlink (a dotfiles-managed ~/.config/omarchy, say) is therefore entered
+# as the real directory it points at — the same treatment the plugin's own path
+# and a source block's directory already get — while a directory that has to be
+# created is created inside the resolved prefix, so a symlink cannot make the
+# creation land somewhere else. Requires an absolute path; fails when even the
+# existing prefix cannot be resolved.
+phys_prefix() {
+  local path="$1" rest="" phys
+  [[ "$path" == /* ]] || return 1
+  while [[ "$path" != "/" && ! -d "$path" ]]; do
+    rest="/$(basename -- "$path")$rest"
+    path="$(dirname -- "$path")"
+  done
+  phys="$(phys_dir "$path")" || return 1
+  printf '%s%s' "$phys" "$rest"
+}
 script_path="${BASH_SOURCE[0]}"
 self="$(phys_dir "$(dirname -- "$script_path")")"
 tmpfile=""
@@ -611,25 +636,129 @@ cmd_close() {
   return 0    # gone → closed for real
 }
 
+# Print the intact managed block of FILE — the start-marker line through the
+# end-marker line — read through the descriptor-bound helpers, so the block is
+# taken from the inode that was checked and a swapped-in name cannot redirect
+# it. Returns 3 when FILE (or a directory in its path) is simply not there, so
+# an optional source can fall back to another; otherwise it dies like every
+# other reader when the file is present but may not be used — a symlinked
+# component, a refused owner or mode, a non-regular file, or a file without one
+# clean marker pair in order.
+#
+# Callers use it in a command substitution: that subshell is what turns a die()
+# into a failed read they can report and recover from rather than a dead
+# command, so an unreadable *optional* file never stops the run.
+read_managed_block() {
+  local file="$1" start="$2" end="$3" dir name l0 l1
+  dir="$(phys_dir "$(dirname -- "$file")")"
+  name="$(basename -- "$file")"
+  if [[ -z "$dir" ]] || ! open_dir_chain "$dir" || ! open_file_in_dir "$name" "$file"; then
+    return 3
+  fi
+  l0=$(grep -nFs -- "$start" "$FILE_PATH" | head -n 1 | cut -d: -f1)
+  l1=$(grep -nFs -- "$end" "$FILE_PATH" | head -n 1 | cut -d: -f1)
+  if [[ -z "$l0" || -z "$l1" ]]; then die "managed block not found in $file"; fi
+  if (( l0 > l1 )); then die "managed block markers out of order in $file"; fi
+  sed -n "${l0},${l1}p" "$FILE_PATH"
+}
+
+# Publish BLOCK as FILE, atomically, inside a pinned directory: the file's own
+# mode is kept when it exists, a new one is created mode 644, and a file that
+# already holds exactly BLOCK is left alone — an unchanged capture is not
+# rewritten, so it costs no churn and no inode change. A symlinked component in
+# the path is entered as the real directory (like the plugin's own path), so a
+# dotfiles-managed config tree still works, while a directory that has to be
+# created is created inside the resolved one.
+#
+# Best-effort by design: its callers run it in a subshell, where its die() skips
+# that one sidecar write with a warning instead of taking down the whole command
+# — the wiring, or the strip that has to follow a capture.
+write_block_file() {
+  local block="$1" file="$2" what="$3"
+  local dir name mode=644 existing="" want_dev="" want_ino="" tmp
+  dir="$(phys_prefix "$(dirname -- "$file")")" || die "cannot resolve the directory of $what"
+  ensure_dir_chain "$dir" || die "cannot open or create the directory of $what: $dir"
+  name="$(basename -- "$file")"
+  if open_file_in_dir "$name" "$file"; then
+    existing="$(cat -- "$FILE_PATH")" || die "cannot read $what"
+    if [[ "$existing" == "$block" ]]; then
+      say "$what is already up to date; not rewritten"
+      return 0
+    fi
+    want_dev="$FILE_DEV"
+    want_ino="$FILE_INO"
+    mode="$FILE_MODE"
+  fi
+  tmp="$(mktemp "$DIR_PATH/$name.tmp.XXXXXX")" || die "could not create a temporary file for $what"
+  tmpfile="$tmp"
+  printf '%s\n' "$block" > "$tmp" || die "could not write $what"
+  chmod "$mode" "$tmp" || die "could not set permissions on $what"
+  if [[ -n "$want_dev" ]]; then
+    replace_in_dir "$tmp" "$name" "$what" inode "$want_dev" "$want_ino"
+  else
+    replace_in_dir "$tmp" "$name" "$what" absent
+  fi
+  tmpfile=""
+}
+
+# Capture the live managed block of a teardown into the custom bindings file, so
+# a customization survives the disable and is wired back on the next start
+# instead of being replaced by the shipped default. REF holds the block this
+# run's wire put in place: while the live block still matches it nothing was
+# customized, so nothing is written and no custom file appears — the file's very
+# existence means "this differs from the shipped default". A custom file already
+# holding exactly the live block is left alone too.
+#
+# Runs in a subshell of cmd_unwire: re-pinning the directory descriptors here
+# cannot disturb the strip that follows, and a die() is a skipped capture with a
+# warning, never a strip that did not happen.
+capture_custom() {
+  local block="$1" custom="$2" ref="$3"
+  local ref_dir ref_name wired=""
+  ref_dir="$(phys_dir "$(dirname -- "$ref")")"
+  ref_name="$(basename -- "$ref")"
+  if [[ -z "$ref_dir" ]] || ! open_dir_chain "$ref_dir" || ! open_file_in_dir "$ref_name" "$ref"; then
+    say "warning: no wired-bindings reference at $ref; leaving the custom bindings untouched"
+    return 0
+  fi
+  wired="$(cat -- "$FILE_PATH")"
+  if [[ "$block" == "$wired" ]]; then
+    say "managed block unchanged since it was wired; nothing captured"
+    return 0
+  fi
+  write_block_file "$block" "$custom" "the custom bindings"
+}
+
 cmd_wire() {
-  local src="$1" target="$2" start="$3" end="$4"
-  local l0 l1 orig_mode starts ends target_dir target_name src_dir src_name src_path
-  # The managed block is read from the plugin's own bindings through a pinned
-  # descriptor: it ends up as executable Hyprland config, so it is opened and
-  # checked like any other file, not read by pathname.
-  # The source directory is the plugin's own, so a symlinked one is resolved to
-  # the real directory; the file itself is still taken exactly as named.
-  src_dir="$(phys_dir "$(dirname -- "$src")")"
-  src_name="$(basename -- "$src")"
-  if [[ -z "$src_dir" ]] || ! open_dir_chain "$src_dir" || ! open_file_in_dir "$src_name" "$src"; then
+  local src="$1" target="$2" start="$3" end="$4" custom="${5-}" ref="${6-}"
+  local orig_mode starts ends target_dir target_name
+  local default_block custom_block block rc crc
+  # The block to wire is the captured custom block when there is an intact one —
+  # the user's customization carried over from the last teardown — and the
+  # shipped default otherwise. Both are read through pinned descriptors: the
+  # block ends up as executable Hyprland config, so it is never read by
+  # pathname. A custom file that cannot be read is not fatal — it is an optional
+  # sidecar, and the shipped default keeps the plugin working — but it is
+  # reported, so a customization that can no longer be honored is not dropped
+  # silently.
+  default_block="$(read_managed_block "$src" "$start" "$end")"; rc=$?
+  if (( rc == 3 )); then
     say "source bindings missing: $src"
     return
   fi
-  src_path="$FILE_PATH"
-  l0=$(grep -nFs -- "$start" "$src_path" | head -n 1 | cut -d: -f1)
-  l1=$(grep -nFs -- "$end" "$src_path" | head -n 1 | cut -d: -f1)
-  if [[ -z "$l0" || -z "$l1" ]]; then die "managed block not found in $src"; fi
-  if (( l0 > l1 )); then die "managed block markers out of order in $src"; fi
+  if (( rc != 0 )); then
+    say "source bindings unusable: $src"
+    return 1
+  fi
+  block="$default_block"
+  if [[ -n "$custom" ]]; then
+    custom_block="$(read_managed_block "$custom" "$start" "$end")"; crc=$?
+    if (( crc == 0 )); then
+      block="$custom_block"
+    elif (( crc != 3 )); then
+      say "warning: ignoring unusable custom bindings at $custom; keeping the shipped default"
+    fi
+  fi
   # Everything below happens inside the target's directory, which is opened,
   # checked and then kept open: the marker counts, the copy of the current file
   # and the replacement all address that directory, so nothing between the
@@ -664,7 +793,7 @@ cmd_wire() {
   else
     orig_mode=644
   fi
-  sed -n "${l0},${l1}p" "$src_path" >> "$tmpfile" || die "could not write temporary file"
+  printf '%s\n' "$block" >> "$tmpfile" || die "could not write temporary file"
   chmod "$orig_mode" "$tmpfile" || die "could not set permissions on temporary file"
   if [[ -n "$FILE_PATH" ]]; then
     replace_in_dir "$tmpfile" "$target_name" "$target" inode "$FILE_DEV" "$FILE_INO"
@@ -678,6 +807,17 @@ cmd_wire() {
      || [[ "$(count_marker "$FILE_PATH" "$start")" != 1 ]]; then
     die "failed to wire keybindings into $target"
   fi
+  # Record the block this run actually put in place, so teardown can tell an
+  # edited live block from an untouched one (see cmd_unwire). Only here, after
+  # the block is confirmed written: on a no-op the reference is deliberately
+  # left as the earlier wire set it, so an edit made to the live block (or a
+  # hand-edit of the custom file) while the service was up is not mistaken for
+  # "already wired" and dropped. Best-effort: a reference that cannot be written
+  # costs only the next capture, never the wiring.
+  if [[ -n "$ref" ]]; then
+    ( tmpfile=""; write_block_file "$block" "$ref" "the wired-bindings reference" ) \
+      || say "warning: could not write the wired-bindings reference at $ref; an edited block will not be captured on teardown"
+  fi
   if hyprctl reload >/dev/null 2>&1; then
     say "keybindings wired into $target and hyprland reloaded"
   else
@@ -686,8 +826,9 @@ cmd_wire() {
 }
 
 cmd_unwire() {
-  local target="$1" start="$2" end="$3" starts ends target_dir target_name
-  local target_path target_dev target_ino target_mode stripper_path
+  local target="$1" start="$2" end="$3" custom="${4-}" ref="${5-}"
+  local starts ends target_dir target_name
+  local target_path target_dev target_ino target_mode stripper_path l0 l1 live
   # The stripper comes from the pinned script directory, the target is opened
   # through its own pinned directory, and both stay bound while the result is
   # built and renamed: a symlink swapped in for bindings.lua, or a replaced
@@ -713,6 +854,21 @@ cmd_unwire() {
   if (( starts != 1 )) || (( ends != 1 )); then
     say "managed block markers not intact in $target ($starts start, $ends end); leaving file untouched"
     return
+  fi
+  # Capture the live block before it is stripped, so a customized block is
+  # wired back on the next start. It runs in a subshell (it re-pins the
+  # directory descriptors and may die) so a capture that cannot be written
+  # leaves the block intact for the next run but never stops this strip.
+  if [[ -n "$custom" && -n "$ref" ]]; then
+    l0=$(grep -nFs -- "$start" "$target_path" | head -n 1 | cut -d: -f1)
+    l1=$(grep -nFs -- "$end" "$target_path" | head -n 1 | cut -d: -f1)
+    if [[ -n "$l0" && -n "$l1" ]] && (( l0 <= l1 )); then
+      live="$(sed -n "${l0},${l1}p" "$target_path")"
+      ( tmpfile=""; capture_custom "$live" "$custom" "$ref" ) \
+        || say "warning: could not capture the live keybinding block to $custom"
+    else
+      say "managed block markers are out of order in $target; not capturing it"
+    fi
   fi
   tmpfile=$(mktemp "$DIR_PATH/$target_name.tmp.XXXXXX") || die "could not create temporary file"
   # Strip into a temp file in the same (pinned) directory, and only rename over

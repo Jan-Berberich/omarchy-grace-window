@@ -23,7 +23,7 @@ o.bind("SUPER + W", "Close window gracefully (jam.grace-window)", "omarchy-shell
 hl.unbind("SUPER + SHIFT + W")
 o.bind("SUPER + SHIFT + W", "Reopen closed window (jam.grace-window)", "omarchy-shell grace-window reopen '10'")
 -- for "minimize/recover" workflow on workspace 9 with no timeout:
--- uncomment the following 4 lines in "~/.config/omarchy/plugins/jam.grace-window/hypr/bindings.lua" then disable & enable plugin
+-- uncomment the following 4 lines in your live ~/.config/hypr/bindings.lua
 -- hl.unbind("SUPER + ALT + W")
 -- o.bind("SUPER + ALT + W", "Minimize window (jam.grace-window)", "omarchy-shell grace-window hide '9' 9e9 9 1 1")
 -- hl.unbind("SUPER + ALT + SHIFT + W")

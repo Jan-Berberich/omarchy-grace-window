@@ -47,7 +47,7 @@ background script.
 |------|---------|
 | `manifest.json` | Omarchy plugin manifest (schema v1, kind `service`) |
 | `Service.qml` | The service: IPC handlers, a single serial hyprctl dispatch queue (with watchdog), an event-driven grace tracker (focus, liveness and workspace moves come from Hyprland's event socket, so the timer never probes), and automatic wiring of the keybindings on start / unwiring on teardown |
-| `hypr/bindings.lua` | The keybindings, wrapped in the managed block the service copies on start |
+| `hypr/bindings.lua` | The shipped keybindings, wrapped in the managed block. Used on start unless a captured customization exists (see below) |
 | `scripts/*` | `.sh`, `.lua`, `.jq` and `.awk` scripts backing the service |
 
 ## Install
@@ -56,13 +56,14 @@ background script.
 omarchy plugin add https://github.com/Jan-Berberich/omarchy-grace-window.git --enable
 ```
 
-When the service starts it appends the managed
-keybinding block from its own `hypr/bindings.lua` to
+When the service starts it appends the managed keybinding block to
 `~/.config/hypr/bindings.lua` and reloads Hyprland, but only if the block is
 not already present, so it is safe across shell restarts and plugin
-hot-reloads. Every line it adds lives inside a `-- BEGIN Grace Window …`
-/ `-- END Grace Window …` managed block pair. Nothing outside that block is
-ever modified.
+hot-reloads. The block is the plugin's own `hypr/bindings.lua`, or your
+customized `hypr/bindings-custom.lua` (when one was captured on a previous
+teardown). Every line it adds lives inside a `-- BEGIN Grace Window …` /
+`-- END Grace Window …` managed block pair. Nothing outside that block is ever
+modified.
 
 ## Uninstall
 
@@ -76,6 +77,14 @@ exactly the plugin's managed binding block from
 already present before the plugin was installed is preserved unchanged. If
 the managed block cannot be located intact, or appears more than once, the
 service fails closed and leaves the file untouched.
+
+If the managed block was customized since it was wired, it is captured to
+`hypr/bindings-custom.lua` first, so the customization survives the disable
+and is wired back on the next start. A block that still matches what the last
+start wired is not captured, so the custom file only ever appears once you
+have actually customized the block. The custom file is yours: edit or delete
+it freely. Deleting it reverts to the shipped default, editing it applies on
+the next start.
 
 ## Usage without the keybindings
 
@@ -100,17 +109,20 @@ The arguments for the `hide` command are:
 keeps its own buffer of hidden windows, so multiple workflows can coexist.
 
 ## Configuration
-The plugin gets installed to `~/.config/omarchy/plugins/jam.grace-window`.
-Here you can change what you want. Just disable and enable the plugin again,
-then restart the shell for any changes to take effect:
+Editing the keybindings, or the commands executed by them can be done directly
+in your live `~/.config/hypr/bindings.lua`. For further customization, look in
+the directory where the plugin gets installed to:
+`~/.config/omarchy/plugins/jam.grace-window`. Here you can change what you
+want. Just disable and enable the plugin again, then restart the shell for the changes to take effect:
 ```bash
 omarchy plugin disable jam.grace-window
 omarchy plugin enable jam.grace-window
 omarchy restart shell
 ```
-- **Keybindings**: should be edited in the plugins `hypr/bindings.lua` for
-  them to persist `Service.qml` restarts. In here you can also change the
-  following command arguments:
+- **Keybindings**: edit the managed block in your live
+  `~/.config/hypr/bindings.lua` (inside the `-- BEGIN Grace Window …`
+  / `-- END Grace Window …` pair) while leaving those two marker comments in
+  place. In the block you can change the following command arguments:
 - **Grace workspace**: 1st argument of the `hide` / `reopen` commands.
 - **Grace period**: 2nd argument of the `hide` command in seconds.
 - **Grace look**: 3rd … 5th arguments are: rounding, rounding power,
@@ -123,7 +135,8 @@ omarchy restart shell
 
 **Example**: You can configure custom behaviour, like a "Minimize / Recover"
 workflow (hide on workspace 9 with no auto-close and only suttle look change)
-by adding the desired keybindings to the managed block in `hypr/bindings.lua`:
+by adding the desired keybindings to the managed block in
+`~/.config/hypr/bindings.lua`:
 ```
 hl.unbind("SUPER + ALT + W")
 o.bind("SUPER + ALT + W", "Minimize window (jam.grace-window)", "omarchy-shell grace-window hide '9' 9e9 9 1 1")
@@ -172,4 +185,10 @@ such workflows can coexist.
   answering. The jq module and the Lua dispatcher are the exception: those are
   found by name inside jq's and Hyprland's own processes, where the plugin's
   descriptors do not exist.
+- The custom bindings and the wired-block reference are best-effort sidecars
+  and obey the same rules: a custom file that cannot be read (unreadable, a
+  symlink, a shared-writable directory in its path) is reported and the shipped
+  default is wired instead, and a capture that cannot be written is reported
+  but never stops the strip. The managed block in `~/.config/hypr/bindings.lua`
+  itself stays fail-closed: a damaged or duplicated block is left untouched.
 - Validated with `omarchy plugin validate`.
