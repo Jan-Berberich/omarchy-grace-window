@@ -1100,7 +1100,7 @@ Item {
     // Windows being reopened are left to their restores; the service simply
     // forgets them.
     root.pending = []
-    // Persist the now-empty pending state (clears a stale state.json).
+    // Persist the now-empty pending state (clears a stale grace-window.json).
     root.saveStateDetached()
     return "ok"
   }
@@ -1261,7 +1261,7 @@ Item {
   // hot-reload, restored for the windows that still exist on their saved grace
   // workspace. Lives next to the runtime scripts, which persist for the whole
   // user session.
-  readonly property string stateFile: root.unwireRuntimeDir + "/state.json"
+  readonly property string stateFile: root.unwireRuntimeDir + "/grace-window.json"
   // The block the last wire put in place, next to the state file. Teardown
   // compares the live block against it: while the two agree nothing was
   // customized and no custom file is written; once they differ the live block
@@ -1620,7 +1620,7 @@ Item {
     if (saveable.length === 0 && root.loadVerdict !== "complete") {
       // The startup load has not finished, or was cut short, so this instance
       // has not seen the saved windows yet and an empty pending list says
-      // nothing about them. Publishing it would clear state.json (an empty
+      // nothing about them. Publishing it would clear grace-window.json (an empty
       // state is how the file is emptied), and the windows still sitting on
       // their grace workspaces would be lost with no way to tell they existed.
       // The file on disk is the last complete truth: leave it alone.

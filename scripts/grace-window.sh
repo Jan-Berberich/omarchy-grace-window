@@ -19,7 +19,8 @@
 #                              capturing it to CUSTOM when it differs from REF.
 # undo-grace JSON              Restore the grace look of JSON's entries in
 #                              place (teardown, runtime copy).
-# save-state DIR JSON          Write DIR/state.json atomically; empty clears it.
+# save-state DIR JSON          Write DIR/grace-window.json atomically; empty
+#                              clears it.
 # state-probe                  Client address + workspace id/name JSON.
 # install-unwire DIR           Copy this script and its awk/lua partners into
 #                              DIR (atomically), for teardown.
@@ -960,35 +961,36 @@ cmd_undo_grace() {
   done < <(jq -c '.[]?' <<<"$data")
 }
 
-# Persist the pending state as $dir/state.json for the next startup; atomic.
-# An empty state removes any stale file, so a window that is no longer pending
-# is never resurrected with a re-armed auto-close.
+# Persist the pending state as $dir/grace-window.json for the next startup;
+# atomic. An empty state removes any stale file, so a window that is no longer
+# pending is never resurrected with a re-armed auto-close.
 cmd_save_state() {
   local dir="$1" data="$2" want_dev want_ino
+  local name="grace-window.json"
   # The state dir is bound for the whole command: removing a stale file,
   # writing the new one and renaming it over the old all address the directory
   # that was checked, and the temporary name is unpredictable, so nothing that
   # appears in the dir while we work can redirect or capture the write.
   ensure_dir_chain "$dir" || die "cannot open or create state directory: $dir"
   if [[ -z "$data" || "$data" == "[]" ]]; then
-    rm -f -- "$DIR_PATH/state.json" || die "cannot remove stale state file"
+    rm -f -- "$DIR_PATH/$name" || die "cannot remove stale state file"
     return 0
   fi
   # Keep the state file we are about to replace identified, so a state written
   # by anyone else while this one was built is never clobbered by it.
   want_dev=""
   want_ino=""
-  if open_file_in_dir state.json "$dir/state.json"; then
+  if open_file_in_dir "$name" "$dir/$name"; then
     want_dev="$FILE_DEV"
     want_ino="$FILE_INO"
   fi
-  tmpfile=$(mktemp "$DIR_PATH/state.json.tmp.XXXXXX") || die "cannot create temporary state file"
+  tmpfile=$(mktemp "$DIR_PATH/$name.tmp.XXXXXX") || die "cannot create temporary state file"
   printf '%s\n' "$data" > "$tmpfile" || die "cannot write state file"
   chmod 600 "$tmpfile" 2>/dev/null || true
   if [[ -n "$want_dev" ]]; then
-    replace_in_dir "$tmpfile" state.json "$dir/state.json" inode "$want_dev" "$want_ino"
+    replace_in_dir "$tmpfile" "$name" "$dir/$name" inode "$want_dev" "$want_ino"
   else
-    replace_in_dir "$tmpfile" state.json "$dir/state.json" absent
+    replace_in_dir "$tmpfile" "$name" "$dir/$name" absent
   fi
   tmpfile=""
 }
