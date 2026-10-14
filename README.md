@@ -22,10 +22,10 @@ closed for real:
 - **Grace period**: time to reopen gracefully closed window before it gets
   closed for real. Pauses if gracefully closed window is focused.
 - **Grace look**: a gracefully closed window gets a distinctive look so you
-  can tell it will close soon: a 10% lower opacity, cut corners and always in 
+  can tell it will close soon: a 10% lower opacity, cut corners and always in
   *tiling* mode.
 - **Grace groups**: the behaviour is as you would expect in omarchy:
-  Only the focused window of a tabbed group get gracefully closed, the rest of
+  Only the focused window of a tabbed group gets gracefully closed, the rest of
   the group stays in place. On reopen the window joins the group that
   currently has focus (if possible).
 - **Grace scratchpad**: when the scratchpad is open, the reopened
@@ -47,7 +47,7 @@ background script.
 |------|---------|
 | `manifest.json` | Omarchy plugin manifest (schema v1, kind `service`) |
 | `Service.qml` | The service: IPC handlers, a single serial hyprctl dispatch queue (with watchdog), an event-driven grace tracker (focus, liveness and workspace moves come from Hyprland's event socket, so the timer never probes), and automatic wiring of the keybindings on start / unwiring on teardown |
-| `hypr/bindings.lua` | The shipped keybindings, wrapped in the managed block. Used on start unless a captured customization exists (see below) |
+| `hypr/bindings.lua` | The shipped keybindings, wrapped in the managed block. Used on start unless a captured customization exists (see [Configuration](#configuration)) |
 | `scripts/*` | `.sh`, `.lua`, `.jq` and `.awk` scripts backing the service |
 
 ## Install
@@ -78,14 +78,6 @@ already present before the plugin was installed is preserved unchanged. If
 the managed block cannot be located intact, or appears more than once, the
 service fails closed and leaves the file untouched.
 
-If the managed block was customized since it was wired, it is captured to
-`hypr/bindings-custom.lua` first, so the customization survives the disable
-and is wired back on the next start. A block that still matches what the last
-start wired is not captured, so the custom file only ever appears once you
-have actually customized the block. The custom file is yours: edit or delete
-it freely. Deleting it reverts to the shipped default, editing it applies on
-the next start.
-
 ## Usage without the keybindings
 
 Talk to the service directly from a terminal:
@@ -109,32 +101,57 @@ The arguments for the `hide` command are:
 keeps its own buffer of hidden windows, so multiple workflows can coexist.
 
 ## Configuration
-Editing the keybindings, or the commands executed by them can be done directly
-in your live `~/.config/hypr/bindings.lua`. For further customization, look in
-the directory where the plugin gets installed to:
-`~/.config/omarchy/plugins/jam.grace-window`. Here you can change what you
-want. Just disable and enable the plugin again, then restart the shell for the changes to take effect:
+
+There are two places to configure the plugin: the **keybindings**, in your live
+`~/.config/hypr/bindings.lua`, and the **service tunables**, in the generated
+`~/.config/omarchy/plugins/jam.grace-window/config.json` next to the plugin's
+own files. Changes made in `config.json` require a plugin restart for the
+changes to take effect:
+
 ```bash
 omarchy plugin disable jam.grace-window
 omarchy plugin enable jam.grace-window
-omarchy restart shell
 ```
-- **Keybindings**: edit the managed block in your live
-  `~/.config/hypr/bindings.lua` (inside the `-- BEGIN Grace Window …`
-  / `-- END Grace Window …` pair) while leaving those two marker comments in
-  place. In the block you can change the following command arguments:
+
+### Keybindings
+Edit the managed block in your live `~/.config/hypr/bindings.lua` (inside the
+`-- BEGIN Grace Window …` / `-- END Grace Window …` pair) while leaving those
+two marker comments in place. In the block you can change / add keybindings
+and edit the following command arguments:
 - **Grace workspace**: 1st argument of the `hide` / `reopen` commands.
 - **Grace period**: 2nd argument of the `hide` command in seconds.
 - **Grace look**: 3rd … 5th arguments are: rounding, rounding power,
   opacity factor.
-- If you experience graphical glitches for some apps when using the
-  **Grace groups** feature, try to increase `groupingDelay` in `Service.qml`,
-  or refresh the graphics manually (e.g. by toggling fullscreen and back).
-  Note that this plugin exposes these glitches, rather then being the root
-  cause of them.
+
+A customization made there is captured to `hypr/bindings-custom.lua` on
+teardown and wired back on the next start. A block that still matches what the
+last start wired is not captured, so the custom file only appears once you
+have actually customized the block.
+
+### Service Tunables
+Next to the plugin files lives
+`~/.config/omarchy/plugins/jam.grace-window/config.json`. It holds the
+service's own tunables and is written with the defaults below the first time
+the service starts:
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `groupingDelay` | `0.1` | Seconds to wait after (un)grouping before continuing. `0.0` is snappier; higher values prevent graphics glitches after (un)grouping. If some apps glitch with the **Grace groups** feature, increase this. |
+| `closeRetryMax` | `3` | Failed close attempts before the plugin gives up and restores the grace look in place (so a window is never stranded looking pending). |
+| `queryTimeoutMs` | `10000` | Abort a hung `hyprctl` command after this many milliseconds, so it can never wedge the dispatch queue. |
+| `loadWaitLimit` | `40` | Startup retries (each after `loadRetryIntervalMs`) waiting for the keybinding wiring to finish before the saved state is loaded. |
+| `sweepIntervalMs` | `500` | Grace countdown tick rate, in milliseconds. |
+| `loadRetryIntervalMs` | `500` | Cadence of the startup-load retry, in milliseconds. |
+| `openWaitSeconds` | `5` | How long the backing shell script may wait for one bounded read-only open before giving up. |
+
+Every value is validated: an entry that is missing, of the wrong type, or out of
+range falls back to its default on its own, so a typo never discards the rest.
+A `config.json` that is not valid JSON is reported and the defaults are used
+without rewriting the file, so a hand-edit is never silently undone. Deleting
+the file makes the next start recreate it with the defaults.
 
 **Example**: You can configure custom behaviour, like a "Minimize / Recover"
-workflow (hide on workspace 9 with no auto-close and only suttle look change)
+workflow (hide on workspace 9 with no auto-close and only subtle look change)
 by adding the desired keybindings to the managed block in
 `~/.config/hypr/bindings.lua`:
 ```
@@ -191,4 +208,10 @@ such workflows can coexist.
   default is wired instead, and a capture that cannot be written is reported
   but never stops the strip. The managed block in `~/.config/hypr/bindings.lua`
   itself stays fail-closed: a damaged or duplicated block is left untouched.
+- `config.json` is best-effort too: a file that cannot be read, is not valid
+  JSON, or holds an unusable value is reported, and the defaults (whichever
+  entries are affected) are used instead, so the service never fails to start
+  because of its configuration. The file is created only when it does not
+  exist, so the defaults written on first start are the initial content and a
+  hand-edited file is never overwritten.
 - Validated with `omarchy plugin validate`.

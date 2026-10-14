@@ -38,17 +38,35 @@ Item {
   id: root
 
   // ------------------------------------------------------------ configuration
+  // The values below are the shipped defaults. On first start the service writes
+  // them to config.json next to this file (untracked and gitignored) and reads
+  // that file on every start, so they can be edited there without touching the
+  // plugin. Every entry is validated; an absent, mistyped or out-of-range value
+  // falls back to its default here. See README.md.
+
   // Delay after (un)grouping so apps refresh their graphics; 0.0 is snappier,
   // higher values prevent glitches after (un)grouping.
-  readonly property double groupingDelay: 0.1
+  property double groupingDelay: 0.1
 
   // Failed close attempts before giving up; the look is then restored in place
   // so the window is not left stranded looking pending.
-  readonly property int closeRetryMax: 3
+  property int closeRetryMax: 3
 
   // A runner command is aborted after this; a hung hyprctl must not wedge the
   // single executor queue and lock the plugin into "busy" forever.
-  readonly property int queryTimeoutMs: 10000
+  property int queryTimeoutMs: 10000
+
+  // Startup retries, each after loadRetryIntervalMs, waiting for the keybinding
+  // wiring to finish before the saved state is loaded (see loadState).
+  property int loadWaitLimit: 40
+
+  // Grace countdown tick rate, and the cadence of the startup-load retry.
+  property int sweepIntervalMs: 500
+  property int loadRetryIntervalMs: 500
+
+  // How long the shell script may wait for one bounded read-only open. Passed
+  // to the script through the environment (see scriptEnvironment).
+  property int openWaitSeconds: 5
 
   // ------------------------------------------------------------ the plugin dir
   // Source path wired by the shell via `manifest`; falls back to the standard
@@ -62,6 +80,12 @@ Item {
   readonly property string scriptsDir: root.sourceDir + "/scripts"
   readonly property string bashScript: root.scriptsDir + "/grace-window.sh"
   readonly property string luaScript: root.scriptsDir + "/grace-window.lua"
+
+  // The user-editable configuration, next to the shipped files. Untracked and
+  // gitignored, so `omarchy plugin update` neither commits nor trips over it.
+  // Written with the shipped defaults on first start and read on every start
+  // (see applyConfig).
+  readonly property string configFile: root.sourceDir + "/config.json"
 
   // ------------------------------------------------------------ pending state
   // Pending hidden windows, newest last. `workspace` groups them into private
@@ -910,7 +934,8 @@ Item {
 
   // ---------------------------------------------------------------- sweep
   Timer {
-    interval: 500
+    id: sweepTimer
+    interval: root.sweepIntervalMs
     repeat: true
     running: true
     onTriggered: root.sweep()
@@ -1188,6 +1213,46 @@ Item {
     }
   }
 
+  // ------------------------------------------------------------- configuration
+  // The environment every invocation of the shell script gets, so the script's
+  // own bounded-open deadline matches the configured value. Set on the shared
+  // executor and the wiring processes; the detached teardown commands carry it
+  // as an `env` prefix instead (see teardownCommand).
+  function scriptEnvironment() {
+    return { GRACE_WINDOW_OPEN_WAIT: String(root.openWaitSeconds) }
+  }
+
+  // Apply the effective configuration the script printed (the defaults it
+  // writes on first start, merged with the user's edits). The script already
+  // validated and completed every entry, so this only guards the shape: a
+  // missing or non-numeric field keeps the default, and an answer that is not
+  // an object at all leaves the defaults untouched.
+  function applyConfig(raw) {
+    const cfg = root.parseJson(raw)
+    if (!cfg || typeof cfg !== "object") {
+      console.warn("grace-window: configuration could not be read; using the defaults")
+      return
+    }
+    if (typeof cfg.groupingDelay === "number") root.groupingDelay = cfg.groupingDelay
+    if (typeof cfg.closeRetryMax === "number") root.closeRetryMax = cfg.closeRetryMax
+    if (typeof cfg.queryTimeoutMs === "number") root.queryTimeoutMs = cfg.queryTimeoutMs
+    if (typeof cfg.loadWaitLimit === "number") root.loadWaitLimit = cfg.loadWaitLimit
+    if (typeof cfg.sweepIntervalMs === "number") root.sweepIntervalMs = cfg.sweepIntervalMs
+    if (typeof cfg.loadRetryIntervalMs === "number") root.loadRetryIntervalMs = cfg.loadRetryIntervalMs
+    if (typeof cfg.openWaitSeconds === "number") root.openWaitSeconds = cfg.openWaitSeconds
+    root.propagateScriptEnvironment()
+  }
+
+  // Push the configured script environment onto the long-lived processes. Set
+  // once after the config is read, before any of them starts; the detached
+  // teardown commands read root.openWaitSeconds directly (teardownCommand).
+  function propagateScriptEnvironment() {
+    const env = root.scriptEnvironment()
+    runnerProc.environment = env
+    wireProc.environment = env
+    unwireCopy.environment = env
+  }
+
   // The status string: most recent live hidden window across all buffers. An
   // expired window still counts — until its close runs it can be reopened.
   function status() {
@@ -1293,6 +1358,15 @@ Item {
     return root.unwireInstalled ? root.unwireRuntimeScript : root.bashScript
   }
 
+  // A detached teardown invocation of the script, carrying the configured
+  // bounded-open deadline. execDetached takes no environment, so it is passed
+  // with an `env` prefix; `env` execs into bash, so the command stays a single
+  // process that a signal reaches as a whole.
+  function teardownCommand(args) {
+    return ["env", "GRACE_WINDOW_OPEN_WAIT=" + String(root.openWaitSeconds),
+      "bash", root.teardownScript()].concat(args)
+  }
+
   // The capture of the live block into customBindingsFile rides along with the
   // strip, in the same command: a separate one could run after the block is
   // already gone, or not at all.
@@ -1301,12 +1375,12 @@ Item {
     if (!root.unwireInstalled) {
       console.warn("grace-window: unwire script not installed; using plugin script as fallback")
     }
-    Quickshell.execDetached(["bash", root.teardownScript(), "unwire",
+    Quickshell.execDetached(root.teardownCommand(["unwire",
       target,
       root.bindingsBlockBgn,
       root.bindingsBlockEnd,
       root.customBindingsFile,
-      root.wiredBindingsFile])
+      root.wiredBindingsFile]))
   }
 
   // Teardown variant of cancel(): restores the grace look of every pending and
@@ -1319,8 +1393,8 @@ Item {
     if (!root.unwireInstalled) {
       console.warn("grace-window: unwire script not installed; using plugin script as fallback")
     }
-    Quickshell.execDetached(["bash", root.teardownScript(), "undo-grace",
-      JSON.stringify(all)])
+    Quickshell.execDetached(root.teardownCommand(["undo-grace",
+      JSON.stringify(all)]))
   }
 
   // ------------------------------------------------------- state persistence
@@ -1389,8 +1463,8 @@ Item {
   // whether it may publish at all (see Component.onDestruction).
   function saveStateDetached(entries) {
     const saveable = entries || root.saveableEntries()
-    Quickshell.execDetached(["bash", root.teardownScript(), "save-state",
-      root.unwireRuntimeDir, JSON.stringify(saveable)])
+    Quickshell.execDetached(root.teardownCommand(["save-state",
+      root.unwireRuntimeDir, JSON.stringify(saveable)]))
   }
 
   // How the startup load ended, and whether publishing the in-memory pending
@@ -1404,15 +1478,15 @@ Item {
   //   complete     it finished and the saved state was fully accounted for
   //   incomplete   it was cut short; pending is not the whole truth
   property string loadVerdict: "pending"
-  // How often loadState has deferred itself while the wire was still running.
+  // How often loadState has deferred itself while the wire was still running,
+  // bounded by the configured loadWaitLimit.
   property int loadWaits: 0
-  readonly property int loadWaitLimit: 40
 
   // Bounded retry for loadState while another op is in flight, instead of a busy
   // Qt.callLater spin.
   Timer {
     id: loadRetryTimer
-    interval: 500
+    interval: root.loadRetryIntervalMs
     repeat: false
     onTriggered: root.loadState()
   }
@@ -1596,14 +1670,28 @@ Item {
 
   // ---------------------------------------------------------------- startup
   Component.onCompleted: {
-    // The shell assigns root.manifest after creating this service, so defer
-    // the wiring, unwire-copy, state restore and self-check until it is set.
+    // Seed the sweep clock before any window can be hidden: a hide that lands
+    // before the first tick would otherwise measure the whole epoch since 1970
+    // and expire at once.
     root.lastTick = Date.now()
-    Qt.callLater(root.wireBindings)
-    Qt.callLater(root.installUnwireScript)
-    Qt.callLater(root.loadState)
-    Qt.callLater(root.hydrateFocus)
-    Qt.callLater(root.selfCheck)
+    // The shell assigns root.manifest after creating this service, so defer the
+    // whole startup until it is set.
+    Qt.callLater(root.bootstrap)
+  }
+
+  // Load config.json first — writing it with the defaults on first start — so
+  // every startup step below runs with the configured values, then wire the
+  // keybindings, install the teardown copy, seed focus and self-check, and
+  // finally restore the saved state (which waits for the wiring to finish).
+  function bootstrap() {
+    root.runOpQuery(["bash", root.bashScript, "config", root.configFile]).then(function (raw) {
+      root.applyConfig(raw)
+      root.wireBindings()
+      root.installUnwireScript()
+      root.hydrateFocus()
+      root.selfCheck()
+      root.loadState()
+    })
   }
 
   // Fires on plugin disable/remove and shell shutdown. Cancels pending windows

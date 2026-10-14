@@ -22,6 +22,10 @@
 # save-state DIR JSON          Write DIR/grace-window.json atomically; empty
 #                              clears it.
 # state-probe                  Client address + workspace id/name JSON.
+# config PATH                  Print the effective configuration for PATH as
+#                              JSON, creating PATH with the shipped defaults on
+#                              first use; a damaged PATH is reported and every
+#                              unusable value falls back to its default.
 # install-unwire DIR           Copy this script and its awk/lua partners into
 #                              DIR (atomically), for teardown.
 #
@@ -66,10 +70,14 @@ tmpfile=""
 me_uid=""
 proc_seen=""
 # How long a read-only open in a child (open_file_in_child) may take before it
-# counts as stuck. Comfortably under the service's own 10s watchdog, so a name
-# that blocks is reported as an error by this script instead of the whole
-# command being killed from the outside.
-open_wait=5
+# counts as stuck. Comfortably under the service's own watchdog, so a name that
+# blocks is reported as an error by this script instead of the whole command
+# being killed from the outside. The service passes config.json's
+# openWaitSeconds through GRACE_WINDOW_OPEN_WAIT; a missing, mistyped or
+# out-of-range value falls back to the default here, so a bad config can never
+# wedge an open.
+open_wait="${GRACE_WINDOW_OPEN_WAIT:-5}"
+if [[ ! "$open_wait" =~ ^[0-9]+$ ]] || (( open_wait < 1 )); then open_wait=5; fi
 # The children holding a descriptor open on our behalf, killed and reaped by
 # release_holders on every way out.
 declare -a holder_pids=()
@@ -87,6 +95,9 @@ SELF_FD=""
 SELF_PATH="$self"
 
 say() { echo "grace-window: $*"; }
+# Warnings for a command whose stdout is consumed as data (config): they go to
+# stderr so a hand-edited-but-damaged config does not corrupt the JSON answer.
+warn() { echo "grace-window: $*" >&2; }
 die() {
   if [[ -n "$tmpfile" ]]; then rm -f "$tmpfile"; fi
   say "ERROR: $*"
@@ -1005,6 +1016,80 @@ cmd_state_probe() {
   jq -L "$SELF_PATH" -c 'include "grace-window"; stateProbe' <<<"$clients" || echo "[]"
 }
 
+# Print config.json's content, or return 3 when the file is simply not there, so
+# the caller knows to write the defaults. Runs in a command substitution at its
+# call site, where a die() (a symlinked config, a foreign owner, a directory in
+# the path) is a reportable failed read rather than a dead command: a config
+# that cannot be read must cost a warning, never the service.
+read_config_file() {
+  local dir="$1" name="$2" path="$3"
+  [[ -n "$dir" ]] || return 3
+  if ! open_dir_chain "$dir" || ! open_file_in_dir "$name" "$path"; then
+    return 3
+  fi
+  cat -- "$FILE_PATH"
+}
+
+# Publish the shipped defaults as PATH, atomically and only while the name is
+# still free: a file that appeared meanwhile (a race with another first start,
+# or one the user created by hand) is left alone rather than clobbered.
+write_config_defaults() {
+  local dir="$1" name="$2" path="$3" content="$4" tmp
+  ensure_dir_chain "$dir" || die "config: cannot open or create the directory of $path"
+  tmp="$(mktemp "$DIR_PATH/$name.tmp.XXXXXX")" || die "config: could not create a temporary file for $path"
+  tmpfile="$tmp"
+  printf '%s\n' "$content" > "$tmp" || die "config: could not write $path"
+  chmod 644 "$tmp" || die "config: could not set permissions on $path"
+  replace_in_dir "$tmp" "$name" "$path" absent
+  tmpfile=""
+}
+
+# The effective configuration for PATH, as JSON on stdout: PATH itself when it
+# holds usable values, the shipped defaults for anything missing or unusable. On
+# first start PATH does not exist yet and is created holding exactly the
+# defaults, so a user has a commented-by-example file to edit. A PATH that is
+# damaged (unreadable, not JSON, empty) is reported on stderr and answered with
+# the defaults without being rewritten, so a hand-edit is never silently undone.
+cmd_config() {
+  local path="${1:-}"
+  local dir name raw rc
+  local eff=""
+  [[ -n "$path" ]] || die "config: missing path"
+  dir="$(phys_prefix "$(dirname -- "$path")")" || die "config: cannot resolve the directory of $path"
+  name="$(basename -- "$path")"
+  raw="$(read_config_file "$dir" "$name" "$path")"; rc=$?
+  bind_self_dir
+  if (( rc == 3 )); then
+    eff="$(jq -n -L "$SELF_PATH" -c 'include "grace-window"; configDefaults')" \
+      || die "config: cannot compute the defaults"
+    # The file is pretty-printed so it stays pleasant to edit by hand; the
+    # answer printed for the service stays compact.
+    write_config_defaults "$dir" "$name" "$path" "$(jq . <<<"$eff")"
+    printf '%s\n' "$eff"
+    return 0
+  fi
+  if (( rc != 0 )); then
+    warn "warning: config at $path is unreadable; using the defaults"
+    raw=""
+  fi
+  if [[ -n "$raw" ]]; then
+    eff="$(jq -n -L "$SELF_PATH" -c --argjson user "$raw" \
+      'include "grace-window"; readConfig($user)' 2>/dev/null)" || eff=""
+  fi
+  if [[ -z "$eff" ]]; then
+    if (( rc != 0 )); then
+      : # already reported as unreadable above
+    elif [[ -n "$raw" ]]; then
+      warn "warning: config at $path is not valid JSON; using the defaults"
+    else
+      warn "warning: config at $path is empty; using the defaults"
+    fi
+    eff="$(jq -n -L "$SELF_PATH" -c 'include "grace-window"; configDefaults')" \
+      || die "config: cannot compute the defaults"
+  fi
+  printf '%s\n' "$eff"
+}
+
 case "${1:-}" in
   hide-query) shift; cmd_hide_query "$@" ;;
   reopen-query) shift; cmd_reopen_query "$@" ;;
@@ -1016,6 +1101,7 @@ case "${1:-}" in
   undo-grace) shift; cmd_undo_grace "$@" ;;
   save-state) shift; cmd_save_state "$@" ;;
   state-probe) shift; cmd_state_probe "$@" ;;
+  config) shift; cmd_config "$@" ;;
   install-unwire) shift; cmd_install_unwire "$@" ;;
   *) say "unknown subcommand: ${1:-}"; exit 1 ;;
 esac

@@ -69,3 +69,48 @@ def regroupDirection($a; $f):
   | (($fwin | cx) - ($tgt | cx)) as $dx
   | (($fwin | cy) - ($tgt | cy)) as $dy
   | if (($dx | fabs) >= ($dy | fabs)) then (if $dx > 0 then "r" else "l" end) else (if $dy > 0 then "d" else "u" end) end;
+
+# ---------------------------------------------------------------- configuration
+# The plugin's tunables and their shipped defaults. config.json, written next to
+# this plugin on first start, overrides any of them. readConfig coerces and
+# range-checks every value, so a hand-edited file can never inject a negative
+# timeout, a fractional retry count, or a string where a number belongs: a value
+# that is absent, mistyped or out of range falls back to its own default —
+# independently of the others, so one bad entry never discards the rest.
+def configDefaults:
+  {
+    version: 1,
+    groupingDelay: 0.1,
+    closeRetryMax: 3,
+    queryTimeoutMs: 10000,
+    loadWaitLimit: 40,
+    sweepIntervalMs: 500,
+    loadRetryIntervalMs: 500,
+    openWaitSeconds: 5
+  };
+
+# A number >= $min, or $def otherwise. JSON numbers are always finite, so only
+# the type and the lower bound need checking.
+def numOr($v; $def; $min):
+  if ($v | type) == "number" and $v >= $min then $v else $def end;
+
+# Like numOr, but the value must also be a whole number.
+def intOr($v; $def; $min):
+  if ($v | type) == "number" and $v == ($v | floor) and $v >= $min then $v else $def end;
+
+# The effective configuration: the defaults, overridden by the user's object
+# wherever an entry is present and usable. Any input that is not an object
+# (a missing file, a bare string, an array) leaves every default in place.
+def readConfig($user):
+  (if ($user | type) == "object" then $user else {} end) as $u
+  | configDefaults as $d
+  | {
+      version: $d.version,
+      groupingDelay: numOr($u.groupingDelay; $d.groupingDelay; 0),
+      closeRetryMax: intOr($u.closeRetryMax; $d.closeRetryMax; 0),
+      queryTimeoutMs: intOr($u.queryTimeoutMs; $d.queryTimeoutMs; 1),
+      loadWaitLimit: intOr($u.loadWaitLimit; $d.loadWaitLimit; 0),
+      sweepIntervalMs: intOr($u.sweepIntervalMs; $d.sweepIntervalMs; 1),
+      loadRetryIntervalMs: intOr($u.loadRetryIntervalMs; $d.loadRetryIntervalMs; 1),
+      openWaitSeconds: intOr($u.openWaitSeconds; $d.openWaitSeconds; 1)
+    };
