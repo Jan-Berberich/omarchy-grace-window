@@ -2,8 +2,8 @@
 # Grace Window — every shell operation the plugin needs, in one file.
 #
 # hide-query / reopen-query    Capture focused-window / workspace state (JSON).
-# leave-group ADDR DELAY       Pull ADDR out of its tabbed group (+ delay).
-# regroup ADDR FOCUS DELAY     Move ADDR into FOCUS's tabbed group.
+# leave-group ADDR DELAY_MS    Pull ADDR out of its tabbed group (+ delay ms).
+# regroup ADDR FOCUS DELAY_MS  Move ADDR into FOCUS's tabbed group (+ delay ms).
 # close ADDR                   Close ADDR and verify it is gone: exit 0 only
 #                              when the address no longer exists (retryable
 #                              otherwise, never a success on a broken query).
@@ -69,15 +69,18 @@ self="$(phys_dir "$(dirname -- "$script_path")")"
 tmpfile=""
 me_uid=""
 proc_seen=""
+# Milliseconds as a fractional-seconds string, for the tools that only take
+# seconds (sleep, read -t).
+ms_to_seconds() { printf '%d.%03d' "$(( $1 / 1000 ))" "$(( $1 % 1000 ))"; }
 # How long a read-only open in a child (open_file_in_child) may take before it
-# counts as stuck. Comfortably under the service's own watchdog, so a name that
-# blocks is reported as an error by this script instead of the whole command
-# being killed from the outside. The service passes config.json's
-# openWaitSeconds through GRACE_WINDOW_OPEN_WAIT; a missing, mistyped or
-# out-of-range value falls back to the default here, so a bad config can never
-# wedge an open.
-open_wait="${GRACE_WINDOW_OPEN_WAIT:-5}"
-if [[ ! "$open_wait" =~ ^[0-9]+$ ]] || (( open_wait < 1 )); then open_wait=5; fi
+# counts as stuck, in milliseconds. Comfortably under the service's own watchdog,
+# so a name that blocks is reported as an error by this script instead of the
+# whole command being killed from the outside. The service passes config.json's
+# openWaitMs through GRACE_WINDOW_OPEN_WAIT; a missing, mistyped or out-of-range
+# value falls back to the default here, so a bad config can never wedge an open.
+open_wait_ms="${GRACE_WINDOW_OPEN_WAIT:-5000}"
+if [[ ! "$open_wait_ms" =~ ^[0-9]+$ ]] || (( open_wait_ms < 1 )); then open_wait_ms=5000; fi
+open_wait_s="$(ms_to_seconds "$open_wait_ms")"
 # The children holding a descriptor open on our behalf, killed and reaped by
 # release_holders on every way out.
 declare -a holder_pids=()
@@ -417,7 +420,8 @@ open_file_at() {
 #
 # This is the one place where a name is opened the way that can wait, so the
 # wait for it is ours and it is bounded: a name that never finishes opening costs
-# open_wait seconds and a clear error, instead of a service that has stopped.
+# open_wait_ms milliseconds and a clear error, instead of a service that has
+# stopped.
 # The child is given the path by variable, never on its standard input, which it
 # is busy reading; what it reports is compared against the inode that was checked
 # before it is used for anything.
@@ -448,13 +452,13 @@ open_file_in_child() {
   rc=0
   # The read is wrapped so that a pipe bash has already closed (the child gone)
   # fails quietly instead of printing a shell diagnostic into the output.
-  { IFS= read -r -t "$open_wait" report <&"$out"; } 2>/dev/null || rc=$?
+  { IFS= read -r -t "$open_wait_s" report <&"$out"; } 2>/dev/null || rc=$?
   if (( rc != 0 )); then
     release_holder "$pid"
     # A timed-out read is how a blocked open shows up here; a plain failure is
     # a child that could not open the name at all and did say so.
     if (( rc > 128 )); then
-      die "refusing to write: $what did not open within ${open_wait}s; left untouched (a fifo in place of a file?)"
+      die "refusing to write: $what did not open within ${open_wait_ms}ms; left untouched (a fifo in place of a file?)"
     fi
     die "cannot open $what"
   fi
@@ -609,13 +613,15 @@ cmd_reopen_query() {
 }
 
 cmd_leave_group() {
-  local addr="$1" delay="$2"
+  local addr="$1" delay_ms="${2:-0}"
+  [[ "$delay_ms" =~ ^[0-9]+$ ]] || delay_ms=0
   lua_call "window_out_of_group('$addr')" || return 1
-  sleep "$delay"
+  sleep "$(ms_to_seconds "$delay_ms")"
 }
 
 cmd_regroup() {
-  local addr="$1" focus="$2" delay="$3" clients dir
+  local addr="$1" focus="$2" delay_ms="${3:-0}" clients dir
+  [[ "$delay_ms" =~ ^[0-9]+$ ]] || delay_ms=0
   clients=$(hyprctl -j clients 2>/dev/null)
   bind_self_dir
   dir=$(printf "%s" "$clients" \
@@ -624,7 +630,7 @@ cmd_regroup() {
       --arg f "$focus" \
       'include "grace-window"; regroupDirection($a; $f)')
   if [[ -n "$dir" ]]; then
-    sleep "$delay"
+    sleep "$(ms_to_seconds "$delay_ms")"
     lua_call "window_into_group('$addr', '$dir')" || return 1
   fi
 }

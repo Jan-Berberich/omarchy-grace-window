@@ -79,13 +79,13 @@ def regroupDirection($a; $f):
 # independently of the others, so one bad entry never discards the rest.
 def configDefaults:
   {
-    groupingDelay: 0.1,
+    groupingDelayMs: 100,
     closeRetryMax: 3,
     queryTimeoutMs: 10000,
     loadWaitLimit: 40,
     sweepIntervalMs: 500,
     loadRetryIntervalMs: 500,
-    openWaitSeconds: 5
+    openWaitMs: 5000
   };
 
 # A number >= $min, or $def otherwise. JSON numbers are always finite, so only
@@ -104,11 +104,11 @@ def readConfig($user):
   (if ($user | type) == "object" then $user else {} end) as $u
   | configDefaults as $d
   | {
-      groupingDelay: numOr($u.groupingDelay; $d.groupingDelay; 0),
+      groupingDelayMs: intOr($u.groupingDelayMs; $d.groupingDelayMs; 0),
       closeRetryMax: intOr($u.closeRetryMax; $d.closeRetryMax; 0),
       queryTimeoutMs: intOr($u.queryTimeoutMs; $d.queryTimeoutMs; 1),
       loadWaitLimit: intOr($u.loadWaitLimit; $d.loadWaitLimit; 0),
       sweepIntervalMs: intOr($u.sweepIntervalMs; $d.sweepIntervalMs; 1),
       loadRetryIntervalMs: intOr($u.loadRetryIntervalMs; $d.loadRetryIntervalMs; 1),
-      openWaitSeconds: intOr($u.openWaitSeconds; $d.openWaitSeconds; 1)
+      openWaitMs: intOr($u.openWaitMs; $d.openWaitMs; 1)
     };

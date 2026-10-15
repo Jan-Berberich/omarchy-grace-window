@@ -45,9 +45,9 @@ Item {
   // validated; an absent, mistyped or out-of-range value falls back to its
   // default here. See README.md.
 
-  // Delay after (un)grouping so apps refresh their graphics; 0.0 is snappier,
-  // higher values prevent glitches after (un)grouping.
-  property double groupingDelay: 0.1
+  // Delay after (un)grouping so apps refresh their graphics, in milliseconds;
+  // 0 is snappier, higher values prevent glitches after (un)grouping.
+  property int groupingDelayMs: 100
 
   // Failed close attempts before giving up; the look is then restored in place
   // so the window is not left stranded looking pending.
@@ -65,9 +65,10 @@ Item {
   property int sweepIntervalMs: 500
   property int loadRetryIntervalMs: 500
 
-  // How long the shell script may wait for one bounded read-only open. Passed
-  // to the script through the environment (see scriptEnvironment).
-  property int openWaitSeconds: 5
+  // How long the shell script may wait for one bounded read-only open, in
+  // milliseconds. Passed to the script through the environment (see
+  // scriptEnvironment).
+  property int openWaitMs: 5000
 
   // ------------------------------------------------------------ the plugin dir
   // Source path wired by the shell via `manifest`; falls back to the standard
@@ -425,7 +426,7 @@ Item {
       // is not dragged to the grace workspace.
       const grouped = Array.isArray(rec.grouped) ? rec.grouped : []
       if (grouped.length > 0) {
-        root.dispatchOps(["bash", root.bashScript, "leave-group", addr, String(root.groupingDelay)])
+        root.dispatchOps(["bash", root.bashScript, "leave-group", addr, String(root.groupingDelayMs)])
       }
       // Reapply the look from this call's args (real opacity scaled by the new
       // opacityFactor, corners cut by the new rounding/power).
@@ -492,7 +493,7 @@ Item {
     root.pending.push(entry)
     const grouped = Array.isArray(rec.grouped) ? rec.grouped : []
     if (grouped.length > 0) {
-      root.dispatchOps(["bash", root.bashScript, "leave-group", addr, String(root.groupingDelay)])
+      root.dispatchOps(["bash", root.bashScript, "leave-group", addr, String(root.groupingDelayMs)])
     }
     if (entry.floating) root.setWindowPin(addr, "off")
     root.hideMove(entry, workspace)
@@ -585,7 +586,7 @@ Item {
     // Join the group that had focus when reopening was triggered.
     root.dispatchRestore([
       "bash", root.bashScript, "regroup",
-      entry.address, win.address || "", String(root.groupingDelay),
+      entry.address, win.address || "", String(root.groupingDelayMs),
     ], restoreTag)
     // End with the window focused, so the reopen lands the user where they left
     // off.
@@ -1220,7 +1221,7 @@ Item {
   // executor and the wiring processes; the detached teardown commands carry it
   // as an `env` prefix instead (see teardownCommand).
   function scriptEnvironment() {
-    return { GRACE_WINDOW_OPEN_WAIT: String(root.openWaitSeconds) }
+    return { GRACE_WINDOW_OPEN_WAIT: String(root.openWaitMs) }
   }
 
   // Apply the effective configuration the script printed (the defaults it
@@ -1234,19 +1235,19 @@ Item {
       console.warn("grace-window: configuration could not be read; using the defaults")
       return
     }
-    if (typeof cfg.groupingDelay === "number") root.groupingDelay = cfg.groupingDelay
+    if (typeof cfg.groupingDelayMs === "number") root.groupingDelayMs = cfg.groupingDelayMs
     if (typeof cfg.closeRetryMax === "number") root.closeRetryMax = cfg.closeRetryMax
     if (typeof cfg.queryTimeoutMs === "number") root.queryTimeoutMs = cfg.queryTimeoutMs
     if (typeof cfg.loadWaitLimit === "number") root.loadWaitLimit = cfg.loadWaitLimit
     if (typeof cfg.sweepIntervalMs === "number") root.sweepIntervalMs = cfg.sweepIntervalMs
     if (typeof cfg.loadRetryIntervalMs === "number") root.loadRetryIntervalMs = cfg.loadRetryIntervalMs
-    if (typeof cfg.openWaitSeconds === "number") root.openWaitSeconds = cfg.openWaitSeconds
+    if (typeof cfg.openWaitMs === "number") root.openWaitMs = cfg.openWaitMs
     root.propagateScriptEnvironment()
   }
 
   // Push the configured script environment onto the long-lived processes. Set
   // once after the config is read, before any of them starts; the detached
-  // teardown commands read root.openWaitSeconds directly (teardownCommand).
+  // teardown commands read root.openWaitMs directly (teardownCommand).
   function propagateScriptEnvironment() {
     const env = root.scriptEnvironment()
     runnerProc.environment = env
@@ -1392,7 +1393,7 @@ Item {
   // with an `env` prefix; `env` execs into bash, so the command stays a single
   // process that a signal reaches as a whole.
   function teardownCommand(args) {
-    return ["env", "GRACE_WINDOW_OPEN_WAIT=" + String(root.openWaitSeconds),
+    return ["env", "GRACE_WINDOW_OPEN_WAIT=" + String(root.openWaitMs),
       "bash", root.teardownScript()].concat(args)
   }
 

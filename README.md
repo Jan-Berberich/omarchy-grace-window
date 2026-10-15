@@ -132,13 +132,13 @@ the service starts:
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `groupingDelay` | `0.1` | Seconds to wait after (un)grouping before continuing. `0.0` is snappier; higher values prevent graphics glitches after (un)grouping. If some apps glitch with the **Grace groups** feature, increase this. |
+| `groupingDelayMs` | `100` | Milliseconds to wait after (un)grouping before continuing. `0` is snappier; higher values prevent graphics glitches after (un)grouping. If some apps glitch with the **Grace groups** feature, increase this. |
 | `closeRetryMax` | `3` | Failed close attempts before the plugin gives up and restores the grace look in place (so a window is never stranded looking pending). |
 | `queryTimeoutMs` | `10000` | Abort a hung `hyprctl` command after this many milliseconds, so it can never wedge the dispatch queue. |
 | `loadWaitLimit` | `40` | Startup retries (each after `loadRetryIntervalMs`) waiting for the keybinding wiring to finish before the saved state is loaded. |
 | `sweepIntervalMs` | `500` | Grace countdown tick rate, in milliseconds. |
 | `loadRetryIntervalMs` | `500` | Cadence of the startup-load retry, in milliseconds. |
-| `openWaitSeconds` | `5` | How long the backing shell script may wait for one bounded read-only open before giving up. |
+| `openWaitMs` | `5000` | How long the backing shell script may wait for one bounded read-only open before giving up, in milliseconds. |
 
 Every value is validated: an entry that is missing, of the wrong type, or out of
 range falls back to its default on its own, so a typo never discards the rest.
