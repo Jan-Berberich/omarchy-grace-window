@@ -79,7 +79,6 @@ def regroupDirection($a; $f):
 # independently of the others, so one bad entry never discards the rest.
 def configDefaults:
   {
-    version: 1,
     groupingDelay: 0.1,
     closeRetryMax: 3,
     queryTimeoutMs: 10000,
@@ -105,7 +104,6 @@ def readConfig($user):
   (if ($user | type) == "object" then $user else {} end) as $u
   | configDefaults as $d
   | {
-      version: $d.version,
       groupingDelay: numOr($u.groupingDelay; $d.groupingDelay; 0),
       closeRetryMax: intOr($u.closeRetryMax; $d.closeRetryMax; 0),
       queryTimeoutMs: intOr($u.queryTimeoutMs; $d.queryTimeoutMs; 1),
