@@ -105,13 +105,9 @@ keeps its own buffer of hidden windows, so multiple workflows can coexist.
 There are two places to configure the plugin: the **keybindings**, in your live
 `~/.config/hypr/bindings.lua`, and the **service tunables**, in the generated
 `~/.config/omarchy/plugins/jam.grace-window/config.json` next to the plugin's
-own files. Changes made in `config.json` require a plugin restart for the
-changes to take effect:
-
-```bash
-omarchy plugin disable jam.grace-window
-omarchy plugin enable jam.grace-window
-```
+own files. An edit to `config.json` is applied automatically: the service
+watches the file (and its directory) and re-reads it as soon as it changes, so
+no plugin restart is needed.
 
 ### Keybindings
 Edit the managed block in your live `~/.config/hypr/bindings.lua` (inside the

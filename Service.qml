@@ -41,8 +41,9 @@ Item {
   // The values below are the shipped defaults. On first start the service writes
   // them to config.json next to this file (untracked and gitignored) and reads
   // that file on every start, so they can be edited there without touching the
-  // plugin. Every entry is validated; an absent, mistyped or out-of-range value
-  // falls back to its default here. See README.md.
+  // plugin. A later edit is picked up live (see reloadConfig). Every entry is
+  // validated; an absent, mistyped or out-of-range value falls back to its
+  // default here. See README.md.
 
   // Delay after (un)grouping so apps refresh their graphics; 0.0 is snappier,
   // higher values prevent glitches after (un)grouping.
@@ -1251,6 +1252,34 @@ Item {
     runnerProc.environment = env
     wireProc.environment = env
     unwireCopy.environment = env
+  }
+
+  // Re-read the configuration after config.json changes on disk, so an edit
+  // takes effect without a plugin restart. FileView watches the file and its
+  // directory through inotify, so both an in-place save and an atomic
+  // rename-over are seen. The events a single save (or our own atomic write)
+  // emits are coalesced by the timer, and re-running the `config` subcommand
+  // keeps the same validation as startup — it only rewrites the file when it is
+  // missing, so this never feeds back into another change.
+  Timer {
+    id: configReloadTimer
+    interval: 250
+    onTriggered: root.reloadConfig()
+  }
+
+  FileView {
+    id: configWatcher
+    path: root.configFile
+    watchChanges: true
+    printErrors: false
+    onFileChanged: configReloadTimer.restart()
+  }
+
+  function reloadConfig() {
+    root.runOpQuery(["bash", root.bashScript, "config", root.configFile]).then(function (raw) {
+      root.applyConfig(raw)
+      console.log("grace-window: configuration reloaded from " + root.configFile)
+    })
   }
 
   // The status string: most recent live hidden window across all buffers. An
