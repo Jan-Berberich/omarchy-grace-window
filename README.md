@@ -180,6 +180,10 @@ such workflows can coexist.
   Hyprland for any other reason (closed on its own, crashed) is dropped by its
   `closewindow` event, so `status` never counts a window that no longer
   exists.
+- Reopening a floating or pinned window on a different monitor than the one it
+  was hidden on keeps its place within the monitor: it reappears at the same
+  position relative to the monitor it lands on, instead of at its old absolute
+  screen coordinates.
 - Every file the plugin reads or writes (managed keybinding block, teardown
   copy of the scripts, saved state) goes through a directory descriptor that
   was opened, checked and then kept open, and is published with an atomic

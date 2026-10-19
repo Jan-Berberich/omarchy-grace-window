@@ -575,13 +575,19 @@ window_prop() {
 }
 
 cmd_hide_query() {
-  local win addr opacity opacity_inactive rounding rounding_power
+  local win mn addr opacity opacity_inactive rounding rounding_power
   win=$(hyprctl -j activewindow 2>/dev/null) || exit 0
   addr=$(jq -r '.address // empty' <<<"$win") || true
   if [[ -z "$addr" || "$addr" == "0x0" ]]; then
     echo "{}"
     exit 0
   fi
+  # The window's monitor origin, captured with its position so a reopen on
+  # another monitor can keep a floating window at the same place within the
+  # monitor. A broken answer just leaves the origin out (null): the window is
+  # still hidden, and its reopen falls back to the absolute position.
+  mn=$(hyprctl -j monitors 2>/dev/null || true)
+  [[ -n "$mn" ]] || mn="[]"
   opacity=$(window_prop "$addr" opacity)
   opacity_inactive=$(window_prop "$addr" opacity_inactive)
   rounding=$(window_prop "$addr" rounding)
@@ -592,7 +598,8 @@ cmd_hide_query() {
     --arg opacityInactive "$opacity_inactive" \
     --arg rounding "$rounding" \
     --arg roundingPower "$rounding_power" \
-    'include "grace-window"; hideQuery($opacity; $opacityInactive; $rounding; $roundingPower)' \
+    --arg monitors "$mn" \
+    'include "grace-window"; hideQuery($opacity; $opacityInactive; $rounding; $roundingPower; $monitors)' \
     <<<"$win"
 }
 

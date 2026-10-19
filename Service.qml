@@ -8,7 +8,8 @@
 //     "none" for unusable arguments.
 //   reopen(workspace)  Bring the window back, cancel its auto-close and
 //     restore its captured state, rejoining the focused tabbed group. It lands
-//     on the active workspace (or an open scratchpad on the focused monitor).
+//     on the active workspace (or an open scratchpad on the focused monitor),
+//     and a floating window keeps its place within the monitor it lands on.
 //   cancel()  Forget every pending window, restoring its grace look in place.
 //   status()  "idle", or "pending <N>s" for the most recent live hidden window.
 //   result()  Signal with the real verdict of each hide/reopen — "ok" or
@@ -471,6 +472,13 @@ Item {
       pinned: rec.pinned || false,
       x: rec.x || 0,
       y: rec.y || 0,
+      // The origin of the monitor the position was captured on (null when the
+      // monitors answer did not name it). restorePosition translates x/y from
+      // it to the monitor a reopen lands on, so a floating window keeps its
+      // place within the monitor instead of moving to another one's
+      // coordinates.
+      monitorX: typeof rec.monitorX === "number" ? rec.monitorX : null,
+      monitorY: typeof rec.monitorY === "number" ? rec.monitorY : null,
       w: rec.w || 0,
       h: rec.h || 0,
       // The applied grace look (dimmed, corners cut) — what a startup restore
@@ -553,6 +561,14 @@ Item {
       target = id
     }
     if (target === "") return "none"
+    // The monitor the window lands on is the focused one: `target` is its
+    // active workspace, or the special workspace shown on it. Its origin
+    // translates a captured position, so a floating window reopens at the same
+    // place within that monitor. Null when the monitors answer named none (a
+    // broken answer), and restorePosition then falls back to the captured
+    // absolute position.
+    const monitorX = typeof data.mx === "number" ? data.mx : null
+    const monitorY = typeof data.my === "number" ? data.my : null
     // Prefer the focused window when it is in grace here; else take the newest
     // reopenable entry. Windows already `closing` are lost either way.
     let index = -1
@@ -582,7 +598,7 @@ Item {
     entry.state = "restoring"
     entry.restoreFailed = false
     root.restoring[entry.address] = entry
-    root.restoreWindow(entry, target, restoreTag)
+    root.restoreWindow(entry, target, restoreTag, monitorX, monitorY)
     // Join the group that had focus when reopening was triggered.
     root.dispatchRestore([
       "bash", root.bashScript, "regroup",
@@ -623,9 +639,13 @@ Item {
     root.resetWindowRules(entry.address, tag)
   }
 
-  function restoreWindow(entry, workspaceId, tag) {
-    // Undo the grace look, restore mode and geometry, then pin — nothing gets
-    // pinned mid-flight while a moved window is still on its way.
+  function restoreWindow(entry, workspaceId, tag, monitorX, monitorY) {
+    // Undo the grace look, restore mode and size, move onto the target
+    // workspace, then position and pin. A known target position is applied
+    // after the workspace move: Hyprland's move-to-workspace preserves a
+    // floating window's monitor-relative position, so an absolute move applied
+    // first would be translated a second time and land at the wrong place.
+    // Nothing gets pinned mid-flight while a moved window is still on its way.
     root.undoGraceState(entry, tag)
     if (entry.fullscreen > 0 || entry.fullscreenClient > 0) {
       // Restore the internal fullscreen. `fullscreenClient` was never reset by
@@ -637,10 +657,34 @@ Item {
     if (entry.floating) {
       root.setWindowFloat(entry.address, "on", tag)
       if (entry.w > 0 && entry.h > 0) root.resizeWindow(entry.address, entry.w, entry.h, tag)
-      root.moveWindowTo(entry.address, entry.x, entry.y, tag)
     }
+    const position = entry.floating ? root.restorePosition(entry, monitorX, monitorY) : null
+    // Without known monitor origins the position is absolute for whatever
+    // monitor the window was captured on, so it must go before the workspace
+    // move, where Hyprland translates it relative to the monitor it leaves
+    // (the pre-capture-origin behaviour).
+    if (position && !position.known) root.moveWindowTo(entry.address, position.x, position.y, tag)
     root.moveWindowToWorkspace(entry.address, workspaceId, tag)
+    if (position && position.known) root.moveWindowTo(entry.address, position.x, position.y, tag)
     if (entry.pinned) root.setWindowPin(entry.address, "on", tag)
+  }
+
+  // The absolute position a floating window reopens at: its captured position
+  // translated from the monitor it was hidden on to the monitor it reopens on,
+  // so it keeps the same place within the monitor. `known` is false when
+  // either monitor origin is unknown — an older saved state, or a monitors
+  // answer that did not name the monitor — and x/y are the captured absolute
+  // position then.
+  function restorePosition(entry, monitorX, monitorY) {
+    if (typeof entry.monitorX !== "number" || typeof entry.monitorY !== "number"
+        || typeof monitorX !== "number" || typeof monitorY !== "number") {
+      return { x: entry.x, y: entry.y, known: false }
+    }
+    return {
+      x: monitorX + (entry.x - entry.monitorX),
+      y: monitorY + (entry.y - entry.monitorY),
+      known: true,
+    }
   }
 
   // In-place restore for cancel / give-up close / teardown: only the grace look
@@ -1478,6 +1522,8 @@ Item {
         pinned: e.pinned,
         x: e.x,
         y: e.y,
+        monitorX: e.monitorX,
+        monitorY: e.monitorY,
         w: e.w,
         h: e.h,
       })
@@ -1649,6 +1695,10 @@ Item {
         pinned: !!e.pinned,
         x: Number(e.x) || 0,
         y: Number(e.y) || 0,
+        // An older saved state predates the monitor origin: null, so a reopen
+        // falls back to the saved absolute position.
+        monitorX: typeof e.monitorX === "number" ? e.monitorX : null,
+        monitorY: typeof e.monitorY === "number" ? e.monitorY : null,
         w: Number(e.w) || 0,
         h: Number(e.h) || 0,
         // The applied grace look, if saved; fall back to the (un-dimmed)

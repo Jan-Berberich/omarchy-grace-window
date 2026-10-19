@@ -11,9 +11,18 @@ module { "name": "grace-window" };
 def firstOrNull: if length == 0 then null else .[0] end;
 
 # The hide-path capture from an activewindow JSON, with the per-window look
-# values passed in as arguments.
-def hideQuery($opacity; $opacityInactive; $rounding; $roundingPower):
-  {
+# values passed in as arguments and the monitors array. The origin of the
+# window's monitor is captured with the position: a reopen on another monitor
+# translates the position by it, so a floating window keeps its place within
+# the monitor instead of landing at coordinates that only make sense on the
+# monitor it was hidden on. A monitors answer that is not an array (a broken
+# query, say) only leaves the origin out — the window is still hidden.
+def hideQuery($opacity; $opacityInactive; $rounding; $roundingPower; $monitors):
+  ( $monitors
+    | try fromjson catch []
+    | if type == "array" then . else [] end ) as $mons
+  | ( .monitor as $id | $mons | map(select(.id == $id)) | firstOrNull ) as $mon
+  | {
     address: .address,
     workspaceId: ((.workspace.id // 0) | tostring),
     workspaceName: (.workspace.name // ""),
@@ -27,20 +36,30 @@ def hideQuery($opacity; $opacityInactive; $rounding; $roundingPower):
     pinned: .pinned,
     x: (.at[0] // 0),
     y: (.at[1] // 0),
+    # The captured monitor's origin, or null when the monitors answer did not
+    # name it (a reopen then falls back to the absolute x/y).
+    monitorX: (if $mon != null then ($mon.x // 0) else null end),
+    monitorY: (if $mon != null then ($mon.y // 0) else null end),
     w: (.size[0] // 0),
     h: (.size[1] // 0),
     grouped: .grouped
   };
 
-# The reopen-path answer ({ aw, ws, sp }) from the three queried documents.
-# sp is the special workspace shown on the focused monitor (the scratchpad),
-# or null when no special workspace is up — the signal that lets a reopen land
-# on an active scratchpad instead of the regular workspace under its overlay.
+# The reopen-path answer ({ aw, ws, sp, mx, my }) from the three queried
+# documents. sp is the special workspace shown on the focused monitor (the
+# scratchpad), or null when no special workspace is up — the signal that lets a
+# reopen land on an active scratchpad instead of the regular workspace under its
+# overlay. mx/my are the focused monitor's origin — the monitor the reopened
+# window lands on, since `target` is its active workspace or a special
+# workspace shown there — used to restore a captured position on it. They are
+# null when no monitor is focused, so the caller can fall back.
 def reopenQuery($aw; $ws; $mn):
-  ({ aw: $aw, ws: $ws,
-     sp: (( $mn | map(select(.focused)) | firstOrNull ) as $m
-          | if $m != null and (($m.specialWorkspace.id // 0) != 0)
-            then $m.specialWorkspace else null end) });
+  ( $mn | map(select(.focused)) | firstOrNull ) as $m
+  | ({ aw: $aw, ws: $ws,
+       sp: (if $m != null and (($m.specialWorkspace.id // 0) != 0)
+             then $m.specialWorkspace else null end),
+       mx: (if $m != null then ($m.x // 0) else null end),
+       my: (if $m != null then ($m.y // 0) else null end) });
 
 # Restore-state probe: from every client, its address, the workspace it is on
 # (id as a string) and that workspace's name. A startup load keeps only saved
