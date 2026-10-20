@@ -58,6 +58,12 @@ Item {
   // single executor queue and lock the plugin into "busy" forever.
   property int queryTimeoutMs: 10000
 
+  // How long the close command may spend on its hyprctl calls before the script
+  // gives up on them itself. It sits under queryTimeoutMs so a stalled dispatch
+  // is reported by the script (and killed, with the same deadline passed to it)
+  // before the service would otherwise have to abort the whole command.
+  readonly property int closeWaitMs: Math.max(1, Math.floor(root.queryTimeoutMs * 0.8))
+
   // Startup retries, each after loadRetryIntervalMs, waiting for the keybinding
   // wiring to finish before the saved state is loaded (see loadState).
   property int loadWaitLimit: 40
@@ -162,10 +168,10 @@ Item {
   // invoked exactly once (guarded by `done`); queries use it to resolve their
   // stdout, closes to report success/failure, restores to settle.
   //
-  // A command that hangs is aborted by runnerTimeout: the process is killed
-  // and the queue is held until the outcome is attributed — by the killed
-  // process's own onExited, or by runnerAbortFallback (a safety net for the
-  // case the killed process lingers without ever reporting). Only then does
+  // A command that hangs is aborted by runnerTimeout: its whole process group
+  // is killed and the queue is held until the outcome is attributed — by the
+  // killed process's own onExited, or by runnerAbortFallback (a safety net for
+  // the case the killed process lingers without ever reporting). Only then does
   // the queue drain, so the newly started command can never inherit a stale
   // exit of the aborted one. A hung hyprctl can therefore never block the
   // queue forever — modulo the one case no watchdog can fix: an OS that never
@@ -192,7 +198,12 @@ Item {
     if (runnerProc.running || root.abortPending || root.queue.length === 0) return
     const item = root.queue.shift()
     root.runningItem = item
-    runnerProc.command = item.args
+    // Each command runs in its own session, so its pid is also its process
+    // group id. That is what lets the timeout watchdog kill the whole command —
+    // the shell and every hyprctl it started — rather than just the shell it
+    // happens to track, which would leave a stalled child free to complete
+    // after the attempt was already reported as failed.
+    runnerProc.command = ["setsid"].concat(item.args)
     // Only window_close dispatches gate a pending entry's transition to
     // `closing`: the mark must happen at the moment the close is handed to the
     // process, so a reopen can still cancel it while it waits in the queue.
@@ -273,12 +284,26 @@ Item {
     }
   }
 
-  // Watchdog for a hung command: SIGKILL the process and attribute the item as
-  // a failure so the queue drains. A catchable SIGTERM can be held off by an
-  // in-D-state hyprctl, and its delayed onExited could be attributed to the
-  // next command that already started. The one lasting wedge left is the OS
-  // never reaping the killed process: `running` tracks the process handle and
-  // only clears on its finish, so no userland watchdog can drain past it.
+  // Kills an aborted command's whole process group. It runs as its own process
+  // (outside the target's session), because Quickshell's Process.signal() can
+  // only signal the one pid it tracks: the group leader is named alongside the
+  // group so a command caught before its setsid() call, when the group does not
+  // exist yet and has no descendants either, still dies.
+  Process {
+    id: runnerKiller
+    running: false
+    command: []
+  }
+
+  // Watchdog for a hung command: SIGKILL the command's process group and
+  // attribute the item as a failure so the queue drains. A catchable SIGTERM
+  // can be held off by an in-D-state hyprctl, and its delayed onExited could be
+  // attributed to the next command that already started. The whole group is
+  // killed — not just the Bash helper — so a stalled close's hyprctl cannot
+  // outlive the timeout and complete the close after the attempt was treated
+  // as failed. The one lasting wedge left is the OS never reaping the killed
+  // process: `running` tracks the process handle and only clears on its finish,
+  // so no userland watchdog can drain past it.
   Timer {
     id: runnerTimeout
     repeat: false
@@ -286,8 +311,17 @@ Item {
       if (!runnerProc.running) return
       console.warn("grace-window: command timed out; aborting it")
       root.abortPending = true
-      runnerProc.signal(9)
-      runnerProc.running = false
+      const pid = runnerProc.processId
+      if (pid !== null && pid !== undefined && Number(pid) > 0) {
+        runnerKiller.command = ["bash", "-c",
+          'p="$1"; case "$p" in ""|0|*[!0-9]*) exit 1 ;; esac; kill -KILL -- "-$p" "$p" 2>/dev/null || true',
+          "grace-window-kill", String(pid)]
+        runnerKiller.running = true
+      } else {
+        // No usable pid (or pid 0, meaning our own group): at least stop the
+        // leader so the queue can drain.
+        runnerProc.signal(9)
+      }
       runnerAbortFallback.interval = Math.max(1000, root.queryTimeoutMs)
       runnerAbortFallback.restart()
     }
@@ -297,10 +331,9 @@ Item {
   // item as failed so its promise resolves and opInFlight clears, instead of
   // leaving it raised forever. Only acts while the abort is unattributed,
   // since onExited clears abortPending. It is deliberately not disarmed by the
-  // abort itself: `running = false` only asks the process to terminate, so
-  // `running` stays true (and the queue held) until the child is actually
-  // reaped, and the timer stays armed until onExited stops it on the real
-  // exit, or it fires once and drops the item.
+  // abort itself: the SIGKILL still leaves `running` true until the process is
+  // actually reaped, so the timer stays armed until onExited stops it on the
+  // real exit, or it fires once and drops the item.
   Timer {
     id: runnerAbortFallback
     repeat: false
@@ -1261,11 +1294,14 @@ Item {
 
   // ------------------------------------------------------------- configuration
   // The environment every invocation of the shell script gets, so the script's
-  // own bounded-open deadline matches the configured value. Set on the shared
-  // executor and the wiring processes; the detached teardown commands carry it
-  // as an `env` prefix instead (see teardownCommand).
+  // own bounded-open and close deadlines match the configured values. Set on the
+  // shared executor and the wiring processes; the detached teardown commands
+  // carry them as an `env` prefix instead (see teardownCommand).
   function scriptEnvironment() {
-    return { GRACE_WINDOW_OPEN_WAIT: String(root.openWaitMs) }
+    return {
+      GRACE_WINDOW_OPEN_WAIT: String(root.openWaitMs),
+      GRACE_WINDOW_CLOSE_WAIT: String(root.closeWaitMs),
+    }
   }
 
   // Apply the effective configuration the script printed (the defaults it

@@ -81,6 +81,14 @@ ms_to_seconds() { printf '%d.%03d' "$(( $1 / 1000 ))" "$(( $1 % 1000 ))"; }
 open_wait_ms="${GRACE_WINDOW_OPEN_WAIT:-5000}"
 if [[ ! "$open_wait_ms" =~ ^[0-9]+$ ]] || (( open_wait_ms < 1 )); then open_wait_ms=5000; fi
 open_wait_s="$(ms_to_seconds "$open_wait_ms")"
+# How long the close command may spend on its hyprctl calls, in milliseconds.
+# The service passes its watchdog deadline less a margin through
+# GRACE_WINDOW_CLOSE_WAIT, so a stalled dispatch is killed and reported here
+# before the service would have to kill the whole command from the outside; a
+# missing, mistyped or out-of-range value falls back to a safe default, so a bad
+# environment can never make a close wait longer than intended.
+close_wait_ms="${GRACE_WINDOW_CLOSE_WAIT:-9000}"
+if [[ ! "$close_wait_ms" =~ ^[0-9]+$ ]] || (( close_wait_ms < 1 )); then close_wait_ms=9000; fi
 # The children holding a descriptor open on our behalf, killed and reaped by
 # release_holders on every way out.
 declare -a holder_pids=()
@@ -647,10 +655,44 @@ cmd_regroup() {
 # whether the address still exists in Hyprland afterwards. A malformed or
 # missing clients answer counts as a retryable failure, never a success — an
 # outage must not look like a successful close.
+#
+# The whole command shares one deadline, so a stalled dispatch cannot eat the
+# time the verification query needs — and, because each call runs in this
+# script's own process group, the service's watchdog can still kill all of them
+# together if this deadline is ever missed.
+close_deadline_ms=0
+epoch_ms() {
+  local ns
+  ns=$(date +%s%N) || return 1
+  printf '%s' "$(( 10#$ns / 1000000 ))"
+}
+close_hyprctl() {
+  local left
+  left=$(( close_deadline_ms - $(epoch_ms) ))
+  (( left < 1 )) && left=1
+  # --foreground keeps the child in this script's process group; the default
+  # would give it a group of its own that an outside group kill cannot reach.
+  timeout --foreground -s KILL "$(ms_to_seconds "$left")" hyprctl "$@"
+}
 cmd_close() {
-  local addr="$1" clients
-  hyprctl dispatch "dofile('$self/grace-window.lua').window_close('$addr')" >/dev/null 2>&1
-  clients=$(hyprctl -j clients 2>/dev/null) || return 1
+  local addr="$1" clients rc
+  close_deadline_ms=$(( $(epoch_ms) + close_wait_ms ))
+  close_hyprctl dispatch "dofile('$self/grace-window.lua').window_close('$addr')" >/dev/null 2>&1
+  rc=$?
+  if (( rc != 0 )); then
+    if (( rc == 124 || rc == 137 )); then
+      say "close dispatch did not finish within ${close_wait_ms}ms; treating as retryable failure"
+    fi
+    return 1
+  fi
+  clients=$(close_hyprctl -j clients 2>/dev/null)
+  rc=$?
+  if (( rc != 0 )); then
+    if (( rc == 124 || rc == 137 )); then
+      say "clients query did not finish within ${close_wait_ms}ms; treating as retryable failure"
+    fi
+    return 1
+  fi
   if ! jq -e 'type == "array"' <<<"$clients" >/dev/null 2>&1; then
     say "clients query returned invalid JSON after close; treating as retryable failure"
     return 1
