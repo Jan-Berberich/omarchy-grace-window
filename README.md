@@ -78,13 +78,14 @@ already present before the plugin was installed is preserved unchanged. If
 the managed block cannot be located intact, or appears more than once, the
 service fails closed and leaves the file untouched.
 
-## Usage without the keybindings
+## Commands
 
-Talk to the service directly from a terminal:
+These are the commands this plugin adds. They can be run directly from a
+terminal. `hide` and `reopen` are used in the preconfigured keybindings.
 
 ```bash
-omarchy-shell grace-window hide '10' 60 30 1 0.9 # hide focused window, start grace
-omarchy-shell grace-window reopen '10'           # bring the newest hidden window back
+omarchy-shell grace-window hide 10 60 30 1 0.9   # hide focused window, start grace
+omarchy-shell grace-window reopen 10             # bring the newest hidden window back
 omarchy-shell grace-window status                # returns "idle" or "pending <N>s"
 omarchy-shell grace-window cancel                # forget pendings, restore grace look
 ```
@@ -102,27 +103,47 @@ keeps its own buffer of hidden windows, so multiple workflows can coexist.
 
 ## Configuration
 
-There are two places to configure the plugin: the **keybindings**, in your live
-`~/.config/hypr/bindings.lua`, and the **service tunables**, in the generated
-`~/.config/omarchy/plugins/jam.grace-window/config.json` next to the plugin's
-own files. An edit to `config.json` is applied automatically: the service
-watches the file (and its directory) and re-reads it as soon as it changes, so
-no plugin restart is needed.
+There are two places to configure the plugin: the
+[Keybindings & Commands](#keybindings--commands), in your live
+`~/.config/hypr/bindings.lua`, and the [Service Tunables](#service-tunables),
+in the generated `~/.config/omarchy/plugins/jam.grace-window/config.json`
+next to the plugin's own files. An edit to `config.json` is applied
+automatically: the service watches the file (and its directory) and re-reads it
+as soon as it changes, so no plugin restart is needed.
 
-### Keybindings
+### Keybindings & Commands
 Edit the managed block in your live `~/.config/hypr/bindings.lua` (inside the
 `-- BEGIN Grace Window …` / `-- END Grace Window …` pair) while leaving those
 two marker comments in place. In the block you can change / add keybindings
 and edit the following command arguments:
-- **Grace workspace**: 1st argument of the `hide` / `reopen` commands.
+- **Grace workspace**: 1st argument of the `hide` / `reopen` commands
+(see [Example 1](#example-1)).
 - **Grace period**: 2nd argument of the `hide` command in seconds.
-- **Grace look**: 3rd … 5th arguments are: rounding, rounding power,
+- **Grace look**: 3rd – 5th arguments are: rounding, rounding power,
   opacity factor.
 
 A customization made there is captured to `hypr/bindings-custom.lua` on
 teardown and wired back on the next start. A block that still matches what the
 last start wired is not captured, so the custom file only appears once you
 have actually customized the block.
+
+#### Example 1
+If you don't want your gracefully closed windows to occupy a visable workspace,
+i.e. to be completely hidden, you gan change the default workspace argument
+`10` to `special:grace`
+
+#### Example 2
+You can configure custom behaviour, like a "Minimize / Recover"
+workflow (hide on workspace 9 with no auto-close and only subtle look change)
+by adding the desired keybindings to the managed block
+```
+hl.unbind("SUPER + ALT + W")
+o.bind("SUPER + ALT + W", "Minimize window (jam.grace-window)", "omarchy-shell grace-window hide 9 9e9 9 1 1")
+hl.unbind("SUPER + ALT + SHIFT + W")
+o.bind("SUPER + ALT + SHIFT + W", "Recover window (jam.grace-window)", "omarchy-shell grace-window reopen 9")
+```
+Since each hide target keeps its own buffer of hidden windows, any number of
+such workflows can coexist.
 
 ### Service Tunables
 Next to the plugin files lives
@@ -145,19 +166,6 @@ range falls back to its default on its own, so a typo never discards the rest.
 A `config.json` that is not valid JSON is reported and the defaults are used
 without rewriting the file, so a hand-edit is never silently undone. Deleting
 the file makes the next start recreate it with the defaults.
-
-**Example**: You can configure custom behaviour, like a "Minimize / Recover"
-workflow (hide on workspace 9 with no auto-close and only subtle look change)
-by adding the desired keybindings to the managed block in
-`~/.config/hypr/bindings.lua`:
-```
-hl.unbind("SUPER + ALT + W")
-o.bind("SUPER + ALT + W", "Minimize window (jam.grace-window)", "omarchy-shell grace-window hide '9' 9e9 9 1 1")
-hl.unbind("SUPER + ALT + SHIFT + W")
-o.bind("SUPER + ALT + SHIFT + W", "Recover window (jam.grace-window)", "omarchy-shell grace-window reopen '9'")
-```
-Since each hide target keeps its own buffer of hidden windows, any number of
-such workflows can coexist.
 
 ## Notes
 
