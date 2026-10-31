@@ -129,19 +129,21 @@ have actually customized the block.
 
 #### Example 1
 If you don't want your gracefully closed windows to occupy a visable workspace,
-i.e. to be completely hidden, you gan change the default workspace argument
+i.e. to be completely hidden, you can change the default workspace argument
 `10` to `special:grace`
 
 #### Example 2
 You can configure custom behaviour, like a "Minimize / Recover"
 workflow (hide on workspace 9 with no auto-close and only subtle look change)
 by adding the desired keybindings to the managed block
-```
+
+```lua
 hl.unbind("SUPER + ALT + W")
 o.bind("SUPER + ALT + W", "Minimize window (jam.grace-window)", "omarchy-shell grace-window hide 9 9e9 9 1 1")
 hl.unbind("SUPER + ALT + SHIFT + W")
 o.bind("SUPER + ALT + SHIFT + W", "Recover window (jam.grace-window)", "omarchy-shell grace-window reopen 9")
 ```
+
 Since each hide target keeps its own buffer of hidden windows, any number of
 such workflows can coexist.
 
