@@ -25,10 +25,11 @@
 // hypr/bindings-custom.lua first and preferred over the plugin's default on
 // the next start.
 //
-// Focus, liveness and workspace moves are tracked from Hyprland's event socket
-// (Quickshell's Hyprland rawEvent) instead of polling, so the grace timer only
-// counts down and never queries the compositor; the one startup focus query
-// seeds it because events only fire on changes.
+// Focus, liveness, workspace moves and workspace visibility are tracked from
+// Hyprland's event socket (Quickshell's Hyprland rawEvent, focusedWorkspace and
+// workspaces model) instead of polling, so the grace timer only counts down and
+// never queries the compositor; startup queries seed focus and open special
+// workspaces because events only fire on changes.
 
 import QtQuick
 import Quickshell
@@ -99,7 +100,8 @@ Item {
   // ------------------------------------------------------------ pending state
   // Pending hidden windows, newest last. `workspace` groups them into private
   // FIFO buffers that hide()/reopen() touch. `state` is one of:
-  //   counting   grace counting down (paused while focused),
+  //   counting   grace counting down (paused while focused on a visible grace
+  //              workspace),
   //   expiring   grace ran out; the close is queued but a reopen can still win,
   //   closing    the close dispatch runs; the entry leaves on success,
   //   restoring  held in `restoring` while its reopen dispatches run.
@@ -121,9 +123,14 @@ Item {
   property int epoch: 0
 
   // Last sweep tick and focused window's address; the grace timer pauses while
-  // a hidden window holds focus.
+  // a hidden window holds focus on a visible grace workspace.
   property double lastTick: 0
   property string focusedAddress: ""
+
+  // Special workspaces currently open, keyed by monitor name (activespecialv2:
+  // id, name, monitor). Hyprland reports the regular workspace underneath as
+  // active, so these are tracked separately from Hyprland.focusedWorkspace.
+  property var openSpecials: ({})
 
   // ---------------------------------------------------------------- IPC
   IpcHandler {
@@ -1020,6 +1027,38 @@ Item {
     onTriggered: root.sweep()
   }
 
+  // Whether `entry`'s countdown must pause: only while the window holds focus
+  // on a visible grace workspace. Hiding the last window of a workspace can
+  // leave focus on the hidden window while its grace workspace is not shown;
+  // that must not freeze the timer.
+  function shouldPauseForFocus(entry) {
+    if (entry.address !== root.focusedAddress) return false
+    return root.graceWorkspaceVisible(entry.workspace)
+  }
+
+  // Whether `workspace` is visible: active on any monitor, or a special
+  // workspace currently shown on one.
+  function graceWorkspaceVisible(workspace) {
+    const workspaces = Hyprland.workspaces ? Hyprland.workspaces.values : []
+    for (let i = 0; i < workspaces.length; i++) {
+      const ws = workspaces[i]
+      if (ws && ws.active &&
+          root.onGracePosition({ workspaceId: ws.id, workspaceName: ws.name }, workspace)) return true
+    }
+    return root.specialWorkspaceVisible(workspace)
+  }
+
+  // Whether `workspace` is a special workspace shown on any monitor.
+  function specialWorkspaceVisible(workspace) {
+    const name = String(workspace)
+    if (name.indexOf("special:") !== 0) return false
+    const monitors = Object.keys(root.openSpecials)
+    for (let i = 0; i < monitors.length; i++) {
+      if (root.openSpecials[monitors[i]] === name) return true
+    }
+    return false
+  }
+
   function sweep() {
     const now = Date.now()
     if (root.pending.length === 0) {
@@ -1038,8 +1077,9 @@ Item {
       // expired but still queued stays expiring until a reopen or a
       // movewindow-away rescues it before the close dispatches.
       if (entry.state === "expiring" || entry.state === "closing") continue
-      // The timer pauses while the hidden window holds focus.
-      if (entry.address === root.focusedAddress) continue
+      // Pause only while the hidden window is focused on a visible grace
+      // workspace (see shouldPauseForFocus).
+      if (root.shouldPauseForFocus(entry)) continue
       entry.remaining -= delta
       if (entry.remaining > 0) continue
       // Grace ran out: flag for closing. A reopen landing within a sweep
@@ -1071,6 +1111,10 @@ Item {
     const name = event && event.name ? String(event.name) : ""
     if (name === "activewindowv2") {
       root.focusedAddress = root.eventAddress(event)
+    } else if (name === "activespecialv2") {
+      root.onActiveSpecial(event, 1, 2)
+    } else if (name === "activespecial") {
+      root.onActiveSpecial(event, 0, 1)
     } else if (name === "closewindow") {
       root.onWindowClosed(root.eventAddress(event))
     } else if (name === "movewindowv2") {
@@ -1081,6 +1125,24 @@ Item {
       // form and has existed since before Hyprland 0.55.
       root.onWindowMoved(event)
     }
+  }
+
+  // activespecial(v2): the special workspace shown on a monitor changed. An
+  // empty name means none is open there anymore. The event carries the monitor,
+  // so each one's open special is tracked separately.
+  function onActiveSpecial(event, nameIndex, monitorIndex) {
+    let parts = []
+    try {
+      if (event && event.parse) parts = event.parse(monitorIndex + 1) || []
+    } catch (e) { }
+    const monitor = String(parts[monitorIndex] || "")
+    if (monitor === "") return
+    const open = {}
+    for (const key of Object.keys(root.openSpecials)) open[key] = root.openSpecials[key]
+    const name = String(parts[nameIndex] || "")
+    if (name === "") delete open[monitor]
+    else open[monitor] = name
+    root.openSpecials = open
   }
 
   // Hyprland's event socket sends addresses as bare lowercase hex
@@ -1776,11 +1838,29 @@ Item {
 
   // One-shot query through the executor: Hyprland only pushes activewindowv2
   // on focus *changes*, so a restored window that already holds focus (and its
-  // grace countdown, which pauses while focused) must be checked at start.
+  // grace countdown, which pauses while focused on a visible grace workspace)
+  // must be checked at start.
   function hydrateFocus() {
     root.runOpQuery(["hyprctl", "-j", "activewindow"]).then(function (raw) {
       const win = root.parseJson(raw)
       root.focusedAddress = win && win.address ? root.normalizeAddress(win.address) : ""
+    })
+  }
+
+  // activespecialv2 only fires on a change, so an already open special (e.g.
+  // the scratchpad after a shell restart) must be seeded from the monitors.
+  function hydrateSpecials() {
+    root.runOpQuery(["hyprctl", "-j", "monitors"]).then(function (raw) {
+      const monitors = root.parseJson(raw)
+      if (!Array.isArray(monitors)) return
+      const open = {}
+      for (let i = 0; i < monitors.length; i++) {
+        const monitor = monitors[i] || {}
+        const special = monitor.specialWorkspace || {}
+        const name = String(special.name || "")
+        if (name !== "" && monitor.name) open[String(monitor.name)] = name
+      }
+      root.openSpecials = open
     })
   }
 
@@ -1805,6 +1885,7 @@ Item {
       root.wireBindings()
       root.installUnwireScript()
       root.hydrateFocus()
+      root.hydrateSpecials()
       root.selfCheck()
       root.loadState()
     })

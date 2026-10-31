@@ -20,7 +20,7 @@ closed for real:
 - <kbd>SUPER</kbd>+<kbd>SHIFT</kbd>+<kbd>CTRL</kbd>+<kbd>W</kbd>: close
   window, for real, immediately. It can not be reopened again.
 - **Grace period**: time to reopen gracefully closed window before it gets
-  closed for real. Pauses if gracefully closed window is focused.
+  closed for real. Pauses if gracefully closed window is focused and visable.
 - **Grace look**: a gracefully closed window gets a distinctive look so you
   can tell it will close soon: a 10% lower opacity, cut corners and always in
   *tiling* mode.
