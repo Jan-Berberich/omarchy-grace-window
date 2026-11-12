@@ -1115,6 +1115,14 @@ Item {
       root.onActiveSpecial(event, 1, 2)
     } else if (name === "activespecial") {
       root.onActiveSpecial(event, 0, 1)
+    } else if (name === "monitorremovedv2") {
+      // (id, name, description): the monitor's open specials must go with it,
+      // or a monitor unplugged with a special workspace shown would keep
+      // looking visible and wrongly pause that buffer's grace timers.
+      root.onMonitorRemoved(event, 1)
+    } else if (name === "monitorremoved") {
+      // The legacy event carries the monitor name alone.
+      root.onMonitorRemoved(event, 0)
     } else if (name === "closewindow") {
       root.onWindowClosed(root.eventAddress(event))
     } else if (name === "movewindowv2") {
@@ -1142,6 +1150,24 @@ Item {
     const name = String(parts[nameIndex] || "")
     if (name === "") delete open[monitor]
     else open[monitor] = name
+    root.openSpecials = open
+  }
+
+  // monitorremoved(v2): drop the monitor's tracked open special, so an unplugged
+  // monitor cannot keep a special workspace looking visible. `nameIndex` is the
+  // event's field holding the monitor name (1 for v2's id,name,description, 0
+  // for the legacy name-only event).
+  function onMonitorRemoved(event, nameIndex) {
+    let parts = []
+    try {
+      if (event && event.parse) parts = event.parse(nameIndex + 1) || []
+    } catch (e) { }
+    const monitor = String(parts[nameIndex] || "")
+    if (monitor === "" || !(monitor in root.openSpecials)) return
+    const open = {}
+    for (const key of Object.keys(root.openSpecials)) {
+      if (key !== monitor) open[key] = root.openSpecials[key]
+    }
     root.openSpecials = open
   }
 

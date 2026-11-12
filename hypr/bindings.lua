@@ -1,6 +1,8 @@
 -- Grace Window plugin (jam.grace-window) keybindings.
--- SUPER+W hides the focused window to workspace 10 with 60s grace period
+-- SUPER+W and SUPER+Q hide the focused window to the hidden special:grace
+-- workspace with a 60s grace period
 -- SUPER+SHIFT+W reopens it (if not already expired and closed for real)
+-- SUPER+DELETE shows the grace workspace
 -- SUPER+SHIFT+CTRL+W closes the window for real, immediately.
 -- Requires the plugin to be installed and enabled (see README.md).
 --
@@ -9,7 +11,7 @@
 --   omarchy-shell grace-window reopen <workspace>
 -- with <period> in seconds.
 -- Each workspace can run its own workflow. The default args below are:
--- workspace: 10, period: 60s, rounding: 30 at power: 1, opacity: 90%
+-- workspace: special:grace, period: 60s, rounding: 30 at power: 1, opacity: 50%
 --
 -- On service start the plugin copies the block below into your
 -- ~/.config/hypr/bindings.lua, exactly once. This file is the source of the
@@ -18,16 +20,22 @@
 -- other binding.
 
 -- BEGIN Grace Window (jam.grace-window) managed block - do not edit this comment
+hl.unbind("SUPER + Q")
+o.bind("SUPER + Q", "Close window gracefully (jam.grace-window)", "omarchy-shell grace-window hide special:grace 60 30 1 0.5")
 hl.unbind("SUPER + W")
-o.bind("SUPER + W", "Close window gracefully (jam.grace-window)", "omarchy-shell grace-window hide 10 60 30 1 0.9")
+o.bind("SUPER + W", "Close window gracefully (jam.grace-window)", "omarchy-shell grace-window hide special:grace 60 30 1 0.5")
 hl.unbind("SUPER + SHIFT + W")
-o.bind("SUPER + SHIFT + W", "Reopen closed window (jam.grace-window)", "omarchy-shell grace-window reopen 10")
--- for "minimize/recover" workflow on workspace 9 with no timeout:
--- uncomment the following 4 lines in your live ~/.config/hypr/bindings.lua
+o.bind("SUPER + SHIFT + W", "Reopen closed window (jam.grace-window)", "omarchy-shell grace-window reopen special:grace")
+hl.unbind("SUPER + DELETE")
+o.bind("SUPER + DELETE", "Switch to grace workspace (jam.grace-window)", hl.dsp.focus({ workspace = "special:grace" }))
+-- for "minimize/recover" workflow with no timeout:
+-- uncomment the following 6 lines in your live ~/.config/hypr/bindings.lua
 -- hl.unbind("SUPER + ALT + W")
--- o.bind("SUPER + ALT + W", "Minimize window (jam.grace-window)", "omarchy-shell grace-window hide 9 9e9 9 1 1")
+-- o.bind("SUPER + ALT + W", "Minimize window (jam.grace-window)", "omarchy-shell grace-window hide special:minimize 9e9 9 1 1")
 -- hl.unbind("SUPER + ALT + SHIFT + W")
--- o.bind("SUPER + ALT + SHIFT + W", "Recover window (jam.grace-window)", "omarchy-shell grace-window reopen 9")
+-- o.bind("SUPER + ALT + SHIFT + W", "Recover window (jam.grace-window)", "omarchy-shell grace-window reopen special:minimize")
+-- hl.unbind("SUPER + ALT + DELETE")
+-- o.bind("SUPER + ALT + DELETE", "Switch to minimize workspace (jam.grace-window)", hl.dsp.focus({ workspace = "special:minimize" }))
 hl.unbind("SUPER + SHIFT + CTRL + W")
 o.bind("SUPER + SHIFT + CTRL + W", "Close window (jam.grace-window)", hl.dsp.window.close())
 -- END Grace Window (jam.grace-window) managed block - do not edit this comment

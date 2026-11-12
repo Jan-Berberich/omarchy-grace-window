@@ -56,7 +56,7 @@ def hideQuery($opacity; $opacityInactive; $rounding; $roundingPower; $monitors):
 def reopenQuery($aw; $ws; $mn):
   ( $mn | map(select(.focused)) | firstOrNull ) as $m
   | ({ aw: $aw, ws: $ws,
-       sp: (if $m != null and (($m.specialWorkspace.id // 0) != 0)
+       sp: (if $m != null and (($m.specialWorkspace.name // "") != "")
              then $m.specialWorkspace else null end),
        mx: (if $m != null then ($m.x // 0) else null end),
        my: (if $m != null then ($m.y // 0) else null end) });

@@ -5,24 +5,26 @@
 An Omarchy shell plugin to reopen a recently closed window,
 including its content with
 <kbd>SUPER</kbd>+<kbd>SHIFT</kbd>+<kbd>W</kbd>. The plugin rebinds
-<kbd>SUPER</kbd>+<kbd>W</kbd> to move the focused window silently to
-**workspace 10** with a one-minute reopen grace period until it gets
-closed for real:
+<kbd>SUPER</kbd>+<kbd>W</kbd> (and <kbd>SUPER</kbd>+<kbd>Q</kbd>) to move the
+focused window silently to the hidden `special:grace` workspace with a
+one-minute reopen grace period until it gets closed for real:
 
-- <kbd>SUPER</kbd>+<kbd>W</kbd>: close window gracefully: silently move the
-  focused window to **workspace 10** and start the one-minute reopen grace
-  period. Active workspace stays where it was.
+- <kbd>SUPER</kbd>+<kbd>W</kbd> / <kbd>SUPER</kbd>+<kbd>Q</kbd>: close window
+  gracefully: silently move the focused window to `special:grace` and start
+  the one-minute reopen grace period. Active workspace stays where it was.
 - <kbd>SUPER</kbd>+<kbd>SHIFT</kbd>+<kbd>W</kbd>: reopen closed window:
   bring it back, focus it, and cancel its grace period. If the focused window
   is itself a gracefully closed window, that one is reopened instead.
   Otherwise reopens the most recently closed window. Moving a gracefully
   closed window out of its grace workspace also reopens it.
+- <kbd>SUPER</kbd>+<kbd>DELETE</kbd>: show the grace workspace, to look at the
+  windows waiting there. Switch to a regular workspace to hide it again.
 - <kbd>SUPER</kbd>+<kbd>SHIFT</kbd>+<kbd>CTRL</kbd>+<kbd>W</kbd>: close
   window, for real, immediately. It can not be reopened again.
 - **Grace period**: time to reopen gracefully closed window before it gets
   closed for real. Pauses if gracefully closed window is focused and visable.
 - **Grace look**: a gracefully closed window gets a distinctive look so you
-  can tell it will close soon: a 10% lower opacity, cut corners and always in
+  can tell it will close soon: a 50% lower opacity, cut corners and always in
   *tiling* mode.
 - **Grace groups**: the behaviour is as you would expect in omarchy:
   Only the focused window of a tabbed group gets gracefully closed, the rest of
@@ -30,6 +32,15 @@ closed for real:
   currently has focus (if possible).
 - **Grace scratchpad**: when the scratchpad is open, the reopened
   window lands on the scratchpad instead of the workspace underneath it.
+
+**Why a special workspace?** Omarchy 4.5 gives every monitor its own block of
+regular workspaces (`1–10`, `11–20`, …) and renumbers them when monitors are
+plugged in or out. A numbered grace workspace would therefore move, disappear,
+or collide with another monitor's block. A special workspace is global: it is
+available from every monitor and keeps its name across hot-plug renumbering, so
+a window hidden there stays reachable with the same keybinding no matter how the
+monitor layout changes. Regular workspaces still work as a `hide` target (each
+one is simply a separate buffer), but a special workspace is the stable choice.
 
 The Plugin also can be used nicely to reorganize your tiled workspace, as
 reopened windows will appear to the right or bottom of the focused window,
@@ -84,10 +95,10 @@ These are the commands this plugin adds. They can be run directly from a
 terminal. `hide` and `reopen` are used in the preconfigured keybindings.
 
 ```bash
-omarchy-shell grace-window hide 10 60 30 1 0.9   # hide focused window, start grace
-omarchy-shell grace-window reopen 10             # bring the newest hidden window back
-omarchy-shell grace-window status                # returns "idle" or "pending <N>s"
-omarchy-shell grace-window cancel                # forget pendings, restore grace look
+omarchy-shell grace-window hide special:grace 60 30 1 0.5  # hide focused window, start grace
+omarchy-shell grace-window reopen special:grace            # bring the newest hidden window back
+omarchy-shell grace-window status                          # returns "idle" or "pending <N>s"
+omarchy-shell grace-window cancel                          # forget pendings, restore grace look
 ```
 
 The arguments for the `hide` command are:
@@ -128,20 +139,26 @@ last start wired is not captured, so the custom file only appears once you
 have actually customized the block.
 
 #### Example 1
-If you don't want your gracefully closed windows to occupy a visable workspace,
-i.e. to be completely hidden, you can change the default workspace argument
-`10` to `special:grace`
+By default gracefully closed windows go to the hidden `special:grace`
+workspace, so they occupy no visible workspace and are reachable from every
+monitor. If you would rather see them on a regular workspace, replace
+`special:grace` with a workspace id such as `10` in the `hide` / `reopen`
+commands. On Omarchy 4.5 that id belongs to the focused monitor's block, so the
+windows are only reachable from that monitor and the id shifts when monitors are
+plugged in or out.
 
 #### Example 2
 You can configure custom behaviour, like a "Minimize / Recover"
-workflow (hide on workspace 9 with no auto-close and only subtle look change)
-by adding the desired keybindings to the managed block
+workflow (hide on `special:minimize` with no auto-close and only a subtle look
+change) by adding the desired keybindings to the managed block
 
 ```lua
 hl.unbind("SUPER + ALT + W")
-o.bind("SUPER + ALT + W", "Minimize window (jam.grace-window)", "omarchy-shell grace-window hide 9 9e9 9 1 1")
+o.bind("SUPER + ALT + W", "Minimize window (jam.grace-window)", "omarchy-shell grace-window hide special:minimize 9e9 9 1 1")
 hl.unbind("SUPER + ALT + SHIFT + W")
-o.bind("SUPER + ALT + SHIFT + W", "Recover window (jam.grace-window)", "omarchy-shell grace-window reopen 9")
+o.bind("SUPER + ALT + SHIFT + W", "Recover window (jam.grace-window)", "omarchy-shell grace-window reopen special:minimize")
+hl.unbind("SUPER + ALT + DELETE")
+o.bind("SUPER + ALT + DELETE", "Switch to minimize workspace (jam.grace-window)", hl.dsp.focus({ workspace = "special:minimize" }))
 ```
 
 Since each hide target keeps its own buffer of hidden windows, any number of

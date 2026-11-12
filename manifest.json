@@ -5,7 +5,7 @@
   "version": "1.7.5",
   "author": "CoolJam",
   "license": "MIT",
-  "description": "Reopen recently closed window, including its content with SUPER+SHIFT+W. The plugin rebinds SUPER+W to move the focused window silently to workspace 10 with a one-minute reopen grace period until it gets closed for real. You can configure the keybindings, hidden window look, grace period, … (see README for more)! Disabling or uninstalling the plugin via omarchy's plugin system removes its managed block from \"~/.config/hypr/bindings.lua\" automatically to restore your previous keybindings.",
+  "description": "Reopen recently closed window, including its content with SUPER+SHIFT+W. The plugin rebinds SUPER+W/Q to move the focused window silently to \"special:grace\" workspace with a 60s grace period until it gets closed for real. You can configure the keybindings, hidden window look, grace period, … (see README for more)! Disabling or uninstalling the plugin via omarchy's plugin system removes its managed block from \"~/.config/hypr/bindings.lua\" automatically to restore your previous keybindings.",
   "kinds": ["service"],
   "keepLoaded": true,
   "entryPoints": {
