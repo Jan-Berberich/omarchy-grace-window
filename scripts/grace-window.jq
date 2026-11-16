@@ -98,6 +98,7 @@ def regroupDirection($a; $f):
 # independently of the others, so one bad entry never discards the rest.
 def configDefaults:
   {
+    showBarWidget: true,
     groupingDelayMs: 100,
     closeRetryMax: 3,
     queryTimeoutMs: 10000,
@@ -116,6 +117,10 @@ def numOr($v; $def; $min):
 def intOr($v; $def; $min):
   if ($v | type) == "number" and $v == ($v | floor) and $v >= $min then $v else $def end;
 
+# A boolean, or $def otherwise.
+def boolOr($v; $def):
+  if ($v | type) == "boolean" then $v else $def end;
+
 # The effective configuration: the defaults, overridden by the user's object
 # wherever an entry is present and usable. Any input that is not an object
 # (a missing file, a bare string, an array) leaves every default in place.
@@ -123,6 +128,7 @@ def readConfig($user):
   (if ($user | type) == "object" then $user else {} end) as $u
   | configDefaults as $d
   | {
+      showBarWidget: boolOr($u.showBarWidget; $d.showBarWidget),
       groupingDelayMs: intOr($u.groupingDelayMs; $d.groupingDelayMs; 0),
       closeRetryMax: intOr($u.closeRetryMax; $d.closeRetryMax; 0),
       queryTimeoutMs: intOr($u.queryTimeoutMs; $d.queryTimeoutMs; 1),

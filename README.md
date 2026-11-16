@@ -17,14 +17,15 @@ one-minute reopen grace period until it gets closed for real:
   is itself a gracefully closed window, that one is reopened instead.
   Otherwise reopens the most recently closed window. Moving a gracefully
   closed window out of its grace workspace also reopens it.
-- <kbd>SUPER</kbd>+<kbd>DELETE</kbd>: show the grace workspace, to look at the
-  windows waiting there. Switch to a regular workspace to hide it again.
+- <kbd>SUPER</kbd>+<kbd>DELETE</kbd>: toggle the grace workspace, to look at
+  the windows waiting there. Press it again (or switch to a regular workspace)
+  to hide it.
 - <kbd>SUPER</kbd>+<kbd>SHIFT</kbd>+<kbd>CTRL</kbd>+<kbd>W</kbd>: close
   window, for real, immediately. It can not be reopened again.
 - **Grace period**: time to reopen gracefully closed window before it gets
   closed for real. Pauses if gracefully closed window is focused and visable.
 - **Grace look**: a gracefully closed window gets a distinctive look so you
-  can tell it will close soon: a 50% lower opacity, cut corners and always in
+  can tell it will close soon: a 10% lower opacity, cut corners and always in
   *tiling* mode.
 - **Grace groups**: the behaviour is as you would expect in omarchy:
   Only the focused window of a tabbed group gets gracefully closed, the rest of
@@ -32,32 +33,30 @@ one-minute reopen grace period until it gets closed for real:
   currently has focus (if possible).
 - **Grace scratchpad**: when the scratchpad is open, the reopened
   window lands on the scratchpad instead of the workspace underneath it.
-
-**Why a special workspace?** Omarchy 4.5 gives every monitor its own block of
-regular workspaces (`1–10`, `11–20`, …) and renumbers them when monitors are
-plugged in or out. A numbered grace workspace would therefore move, disappear,
-or collide with another monitor's block. A special workspace is global: it is
-available from every monitor and keeps its name across hot-plug renumbering, so
-a window hidden there stays reachable with the same keybinding no matter how the
-monitor layout changes. Regular workspaces still work as a `hide` target (each
-one is simply a separate buffer), but a special workspace is the stable choice.
+- **Bar indicator**: next to the workspace numbers, one capital letter for
+  every special workspace that currently holds windows: `G` for
+  `special:grace`, `M` for `special:minimize`, `S` for
+  `special:scratchpad`, and the first letter of any other `special:<name>`.
+  A letter disappears when its workspace becomes empty, and clicking it
+  toggles that workspace.
 
 The Plugin also can be used nicely to reorganize your tiled workspace, as
 reopened windows will appear to the right or bottom of the focused window,
 depending on its aspect ratio (like a newly opened window would).
 You can even change the order of the windows in your tabbed group with this.
 
-Grace Window is a *service* plugin: the state lives in the long-lived
-`omarchy-shell` process, and the keybindings drive it over Quickshell IPC
-(`omarchy-shell grace-window hide` / `reopen`), so there is no standalone
-background script.
+Grace Window is a *service* plugin with a bar-widget companion: the state
+lives in the long-lived `omarchy-shell` process, and the keybindings drive it
+over Quickshell IPC (`omarchy-shell grace-window hide` / `reopen`), so there is
+no standalone background script.
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `manifest.json` | Omarchy plugin manifest (schema v1, kind `service`) |
+| `manifest.json` | Omarchy plugin manifest (schema v1, kinds `service` and `bar-widget`) |
 | `Service.qml` | The service: IPC handlers, a single serial hyprctl dispatch queue (with watchdog), an event-driven grace tracker (focus, liveness and workspace moves come from Hyprland's event socket, so the timer never probes), and automatic wiring of the keybindings on start / unwiring on teardown |
+| `BarWidget.qml` | The bar indicator: one letter per occupied special workspace, beside the regular workspace numbers |
 | `hypr/bindings.lua` | The shipped keybindings, wrapped in the managed block. Used on start unless a captured customization exists (see [Configuration](#configuration)) |
 | `scripts/*` | `.sh`, `.lua`, `.jq` and `.awk` scripts backing the service |
 
@@ -65,6 +64,10 @@ background script.
 
 ```bash
 omarchy plugin add https://github.com/Jan-Berberich/omarchy-grace-window.git --enable
+```
+
+```bash
+omarchy plugin enable jam.grace-window --section left --after omarchy.workspaces
 ```
 
 When the service starts it appends the managed keybinding block to
@@ -95,7 +98,7 @@ These are the commands this plugin adds. They can be run directly from a
 terminal. `hide` and `reopen` are used in the preconfigured keybindings.
 
 ```bash
-omarchy-shell grace-window hide special:grace 60 30 1 0.5  # hide focused window, start grace
+omarchy-shell grace-window hide special:grace 60 30 1 0.9  # hide focused window, start grace
 omarchy-shell grace-window reopen special:grace            # bring the newest hidden window back
 omarchy-shell grace-window status                          # returns "idle" or "pending <N>s"
 omarchy-shell grace-window cancel                          # forget pendings, restore grace look
@@ -116,11 +119,12 @@ keeps its own buffer of hidden windows, so multiple workflows can coexist.
 
 There are two places to configure the plugin: the
 [Keybindings & Commands](#keybindings--commands), in your live
-`~/.config/hypr/bindings.lua`, and the [Service Tunables](#service-tunables),
+`~/.config/hypr/bindings.lua`, and the [Plugin Tunables](#plugin-tunables),
 in the generated `~/.config/omarchy/plugins/jam.grace-window/config.json`
 next to the plugin's own files. An edit to `config.json` is applied
-automatically: the service watches the file (and its directory) and re-reads it
-as soon as it changes, so no plugin restart is needed.
+automatically: the service and the bar widget watch the file (and its
+directory) and re-read it as soon as it changes, so no plugin restart is
+needed.
 
 ### Keybindings & Commands
 Edit the managed block in your live `~/.config/hypr/bindings.lua` (inside the
@@ -158,20 +162,21 @@ o.bind("SUPER + ALT + W", "Minimize window (jam.grace-window)", "omarchy-shell g
 hl.unbind("SUPER + ALT + SHIFT + W")
 o.bind("SUPER + ALT + SHIFT + W", "Recover window (jam.grace-window)", "omarchy-shell grace-window reopen special:minimize")
 hl.unbind("SUPER + ALT + DELETE")
-o.bind("SUPER + ALT + DELETE", "Switch to minimize workspace (jam.grace-window)", hl.dsp.focus({ workspace = "special:minimize" }))
+o.bind("SUPER + ALT + DELETE", "Toggle minimize workspace (jam.grace-window)", hl.dsp.workspace.toggle_special("minimize"))
 ```
 
 Since each hide target keeps its own buffer of hidden windows, any number of
 such workflows can coexist.
 
-### Service Tunables
+### Plugin Tunables
 Next to the plugin files lives
 `~/.config/omarchy/plugins/jam.grace-window/config.json`. It holds the
-service's own tunables and is written with the defaults below the first time
-the service starts:
+plugin's tunables and is written with the defaults below the first time the
+service starts:
 
 | Key | Default | Meaning |
 |-----|---------|---------|
+| `showBarWidget` | `true` | Show the bar indicator. Set to `false` to hide it while keeping the service and its keybindings active. |
 | `groupingDelayMs` | `100` | Milliseconds to wait after (un)grouping before continuing. `0` is snappier; higher values prevent graphics glitches after (un)grouping. If some apps glitch with the **Grace groups** feature, increase this. |
 | `closeRetryMax` | `3` | Failed close attempts before the plugin gives up and restores the grace look in place (so a window is never stranded looking pending). |
 | `queryTimeoutMs` | `10000` | Abort a hung `hyprctl` command after this many milliseconds, so it can never wedge the dispatch queue. |

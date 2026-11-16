@@ -45,7 +45,8 @@ Item {
   // that file on every start, so they can be edited there without touching the
   // plugin. A later edit is picked up live (see reloadConfig). Every entry is
   // validated; an absent, mistyped or out-of-range value falls back to its
-  // default here. See README.md.
+  // default here. See README.md. (The bar widget's own `showBarWidget`
+  // switch lives in the same file but is read by BarWidget.qml directly.)
 
   // Delay after (un)grouping so apps refresh their graphics, in milliseconds;
   // 0 is snappier, higher values prevent glitches after (un)grouping.

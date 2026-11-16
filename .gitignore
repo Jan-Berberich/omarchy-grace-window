@@ -7,6 +7,7 @@
 !scripts/grace-window.lua
 !scripts/grace-window.sh
 !.gitignore
+!BarWidget.qml
 !LICENSE
 !manifest.json
 !preview.png
