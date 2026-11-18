@@ -576,6 +576,13 @@ count_marker() {
   printf '%s' "$out"
 }
 
+# First line of FILE that starts with MARKER, or empty when none. This mirrors
+# the unwire stripper's own boundary test (index($0, marker) == 1), so a marker
+# merely mentioned inside a line cannot be mistaken for a block boundary.
+marker_line() {
+  awk -v m="$2" 'index($0, m) == 1 { print NR; exit }' "$1" 2>/dev/null
+}
+
 # Read one window property's current value (empty when the query fails; the
 # callers refuse to hide a window whose look cannot be captured faithfully).
 window_prop() {
@@ -922,20 +929,30 @@ cmd_unwire() {
     say "managed block markers not intact in $target ($starts start, $ends end); leaving file untouched"
     return
   fi
+  # Find both boundaries before doing anything else, using the stripper's own
+  # prefix test: a line that only mentions a marker is not a block boundary.
+  l0=$(marker_line "$target_path" "$start")
+  l1=$(marker_line "$target_path" "$end")
+  if [[ -z "$l0" || -z "$l1" ]]; then
+    say "managed block markers are not at the start of a line in $target; leaving file untouched"
+    return
+  fi
+  # A reversed pair is not a managed block. The stripper would treat the START
+  # marker as the beginning of an unterminated block and drop the rest of the
+  # file — including keybindings this plugin does not own — so refuse the whole
+  # unwire here, capture as well as strip, and leave the file for a hand edit.
+  if (( l0 >= l1 )); then
+    say "managed block markers are out of order in $target (start at $l0, end at $l1); leaving file untouched"
+    return
+  fi
   # Capture the live block before it is stripped, so a customized block is
   # wired back on the next start. It runs in a subshell (it re-pins the
   # directory descriptors and may die) so a capture that cannot be written
   # leaves the block intact for the next run but never stops this strip.
   if [[ -n "$custom" && -n "$ref" ]]; then
-    l0=$(grep -nFs -- "$start" "$target_path" | head -n 1 | cut -d: -f1)
-    l1=$(grep -nFs -- "$end" "$target_path" | head -n 1 | cut -d: -f1)
-    if [[ -n "$l0" && -n "$l1" ]] && (( l0 <= l1 )); then
-      live="$(sed -n "${l0},${l1}p" "$target_path")"
-      ( tmpfile=""; capture_custom "$live" "$custom" "$ref" ) \
-        || say "warning: could not capture the live keybinding block to $custom"
-    else
-      say "managed block markers are out of order in $target; not capturing it"
-    fi
+    live="$(sed -n "${l0},${l1}p" "$target_path")"
+    ( tmpfile=""; capture_custom "$live" "$custom" "$ref" ) \
+      || say "warning: could not capture the live keybinding block to $custom"
   fi
   tmpfile=$(mktemp "$DIR_PATH/$target_name.tmp.XXXXXX") || die "could not create temporary file"
   # Strip into a temp file in the same (pinned) directory, and only rename over
@@ -947,7 +964,7 @@ cmd_unwire() {
   if ! awk -v s="$start" -v e="$end" -f "$stripper_path" "$target_path" > "$tmpfile"; then
     die "unwire (awk) failed; $target left untouched"
   fi
-  if grep -qFs -- "$start" "$tmpfile"; then
+  if grep -qFs -- "$start" "$tmpfile" || grep -qFs -- "$end" "$tmpfile"; then
     die "unwire produced a malformed result (marker still present); $target left untouched"
   fi
   chmod "$target_mode" "$tmpfile" || die "could not set permissions on temporary file"
