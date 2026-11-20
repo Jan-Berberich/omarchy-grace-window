@@ -520,6 +520,17 @@ release_holders() {
 trap release_holders EXIT
 trap 'exit 1' HUP INT TERM
 
+# Hash the bytes a descriptor path currently names. The path is always one of
+# the pinned /proc/self/fd or /proc/PID/fd paths above, so this reads the inode
+# we checked even if the name has since moved. Used to prove that the content a
+# replacement was built from is still the content being replaced: the device
+# and inode alone cannot see a save that rewrote that same inode in place.
+file_sha() {
+  local out
+  out=$(sha256sum -- "$1" 2>/dev/null) || return 1
+  printf '%s' "${out%% *}"
+}
+
 # Before renaming over a name, the name must still be the entry we worked on:
 # a file that appeared or was replaced while we were building the result is
 # never clobbered silently. The rename itself is a single atomic step inside
@@ -528,8 +539,11 @@ trap 'exit 1' HUP INT TERM
 #   MODE    absent  the name must still not exist (we are about to create it)
 #           inode   the name must still resolve to DEV/INO (we read that one)
 #           any     anything goes: the rename replaces the name itself
+#   SHA     optional fingerprint taken from SHA_PATH when the file was read;
+#           when given, its bytes must still match, too (see below)
 check_name_intact() {
-  local name="$1" what="$2" mode="$3" want_dev="${4:-}" want_ino="${5:-}" info dev ino
+  local name="$1" what="$2" mode="$3" want_dev="${4:-}" want_ino="${5:-}"
+  local want_sha="${6:-}" sha_path="${7:-}" info dev ino now
   case "$mode" in
     absent)
       if lstat_info "$DIR_PATH/$name" >/dev/null 2>&1; then
@@ -544,6 +558,16 @@ check_name_intact() {
       fi
       ;;
   esac
+  # A new name pointing at a new inode is caught above; this catches the other
+  # half: the same inode whose bytes were changed since we read it. The check
+  # sits here, immediately before the rename, so the window it guards is as
+  # small as the inode check's.
+  if [[ -n "$want_sha" ]]; then
+    now=$(file_sha "$sha_path") || die "cannot re-read $what"
+    if [[ "$now" != "$want_sha" ]]; then
+      die "$what changed in place while it was being processed; left untouched"
+    fi
+  fi
 }
 
 # Publish a finished temporary file over NAME in the pinned directory. The data
@@ -552,9 +576,42 @@ check_name_intact() {
 # the write into another file.
 replace_in_dir() {
   local tmp="$1" name="$2" what="$3" mode="$4" want_dev="${5:-}" want_ino="${6:-}"
+  local want_sha="${7:-}" sha_path="${8:-}"
   sync -d -- "$tmp" 2>/dev/null || true
-  check_name_intact "$name" "$what" "$mode" "$want_dev" "$want_ino"
+  check_name_intact "$name" "$what" "$mode" "$want_dev" "$want_ino" "$want_sha" "$sha_path"
   mv -f -- "$tmp" "$DIR_PATH/$name" || die "could not atomically replace $what"
+}
+
+# Serialize this plugin's own writers on a lock file in the directory they are
+# about to write. The lock file is opened for reading and writing without
+# truncation and is never renamed, so every invocation — the plugin's script or
+# the copy installed for teardown, an old service or a new one — locks the same
+# object even while the file it protects is being replaced. The descriptor
+# stays open until the command exits, so the kernel releases the lock on every
+# way out, including a command killed by the service's watchdog. Callers take
+# it before their first read of the file they will replace: the next writer
+# then works from the previous one's result instead of a stale snapshot.
+lock_in_pinned_dir() {
+  local name="$1" what="$2" fd info dev ino uid mode typebits
+  local finfo fdev fino fuid fmode ftype
+  info=$(lstat_info "$DIR_PATH/$name" 2>/dev/null) || info=""
+  if [[ -n "$info" ]]; then
+    read -r dev ino uid mode typebits <<< "$info"
+    is_symlink_mode "$typebits" && die "refusing to write: $what lock is a symlink"
+    is_regular_mode "$typebits" || die "refusing to write: $what lock is not a regular file"
+  fi
+  exec {fd}<>"$DIR_PATH/$name" || die "cannot open writer lock for $what"
+  # Prove the descriptor names the file that was checked, so a name swapped in
+  # between the check and the open cannot give two writers different locks.
+  finfo=$(fstat_info "$fd") || die "cannot inspect writer lock for $what"
+  read -r fdev fino fuid fmode ftype <<< "$finfo"
+  is_regular_mode "$ftype" || die "refusing to write: $what lock is not a regular file"
+  if [[ -n "$info" && ( "$fdev" != "$dev" || "$fino" != "$ino" ) ]]; then
+    eval "exec ${fd}>&-"
+    die "refusing to write: $what lock changed while it was being opened"
+  fi
+  refuse_unless_safe "$what lock" "$fuid" "$fmode" "regular file"
+  flock -x "$fd" || die "cannot acquire writer lock for $what"
 }
 
 # Pin this script's own directory the same way, so the awk stripper, the lua
@@ -754,11 +811,15 @@ read_managed_block() {
 # — the wiring, or the strip that has to follow a capture.
 write_block_file() {
   local block="$1" file="$2" what="$3"
-  local dir name mode=644 existing="" want_dev="" want_ino="" tmp
+  local dir name mode=644 existing="" want_dev="" want_ino="" want_sha="" tmp
   dir="$(phys_prefix "$(dirname -- "$file")")" || die "cannot resolve the directory of $what"
   ensure_dir_chain "$dir" || die "cannot open or create the directory of $what: $dir"
   name="$(basename -- "$file")"
   if open_file_in_dir "$name" "$file"; then
+    # Hash before reading: a change between the hash and the copy then shows up
+    # as a mismatch at the rename too, rather than being mistaken for the old
+    # content we just copied.
+    want_sha=$(file_sha "$FILE_PATH") || die "cannot read $what"
     existing="$(cat -- "$FILE_PATH")" || die "cannot read $what"
     if [[ "$existing" == "$block" ]]; then
       say "$what is already up to date; not rewritten"
@@ -773,7 +834,7 @@ write_block_file() {
   printf '%s\n' "$block" > "$tmp" || die "could not write $what"
   chmod "$mode" "$tmp" || die "could not set permissions on $what"
   if [[ -n "$want_dev" ]]; then
-    replace_in_dir "$tmp" "$name" "$what" inode "$want_dev" "$want_ino"
+    replace_in_dir "$tmp" "$name" "$what" inode "$want_dev" "$want_ino" "$want_sha" "$FILE_PATH"
   else
     replace_in_dir "$tmp" "$name" "$what" absent
   fi
@@ -810,7 +871,7 @@ capture_custom() {
 
 cmd_wire() {
   local src="$1" target="$2" start="$3" end="$4" custom="${5-}" ref="${6-}"
-  local orig_mode starts ends target_dir target_name
+  local orig_mode starts ends target_dir target_name target_path="" orig_sha=""
   local default_block custom_block block rc crc
   # The block to wire is the captured custom block when there is an intact one —
   # the user's customization carried over from the last teardown — and the
@@ -845,6 +906,9 @@ cmd_wire() {
   target_dir="$(dirname -- "$target")"
   target_name="$(basename -- "$target")"
   open_dir_chain "$target_dir" || die "target directory missing or not a directory: $target_dir"
+  # Take the lock before reading the target: an unwire from an old service (or
+  # a second wire) cannot then interleave with this read-modify-write.
+  lock_in_pinned_dir ".grace-window.$target_name.lock" "$target"
   # The target must be either fully wired (exactly one intact start/end pair)
   # or free of the markers — any other state was not written by this plugin.
   # Appending a second block would corrupt it further, and the partial block is
@@ -852,8 +916,10 @@ cmd_wire() {
   starts=0
   ends=0
   if open_file_in_dir "$target_name" "$target"; then
-    starts=$(count_marker "$FILE_PATH" "$start") || die "cannot read $target"
-    ends=$(count_marker "$FILE_PATH" "$end") || die "cannot read $target"
+    target_path="$FILE_PATH"
+    starts=$(count_marker "$target_path" "$start") || die "cannot read $target"
+    ends=$(count_marker "$target_path" "$end") || die "cannot read $target"
+    orig_sha=$(file_sha "$target_path") || die "cannot read $target"
   fi
   if (( starts == 1 && ends == 1 )); then
     say "keybindings already wired; nothing to do"
@@ -863,19 +929,20 @@ cmd_wire() {
     die "managed block markers in $target are not intact ($starts start, $ends end); remove them by hand, then restart the service to re-wire a clean block"
   fi
   tmpfile=$(mktemp "$DIR_PATH/$target_name.tmp.XXXXXX") || die "could not create temporary file"
-  if [[ -n "$FILE_PATH" ]]; then
+  if [[ -n "$target_path" ]]; then
     # Appending to an existing file: its mode, and the exact bytes we counted
     # the markers in, come from the inode we hold open.
     orig_mode="$FILE_MODE"
-    cat "$FILE_PATH" > "$tmpfile" || die "could not write temporary file"
+    cat "$target_path" > "$tmpfile" || die "could not write temporary file"
     echo "" >> "$tmpfile" || die "could not write temporary file"
   else
     orig_mode=644
   fi
   printf '%s\n' "$block" >> "$tmpfile" || die "could not write temporary file"
   chmod "$orig_mode" "$tmpfile" || die "could not set permissions on temporary file"
-  if [[ -n "$FILE_PATH" ]]; then
-    replace_in_dir "$tmpfile" "$target_name" "$target" inode "$FILE_DEV" "$FILE_INO"
+  if [[ -n "$target_path" ]]; then
+    replace_in_dir "$tmpfile" "$target_name" "$target" inode "$FILE_DEV" "$FILE_INO" \
+      "$orig_sha" "$target_path"
   else
     replace_in_dir "$tmpfile" "$target_name" "$target" absent
   fi
@@ -907,7 +974,7 @@ cmd_wire() {
 cmd_unwire() {
   local target="$1" start="$2" end="$3" custom="${4-}" ref="${5-}"
   local starts ends target_dir target_name
-  local target_path target_dev target_ino target_mode stripper_path l0 l1 live
+  local target_path target_dev target_ino target_mode target_sha="" stripper_path l0 l1 live
   # The stripper comes from the pinned script directory, the target is opened
   # through its own pinned directory, and both stay bound while the result is
   # built and renamed: a symlink swapped in for bindings.lua, or a replaced
@@ -916,7 +983,14 @@ cmd_unwire() {
   bind_self_dir
   target_dir="$(dirname -- "$target")"
   target_name="$(basename -- "$target")"
-  if ! open_dir_chain "$target_dir" || ! open_file_in_dir "$target_name" "$target"; then
+  if ! open_dir_chain "$target_dir"; then
+    say "bindings file not found: $target; nothing to clean"
+    return
+  fi
+  # Serialize with a wire from a new service before the first read of the
+  # target, for the same reason as in cmd_wire.
+  lock_in_pinned_dir ".grace-window.$target_name.lock" "$target"
+  if ! open_file_in_dir "$target_name" "$target"; then
     say "bindings file not found: $target; nothing to clean"
     return
   fi
@@ -925,6 +999,7 @@ cmd_unwire() {
   target_dev=$FILE_DEV
   target_ino=$FILE_INO
   target_mode=$FILE_MODE
+  target_sha=$(file_sha "$target_path") || die "cannot read $target"
   starts=$(count_marker "$target_path" "$start") || die "cannot read $target"
   ends=$(count_marker "$target_path" "$end") || die "cannot read $target"
   # Only an intact, single managed block is ever unwired; duplicates or bare
@@ -973,7 +1048,8 @@ cmd_unwire() {
     die "unwire produced a malformed result (marker still present); $target left untouched"
   fi
   chmod "$target_mode" "$tmpfile" || die "could not set permissions on temporary file"
-  replace_in_dir "$tmpfile" "$target_name" "$target" inode "$target_dev" "$target_ino"
+  replace_in_dir "$tmpfile" "$target_name" "$target" inode "$target_dev" "$target_ino" \
+    "$target_sha" "$target_path"
   tmpfile=""
   if hyprctl reload >/dev/null 2>&1; then
     say "managed keybinding block removed from $target and hyprland reloaded"
@@ -994,6 +1070,7 @@ cmd_install_unwire() {
   # would wait on a fifo planted in the plugin directory.
   bind_self_dir
   ensure_dir_chain "$dir" || die "cannot open or create runtime directory: $dir"
+  lock_in_pinned_dir ".grace-window.lock" "$dir"
   for f in grace-window.sh grace-window.awk grace-window.lua; do
     open_file_at "$SELF_PATH" "$f" "$self/$f" || die "cannot read $f from the plugin directory"
     src_path=$FILE_PATH
@@ -1060,6 +1137,7 @@ cmd_save_state() {
   # that was checked, and the temporary name is unpredictable, so nothing that
   # appears in the dir while we work can redirect or capture the write.
   ensure_dir_chain "$dir" || die "cannot open or create state directory: $dir"
+  lock_in_pinned_dir ".grace-window.lock" "$dir"
   if [[ -z "$data" || "$data" == "[]" ]]; then
     rm -f -- "$DIR_PATH/$name" || die "cannot remove stale state file"
     return 0

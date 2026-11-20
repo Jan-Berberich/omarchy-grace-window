@@ -230,8 +230,14 @@ the file makes the next start recreate it with the defaults.
   swapped for a symlink, a directory replaced while the plugin works, or a
   temporary name planted in advance therefore cannot redirect a read/write;
   a target replaced underneath the plugin is left untouched and the command
-  fails. The script also refuses to write when a path component is a symlink,
-  when a directory in the path is group/other writable, or when the target is
+  fails. The same goes for a save that rewrites the very same file in place:
+  the script fingerprints the bytes it read and re-checks them just before the
+  rename, so a concurrent edit is reported instead of being overwritten. Its
+  own writers (wiring, unwiring, saving state, installing the teardown copy)
+  take an exclusive lock on a file in the directory they write, so overlapping
+  service lifecycles cannot work from the same stale snapshot. The script
+  also refuses to write when a path component is a symlink, when a directory in
+  the path is group/other writable, or when the target is
   not a regular file owned by you (or root), which is why a symlinked
   `~/.config/hypr` (through a dotfiles manager, say) is the one setup that
   stops working. No open can wait, either: a fifo swapped in for a file or a
