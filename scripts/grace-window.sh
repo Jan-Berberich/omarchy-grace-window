@@ -21,7 +21,12 @@
 #                              place (teardown, runtime copy).
 # save-state DIR JSON          Write DIR/grace-window.json atomically; empty
 #                              clears it.
-# state-probe                  Client address + workspace id/name JSON.
+# read-state DIR               Print DIR/grace-window.json ([] when it is absent);
+#                              fail when a present record is unreadable or is not
+#                              a JSON array.
+# state-probe                  Client address + workspace id/name JSON; fail when
+#                              the client query or JSON processing fails, never
+#                              answer with an empty inventory on an outage.
 # config PATH                  Print the effective configuration for PATH as
 #                              JSON, creating PATH with the shipped defaults on
 #                              first use; a damaged PATH is reported and every
@@ -1078,14 +1083,46 @@ cmd_save_state() {
   tmpfile=""
 }
 
+# Read the saved recovery record for startup. A missing record (or runtime dir)
+# is an empty state: there is nothing to restore. A record that exists but cannot
+# be used is a failure, never an empty answer — an empty answer here would let
+# startup reconcile against a record it never actually read, and then publish a
+# snapshot built on that guess over the original.
+cmd_read_state() {
+  local dir="$1" name="grace-window.json" data
+  if ! open_dir_chain "$dir"; then
+    # A missing directory holds no state; anything else that could not be
+    # entered (a non-directory, for one) is a broken read, not an empty one.
+    [[ -e "$dir" ]] || { printf '[]\n'; return 0; }
+    die "cannot open state directory: $dir"
+  fi
+  if ! open_file_in_dir "$name" "$dir/$name"; then
+    printf '[]\n'
+    return 0
+  fi
+  data=$(cat -- "$FILE_PATH") || die "cannot read $dir/$name"
+  jq -e 'type == "array"' <<<"$data" >/dev/null 2>&1 \
+    || die "saved state is not a JSON array: $dir/$name"
+  printf '%s\n' "$data"
+}
+
 # Startup restore probe: every client's address and workspace, to filter the
-# saved state down to windows still on their grace workspace.
+# saved state down to windows still on their grace workspace. An empty inventory
+# means every saved window is gone, so a failed query or a broken answer must be
+# reported as a failure — answering "[]" for one would let startup discard and
+# then delete recovery state it could not actually verify.
 cmd_state_probe() {
-  local clients
-  clients=$(hyprctl -j clients 2>/dev/null || true)
-  [[ -n "$clients" ]] || clients="[]"
+  local clients probe
+  if ! clients=$(hyprctl -j clients 2>/dev/null) || [[ -z "$clients" ]]; then
+    die "clients query failed; cannot probe window inventory"
+  fi
   bind_self_dir
-  jq -L "$SELF_PATH" -c 'include "grace-window"; stateProbe' <<<"$clients" || echo "[]"
+  if ! probe=$(printf '%s\n' "$clients" | jq -e -L "$SELF_PATH" -c \
+      'include "grace-window"; if type == "array" then stateProbe else error("clients query is not an array") end' \
+      2>/dev/null); then
+    die "clients query returned invalid JSON; cannot probe window inventory"
+  fi
+  printf '%s\n' "$probe"
 }
 
 # Print config.json's content, or return 3 when the file is simply not there, so
@@ -1172,6 +1209,7 @@ case "${1:-}" in
   unwire) shift; cmd_unwire "$@" ;;
   undo-grace) shift; cmd_undo_grace "$@" ;;
   save-state) shift; cmd_save_state "$@" ;;
+  read-state) shift; cmd_read_state "$@" ;;
   state-probe) shift; cmd_state_probe "$@" ;;
   config) shift; cmd_config "$@" ;;
   install-unwire) shift; cmd_install_unwire "$@" ;;

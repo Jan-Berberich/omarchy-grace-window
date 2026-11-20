@@ -67,7 +67,8 @@ Item {
   readonly property int closeWaitMs: Math.max(1, Math.floor(root.queryTimeoutMs * 0.8))
 
   // Startup retries, each after loadRetryIntervalMs, waiting for the keybinding
-  // wiring to finish before the saved state is loaded (see loadState).
+  // wiring to finish before the saved state is loaded, and retrying a failed
+  // recovery read or client inventory (see loadState).
   property int loadWaitLimit: 40
 
   // Grace countdown tick rate, and the cadence of the startup-load retry.
@@ -363,6 +364,17 @@ Item {
     return new Promise(function (resolve) {
       root.run(args, {
         onDone: function (ok, text) { resolve(text === null ? "null" : text) },
+      })
+    })
+  }
+
+  // Like runOpQuery, but keeps the runner's outcome alongside stdout. The state
+  // read and probe need it: a failed command can still print something, and a
+  // failed inventory must never be mistaken for a complete (empty) one.
+  function runOpQueryChecked(args) {
+    return new Promise(function (resolve) {
+      root.run(args, {
+        onDone: function (ok, text) { resolve({ ok: ok, text: text === null ? "null" : text }) },
       })
     })
   }
@@ -1279,8 +1291,10 @@ Item {
   // cancelled (or given-up) window and re-arm its close.
   function cancel() {
     // Bump the epoch so in-flight ops report "none" instead of applying after
-    // the cancellation.
+    // the cancellation. A pending startup retry must not go on to read and
+    // restore state the user has just forgotten.
     root.epoch++
+    loadRetryTimer.stop()
     root.cancelScheduledCloses()
     for (let i = 0; i < root.pending.length; i++) {
       root.restoreInPlace(root.pending[i])
@@ -1293,8 +1307,14 @@ Item {
     // Windows being reopened are left to their restores; the service simply
     // forgets them.
     root.pending = []
-    // Persist the now-empty pending state (clears a stale grace-window.json).
-    root.saveStateDetached()
+    // Persist the now-empty pending state (clears a stale grace-window.json) —
+    // but only once startup has confirmed the saved state. An explicit cancel
+    // during a failed read or probe must not erase the one complete record.
+    if (root.loadVerdict === "complete") {
+      root.saveStateDetached()
+    } else {
+      console.warn("grace-window: cancel during startup state load; the saved state is left untouched")
+    }
     return "ok"
   }
 
@@ -1669,19 +1689,21 @@ Item {
   }
 
   // How the startup load ended, and whether publishing the in-memory pending
-  // list is therefore safe. An empty pending list means "nothing to restore"
-  // only once the load has actually finished: while it is in flight, or if it
-  // was cut short (an aborted query, an unreadable file), pending is merely
-  // incomplete, and the empty state is indistinguishable from "forget
-  // everything" — which is what the state file records when it is written
-  // empty, so those windows would be lost for good.
+  // list is therefore safe. Only "complete" means the recovery record was read
+  // and, when it held windows, checked against a trustworthy client inventory.
+  // Until then pending is a partial view: publishing it — empty or not — would
+  // overwrite the one complete record with a guess, so no state is written.
   //   pending      the load has not finished
   //   complete     it finished and the saved state was fully accounted for
-  //   incomplete   it was cut short; pending is not the whole truth
+  //   incomplete   a read or probe failed; pending is not the whole truth
   property string loadVerdict: "pending"
   // How often loadState has deferred itself while the wire was still running,
   // bounded by the configured loadWaitLimit.
   property int loadWaits: 0
+  // Failed read/probe attempts, retried on the same cadence and bounded by the
+  // same loadWaitLimit. Kept separate from loadWaits so a slow wire cannot eat
+  // the retries meant for a transient Hyprland or file-read failure.
+  property int loadRetries: 0
 
   // Bounded retry for loadState while another op is in flight, instead of a busy
   // Qt.callLater spin.
@@ -1696,7 +1718,8 @@ Item {
   // exist on their grace workspace, and restore those. Runs through the shared
   // executor (serialized with hide/reopen, under the same watchdog). A missing
   // state file reads as empty (no-op); a cancel landing mid-load aborts via the
-  // epoch check.
+  // epoch check. Both queries report their own outcome: a failed read or probe
+  // is retried on the startup cadence, never taken as an empty inventory.
   function loadState() {
     // Wait for the wiring reload first. `hyprctl reload` holds the Hyprland
     // socket for seconds, and the probe behind it would queue on the shared
@@ -1723,11 +1746,12 @@ Item {
     }
     root.opInFlight++
     root.loadWaits = 0
+    loadRetryTimer.stop()
     const myEpoch = root.epoch
     root.loadVerdict = "pending"
-    root.runOpQuery(["cat", root.stateFile]).then(
-      function (raw) {
-        const saved = root.parseJson(raw)
+    root.runOpQueryChecked(["bash", root.bashScript, "read-state", root.unwireRuntimeDir]).then(
+      function (read) {
+        const saved = read.ok ? root.parseJson(read.text) : null
         if (myEpoch !== root.epoch) {
           root.opInFlight--
           console.warn("grace-window: startup state load aborted before it read anything")
@@ -1735,25 +1759,53 @@ Item {
         }
         if (!Array.isArray(saved)) {
           root.opInFlight--
-          root.loadVerdict = "incomplete"
-          console.warn(`grace-window: could not read ${root.stateFile}; leaving the saved state untouched`)
+          root.failLoad(`could not read ${root.stateFile}`)
           return
         }
         if (saved.length === 0) {
           // Nothing was saved: the windows of the previous lifetime are all gone
           // or were all cancelled. A teardown may publish an empty pending.
           root.opInFlight--
-          root.loadVerdict = "complete"
+          root.finishLoad()
           return
         }
         // Probe which saved windows still exist on their grace workspace.
-        root.runOpQuery(["bash", root.bashScript, "state-probe"]).then(
-          function (probeRaw) {
+        root.runOpQueryChecked(["bash", root.bashScript, "state-probe"]).then(
+          function (probe) {
             root.opInFlight--
             if (myEpoch !== root.epoch) return
-            root.restorePending(saved, probeRaw)
+            if (!probe.ok) {
+              root.failLoad(`state probe for ${root.stateFile} failed`)
+              return
+            }
+            root.restorePending(saved, probe.text)
           })
       })
+  }
+
+  // Reconciliation succeeded: the saved record has been read and, when needed,
+  // checked against a real client inventory. Only now may this instance publish
+  // its pending list, empty or not.
+  function finishLoad() {
+    root.loadRetries = 0
+    loadRetryTimer.stop()
+    root.loadVerdict = "complete"
+  }
+
+  // A failed read or probe leaves the saved record as the last complete truth.
+  // Retry the whole reconciliation on the startup cadence, so a transient
+  // Hyprland or file-read failure can still be recovered from. Once the budget
+  // is spent stay "incomplete" for this lifetime: publishing any snapshot built
+  // on a partial view would overwrite the only record of the saved windows.
+  function failLoad(reason) {
+    root.loadVerdict = "incomplete"
+    console.warn(`grace-window: ${reason}; ${root.stateFile} left untouched`)
+    if (root.loadRetries >= root.loadWaitLimit) {
+      console.warn("grace-window: giving up on startup state reconciliation; the saved state is left untouched")
+      return
+    }
+    root.loadRetries++
+    loadRetryTimer.restart()
   }
 
   // Rebuilds the pending list from the saved entries, keeping only windows the
@@ -1763,11 +1815,9 @@ Item {
   function restorePending(saved, probeRaw) {
     const probe = root.parseJson(probeRaw)
     if (!Array.isArray(probe)) {
-      // The probe died, was watchdoged, or answered something that is not a
-      // list. pending does not yet know about the saved windows, so a teardown
-      // must not take this for "nothing pending".
-      root.loadVerdict = "incomplete"
-      console.warn(`grace-window: state probe for ${root.stateFile} failed; ${saved.length} saved window(s) left unrestored`)
+      // Defense in depth: the caller already requires a successful probe, but a
+      // broken answer must never be reconciled as "no windows are alive".
+      root.failLoad(`state probe for ${root.stateFile} returned invalid JSON; ${saved.length} saved window(s) left unrestored`)
       return
     }
     const whereabouts = new Map()
@@ -1800,7 +1850,7 @@ Item {
     }
     // Whether or not anything came back, the load itself has now been fully
     // accounted for, so a teardown may publish what this instance is tracking.
-    root.loadVerdict = "complete"
+    root.finishLoad()
     if (restored.length === 0) return
     console.log(`grace-window: restoring ${restored.length} pending window(s) in place from ${root.stateFile}`)
     for (let i = 0; i < restored.length; i++) {
@@ -1929,14 +1979,15 @@ Item {
     // load (remaining ≤ 0 ⇒ expiring).
     root.cancelScheduledCloses()
     const saveable = root.saveableEntries()
-    if (saveable.length === 0 && root.loadVerdict !== "complete") {
-      // The startup load has not finished, or was cut short, so this instance
-      // has not seen the saved windows yet and an empty pending list says
-      // nothing about them. Publishing it would clear grace-window.json (an empty
-      // state is how the file is emptied), and the windows still sitting on
-      // their grace workspaces would be lost with no way to tell they existed.
-      // The file on disk is the last complete truth: leave it alone.
-      console.warn("grace-window: torn down before the startup state load finished; the saved state is left untouched")
+    if (root.loadVerdict !== "complete") {
+      // The startup load has not finished, or a read/probe failed, so this
+      // instance has not seen the saved windows yet: neither an empty nor a
+      // nonempty snapshot is the whole truth. Publishing either would replace
+      // grace-window.json — clearing it or overwriting it with a partial view —
+      // and windows still sitting on their grace workspaces would be lost with
+      // no way to tell they existed. The file on disk is the last complete
+      // truth: leave it alone.
+      console.warn(`grace-window: torn down before the startup state load finished; ${saveable.length} pending window(s) not published and the saved state is left untouched`)
     } else {
       root.saveStateDetached(saveable)
     }

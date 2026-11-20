@@ -67,7 +67,7 @@ omarchy plugin add https://github.com/Jan-Berberich/omarchy-grace-window.git --e
 ```
 
 ```bash
-omarchy plugin enable jam.grace-window --section left --after omarchy.workspaces
+omarchy plugin enable jam.grace-window --after omarchy.workspaces
 ```
 
 When the service starts it appends the managed keybinding block to
@@ -80,6 +80,10 @@ teardown). Every line it adds lives inside a `-- BEGIN Grace Window …` /
 modified.
 
 ## Uninstall
+
+```bash
+omarchy plugin disable jam.grace-window
+```
 
 ```bash
 omarchy plugin remove jam.grace-window
@@ -200,7 +204,10 @@ the file makes the next start recreate it with the defaults.
   all carry over. Windows moved or closed while down are skipped, windows
   mid-reopen are treated like pending, and `cancel` (or a close given up after
   `closeRetryMax`) clears the saved state so such a window is never
-  resurrected or re-armed.
+  resurrected or re-armed. A saved record is only replaced once startup has
+  read it and verified the client inventory: a failed read or probe is retried,
+  and until it succeeds the record on disk is left untouched, even if windows
+  were hidden in the meantime.
 - Multiple windows can be hidden in sequence, in any number of
   workspaces. Each one keeps its own grace period in its workspace's buffer,
   and `reopen <workspace>` restores the most recent one of that workspace
